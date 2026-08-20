@@ -421,26 +421,30 @@ function ProfileGlyph() {
   );
 }
 
+/**
+ * Rendered only while open, so each opening mounts it fresh and `initialMode` actually takes
+ * effect -- a persistent instance would keep whichever mode the last visitor left it in.
+ */
 function AuthDialog({
-  open,
+  initialMode,
   onClose,
   onAuthed,
   onBeforeRedirect,
 }: {
-  open: boolean;
+  /** Where the visitor came from: the header implies an existing account, the card implies a new one. */
+  initialMode: "signup" | "signin";
   onClose: () => void;
   onAuthed: (email: string) => void;
   /** Runs right before the OAuth full-page redirect, to stash state that must survive it. */
   onBeforeRedirect?: () => void;
 }) {
-  const [mode, setMode] = useState<"signup" | "signin">("signup");
+  const [mode, setMode] = useState<"signup" | "signin">(initialMode);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
-  if (!open) return null;
   const supabase = getSupabaseBrowser();
 
   async function submit(event: FormEvent) {
@@ -494,7 +498,11 @@ function AuthDialog({
     >
       <div className="auth-dialog" role="dialog" aria-modal="true" aria-label="Create your account">
         <h3>{mode === "signup" ? "keep your words" : "welcome back"}</h3>
-        <p>your word bank, saved — and brought back tomorrow in a new situation.</p>
+        <p>
+          {mode === "signup"
+            ? "your word bank, saved — and brought back tomorrow in a new situation."
+            : "sign in to pick up your word bank where you left it."}
+        </p>
         {supabase ? (
           <>
             <button className="auth-google" type="button" disabled={busy} onClick={() => void signInWithGoogle()}>
@@ -641,6 +649,8 @@ export default function Home() {
   // Per-turn coach observations, passed to /api/rescue so the card matches the actual session.
   const [coachEvidence, setCoachEvidence] = useState<string[]>([]);
   const [authOpen, setAuthOpen] = useState(false);
+  // Which side of the dialog to land on, decided by where the visitor tapped.
+  const [authIntent, setAuthIntent] = useState<"signup" | "signin">("signup");
   const [emailFallbackOpen, setEmailFallbackOpen] = useState(false);
   const [authedEmail, setAuthedEmail] = useState<string | null>(null);
   // Set after an OAuth return; the effect below saves the words once the rescue state is back.
@@ -2247,6 +2257,11 @@ export default function Home() {
     }
   }
 
+  function openAuth(intent: "signup" | "signin") {
+    setAuthIntent(intent);
+    setAuthOpen(true);
+  }
+
   function stashVerdictForAuth() {
     if (!placementRescue) return;
     const snapshot: VerdictSnapshot = {
@@ -2819,9 +2834,17 @@ export default function Home() {
             <span>{eyesOffMode ? "eyes off" : "feedback"}</span>
             <HeartIcon />
           </button>
-          <Link className="profile-pill" href="/profile" aria-label="your profile">
-            {(authedEmail ?? "").slice(0, 1).toUpperCase() || <ProfileGlyph />}
-          </Link>
+          {/* Signed out, the profile page has nothing to show but an empty state, so the icon
+              opens the sign-in dialog directly instead of routing there first. */}
+          {authedEmail ? (
+            <Link className="profile-pill" href="/profile" aria-label="your profile">
+              {authedEmail.slice(0, 1).toUpperCase() || <ProfileGlyph />}
+            </Link>
+          ) : (
+            <button className="profile-pill" type="button" aria-label="sign in" onClick={() => openAuth("signin")}>
+              <ProfileGlyph />
+            </button>
+          )}
         </header>
 
         <button
@@ -3081,7 +3104,7 @@ export default function Home() {
                     these words disappear when you close this. keep them — and get them back tomorrow in a new
                     situation.
                   </p>
-                  <button className="account-button" type="button" onClick={() => setAuthOpen(true)}>
+                  <button className="account-button" type="button" onClick={() => openAuth("signup")}>
                     create a free account
                   </button>
                   <button
@@ -3550,15 +3573,17 @@ export default function Home() {
           </div>
         ) : null}
       </section>
-      <AuthDialog
-        open={authOpen}
-        onClose={() => setAuthOpen(false)}
-        onBeforeRedirect={stashVerdictForAuth}
-        onAuthed={(email) => {
-          setReturnEmail(email);
-          void saveReturnEmail(email);
-        }}
-      />
+      {authOpen ? (
+        <AuthDialog
+          initialMode={authIntent}
+          onClose={() => setAuthOpen(false)}
+          onBeforeRedirect={stashVerdictForAuth}
+          onAuthed={(email) => {
+            setReturnEmail(email);
+            void saveReturnEmail(email);
+          }}
+        />
+      ) : null}
     </main>
   );
 }
