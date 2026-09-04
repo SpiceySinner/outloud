@@ -8,6 +8,7 @@ export const rescueJsonSchema = {
     "confirmed_intent",
     "intended_meaning_check",
     "meaning_result",
+    "stated_vs_observed",
     "observed_blocker",
     "one_correction",
     "primary_correction",
@@ -46,6 +47,24 @@ export const rescueJsonSchema = {
       enum: ["clear", "partial", "unclear", "skipped"],
       description: "Whether the attempted meaning would come through to a native speaker. Use skipped only when skipped_attempt is true.",
     },
+    stated_vs_observed: {
+      type: "object",
+      additionalProperties: false,
+      required: ["result", "line_en"],
+      properties: {
+        result: {
+          type: "string",
+          enum: ["confirm", "correct", "both", "not_enough"],
+          description:
+            "How the evidence relates to self_reported_blocker. confirm: the evidence agrees. correct: the evidence CLEARLY contradicts it. both: they were partly right and something else also showed up. not_enough: no attempt, or too little to judge -- including when self_reported_blocker is not_sure.",
+        },
+        line_en: {
+          type: "string",
+          description:
+            "The verdict headline: one short lowercase sentence, at most 20 words, naming their stated problem and what actually happened. It is the first thing they read on the card, so it must fit on a phone without becoming a paragraph.",
+        },
+      },
+    },
     observed_blocker: {
       type: "object",
       additionalProperties: false,
@@ -61,7 +80,8 @@ export const rescueJsonSchema = {
         },
         evidence: {
           type: "string",
-          description: "The specific evidence from the user's attempt. If skipped, say there was no attempt to observe.",
+          description:
+            "The specific evidence from the user's attempt, quoted or described concretely. Shown to the user underneath the verdict headline whenever the verdict complicates what they said, so it must be addressed to them: lowercase, second person, 'you' and never 'the learner' or 'the user'. If skipped, say there was no attempt to observe.",
         },
         explanation_en: {
           type: "string",
@@ -246,9 +266,15 @@ export function buildRescuePrompt(request: RescueRequest) {
           "If voice_attempt is present, spoken_note should be one concrete note about understandability only.",
           "If voice_attempt is present, never flag spelling, missing accent marks, or transcript orthography as the user's mistake. Those are transcription/writing issues, not spoken Spanish mistakes.",
           "If voice_attempt is absent, spoken_note must be an empty string.",
-          "If pronunciation or intelligibility is the current blocker and voice_attempt is present, pronunciationTargets must identify the specific word or words that need clearer sound, with syllables and stress. This is not accent grading; only choose words that affect whether the meaning lands clearly.",
-          "If pronunciation is not the current blocker, or the user did not speak, pronunciationTargets must be an empty array.",
+          "pronunciationTargets is independent of observed_blocker.type: whenever voice_attempt is present and intelligibility was genuinely affected -- even if the current blocker is something else, such as grammar or sentence assembly -- pronunciationTargets must identify the specific word or words that need clearer sound, with syllables and stress. This is not accent grading; only choose words that affect whether the meaning lands clearly. observed_blocker.type still names only the single highest-impact issue; do not change it just because pronunciationTargets is populated.",
+          "If intelligibility was not affected, or the user did not speak, pronunciationTargets must be an empty array.",
           "Treat self_reported_blocker as the user's hypothesis, not a diagnosis.",
+          "stated_vs_observed closes the loop the user opened when they told you their problem. line_en must name their stated problem and what the evidence actually showed, in one lowercase sentence of at most 20 words, addressed to them. Name one thing, not two -- a headline that lists every observation stops being a headline.",
+          "Choose result from the evidence, never for effect. confirm when the evidence agrees ('you called it -- the words are the thing'). both when they were partly right and something else also showed up, which is often the honest answer. correct ONLY when the evidence clearly contradicts what they said.",
+          "line_en and result must say the same thing. The client shows the supporting evidence only when result is correct or both, so a confirm line that quietly contradicts them ('you said X, but ...') lands as an unsupported accusation. A confirm line must read as agreement and must not open its second half with but, actually, or however. A correct or both line must name what you did observe, not merely deny what they said.",
+          "NEVER manufacture a contradiction to look perceptive. A wrong 'actually it is X' lands at the exact moment the user is deciding whether to trust you, and it is unrecoverable. If you are weighing correct against both, choose both. If you are weighing correct against confirm, choose confirm.",
+          "If self_reported_blocker is not_sure, result must be not_enough when there is no usable attempt, and otherwise confirm -- they made no claim, so there is nothing to contradict. line_en then simply names what you saw, without implying they were wrong about anything.",
+          "If skipped_attempt is true, result must be not_enough and line_en must say plainly that you cannot check their hypothesis until they try once. Never confirm or correct a blocker you did not observe.",
           "If self_reported_blockers contains multiple hypotheses, compare them with the observed attempt and choose the highest-impact current blocker.",
           "observed_blocker must be based only on original_text, first_attempt, voice_attempt, and skipped_attempt.",
           "actionable_feedback must name one issue, explain it in English, and tell the user exactly what to do next.",

@@ -105,6 +105,15 @@ export type RescueResponse = {
   };
   intended_meaning_check: string;
   meaning_result: "clear" | "partial" | "unclear" | "skipped";
+  /**
+   * How the evidence relates to the learner's own stated blocker. Optional because moments
+   * persisted before this field existed are read back from the database and would otherwise
+   * fail to parse; the verdict falls back to a neutral headline when it is absent.
+   */
+  stated_vs_observed?: {
+    result: "confirm" | "correct" | "both" | "not_enough";
+    line_en: string;
+  };
   observed_blocker: {
     type: string;
     confidence: "low" | "medium" | "high";

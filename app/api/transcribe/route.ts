@@ -3,17 +3,27 @@ import { NextResponse } from "next/server";
 import { buildFreezeSignals, type ClientVoiceMetrics, type TimedWord } from "@/lib/freeze";
 import { buildMockVoiceAttempt, isMockAiEnabled } from "@/lib/mock-ai";
 import { naturalSpanishSystemPrompt } from "@/lib/natural-spanish";
-import { checkRateLimit } from "@/lib/rate-limit";
+import { checkRateLimit, openAiRequestsPerDay } from "@/lib/rate-limit";
+import { classifyTranscriptionConfidence } from "@/lib/transcription-confidence";
 import { stripTranscriptArtifacts } from "@/lib/transcript-artifacts";
+
+type WhisperVerboseSegment = {
+  start: number;
+  end: number;
+  text: string;
+  avg_logprob?: number;
+  no_speech_prob?: number;
+  compression_ratio?: number;
+};
 
 type WhisperVerboseResponse = {
   text?: string;
   words?: TimedWord[];
-  segments?: Array<{ start: number; end: number; text: string }>;
+  segments?: WhisperVerboseSegment[];
 };
 
 export async function POST(request: Request) {
-  const limited = checkRateLimit(request, "transcribe", Number(process.env.MAX_OPENAI_REQUESTS_PER_SESSION ?? 25), 24 * 60 * 60 * 1000);
+  const limited = checkRateLimit(request, "transcribe", openAiRequestsPerDay(), 24 * 60 * 60 * 1000);
   if (limited) return limited;
 
   const formData = await request.formData();
@@ -30,7 +40,10 @@ export async function POST(request: Request) {
 
   try {
     if (isMockAiEnabled()) {
-      return NextResponse.json(buildMockVoiceAttempt("Creo que tu comida esta muy rica"));
+      return NextResponse.json({
+        ...buildMockVoiceAttempt("Creo que tu comida esta muy rica"),
+        transcriptionConfidence: "reliable",
+      });
     }
 
     if (!process.env.OPENAI_API_KEY) {
@@ -52,8 +65,16 @@ export async function POST(request: Request) {
     const transcript = stripTranscriptArtifacts(transcription.text?.trim() ?? "");
     const words = Array.isArray(transcription.words) ? transcription.words : [];
     const freeze = buildFreezeSignals({ transcript, words, clientMetrics });
+    const segments = Array.isArray(transcription.segments) ? transcription.segments : [];
+    const transcriptionConfidence = classifyTranscriptionConfidence(
+      segments.map((segment) => ({
+        avgLogprob: segment.avg_logprob ?? null,
+        noSpeechProb: segment.no_speech_prob ?? null,
+        compressionRatio: segment.compression_ratio ?? null,
+      })),
+    );
 
-    return NextResponse.json({ transcript, freeze });
+    return NextResponse.json({ transcript, freeze, transcriptionConfidence });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Transcription failed.";
     return NextResponse.json({ error: `${message} Typing works too.` }, { status: 502 });

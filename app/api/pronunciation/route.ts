@@ -8,7 +8,7 @@ import {
   pronunciationCoachingJsonSchema,
   pronunciationCoachingSchema,
 } from "@/lib/pronunciation-schema";
-import { checkRateLimit } from "@/lib/rate-limit";
+import { checkRateLimit, openAiRequestsPerDay } from "@/lib/rate-limit";
 
 const contextSchema = z.object({
   who: z.string().min(1),
@@ -25,7 +25,7 @@ const requestSchema = z.object({
 });
 
 export async function POST(request: Request) {
-  const limited = checkRateLimit(request, "pronunciation", Number(process.env.MAX_OPENAI_REQUESTS_PER_SESSION ?? 25), 24 * 60 * 60 * 1000);
+  const limited = checkRateLimit(request, "pronunciation", openAiRequestsPerDay(), 24 * 60 * 60 * 1000);
   if (limited) return limited;
 
   let body: unknown;

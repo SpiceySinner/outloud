@@ -39,44 +39,44 @@ const policyByBlocker: Record<BlockerType, { intervention: InterventionType; ord
   vocabulary_retrieval: {
     intervention: "keyword",
     order: ["keyword", "sentence_frame", "full_model"],
-    rationale: "The word seems to be the bottleneck, so Outloud starts with one useful word before showing the full answer.",
+    rationale: "the word is what goes missing, so help starts with one word — not the whole answer.",
   },
   sentence_assembly: {
     intervention: "sentence_frame",
     order: ["keyword", "sentence_frame", "english_explanation", "full_model"],
-    rationale: "The ideas are present, but the sentence needs structure. Outloud starts with a frame instead of dumping the whole answer.",
+    rationale: "you have the ideas; it is the shape that breaks. so you get the frame before you get the answer.",
   },
   hesitation_pressure: {
     intervention: "preparation_time",
     order: ["repeat", "keyword", "sentence_frame", "full_model"],
-    rationale: "Pressure appears to be part of the freeze, so Outloud gives a small starter and then removes help.",
+    rationale: "the freeze is part of it, so you get the question again and a way in before anything else.",
   },
   pronunciation_intelligibility: {
     intervention: "slow_audio",
     order: ["slower_audio", "repeat", "keyword", "sentence_frame", "full_model"],
-    rationale: "Understanding may be blocked by a specific sound or word, so Outloud uses audio practice without accent scoring.",
+    rationale: "a specific sound is getting in the way, so you hear it slowly first. this is not accent grading.",
   },
   grammar_control: {
     intervention: "english_explanation",
     order: ["english_explanation", "sentence_frame", "keyword", "full_model"],
-    rationale: "One grammar contrast matters here, so Outloud gives the reason and asks for an immediate retry.",
+    rationale: "one grammar contrast is doing the damage, so you get the reason first and try again right away.",
   },
   naturalness_register: {
     intervention: "changed_context_example",
     order: ["sentence_frame", "english_explanation", "keyword", "full_model"],
-    rationale: "The meaning may work but sound off socially, so Outloud starts with relationship-appropriate wording.",
+    rationale: "the meaning lands but the register does not, so you get wording that fits who you are talking to.",
   },
   follow_up_pressure: {
     intervention: "unexpected_follow_up",
     order: ["repeat", "keyword", "sentence_frame", "conversation_repair_phrase" as AssistanceUsed, "full_model"].filter(
       (value): value is AssistanceUsed => value !== ("conversation_repair_phrase" as AssistanceUsed),
     ),
-    rationale: "The opening can be clear while the follow-up breaks the conversation, so Outloud trains the next turn.",
+    rationale: "your opening is fine; the follow-up is what breaks. so you hear the question again and answer that.",
   },
   insufficient_evidence: {
     intervention: "sentence_frame",
     order: defaultAssistanceOrder,
-    rationale: "There is not enough evidence yet. Outloud starts with light help and updates after the next attempt.",
+    rationale: "not enough seen yet to shape this, so help stays light and adjusts after your next reply.",
   },
 };
 
@@ -97,6 +97,24 @@ export function toggleBlockerHypothesis(
  * `@/lib/blocker-taxonomy` (see that file's comment for why it moved).
  */
 export { normalizeObservedBlocker };
+
+/**
+ * The assistance order for one blocker, in escalating strength. Same words -> the word first;
+ * same sentence that will not assemble -> the shape first; a freeze -> time first.
+ *
+ * Read directly rather than through `chooseTeachingPolicy` because the room derives its focus
+ * blocker from a richer chain than the rescue alone (it prefers `actionable_feedback.issueType`
+ * and falls back to the learner's own hypothesis). Driving the ladder from anything else would
+ * let the help order disagree with the focus line printed above it in the same room.
+ */
+export function assistanceOrderFor(blocker: BlockerType): AssistanceUsed[] {
+  return policyByBlocker[blocker].order;
+}
+
+/** Why this blocker gets that order, in the product's voice. Shown under the ladder. */
+export function teachingRationaleFor(blocker: BlockerType): string {
+  return policyByBlocker[blocker].rationale;
+}
 
 export function chooseTeachingPolicy({
   selectedHypotheses,

@@ -4,7 +4,7 @@ import { z } from "zod";
 import { buildRescuePrompt, rescueJsonSchema } from "@/lib/prompt";
 import { buildMockRescueResponse, isMockAiEnabled } from "@/lib/mock-ai";
 import { backgroundModel } from "@/lib/model-config";
-import { checkRateLimit } from "@/lib/rate-limit";
+import { checkRateLimit, openAiRequestsPerDay } from "@/lib/rate-limit";
 import { rescueResponseSchema } from "@/lib/rescue-schema";
 
 const requestSchema = z.object({
@@ -60,7 +60,7 @@ const requestSchema = z.object({
 });
 
 export async function POST(request: Request) {
-  const limited = checkRateLimit(request, "rescue", Number(process.env.MAX_OPENAI_REQUESTS_PER_SESSION ?? 25), 24 * 60 * 60 * 1000);
+  const limited = checkRateLimit(request, "rescue", openAiRequestsPerDay(), 24 * 60 * 60 * 1000);
   if (limited) return limited;
 
   const parsed = requestSchema.safeParse(await request.json());

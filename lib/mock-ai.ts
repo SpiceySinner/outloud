@@ -30,6 +30,15 @@ export function buildMockRescueResponse(request: RescueRequest): RescueResponse 
       ? ""
       : mockProfile.meaningCheck,
     meaning_result: skipped ? "skipped" : "partial",
+    // The mock derives observedType FROM the hypothesis, so it can only ever agree -- "correct"
+    // is unreachable here by construction. That is honest for a mock: the confirm/correct/both
+    // judgment is exactly the part only the real model can make.
+    stated_vs_observed: {
+      result: skipped ? ("not_enough" as const) : ("confirm" as const),
+      line_en: skipped
+        ? "you told me what trips you up, but there is no attempt to check it against yet."
+        : `you called it — ${observedType.replace(/_/g, " ")} is what showed up.`,
+    },
     observed_blocker: {
       type: skipped ? "insufficient evidence" : observedType,
       confidence: skipped ? "low" : "high",
@@ -71,7 +80,10 @@ export function buildMockRescueResponse(request: RescueRequest): RescueResponse 
     tone_note: mockProfile.toneNote,
     spoken_note: request.voiceAttempt ? mockProfile.spokenNote : "",
     dialect_version: request.context.dialect,
-    pronunciationTargets: observedType === "pronunciation_intelligibility" && request.voiceAttempt
+    // Independent of observedType on purpose (mirrors the real prompt's decoupled rule) --
+    // exercises the "primary issue is something else, pronunciation also flagged" case under
+    // OUTLOUD_MOCK_AI=true whenever there's a genuine spoken attempt to judge.
+    pronunciationTargets: !skipped && request.voiceAttempt
       ? [{ word: "estaba", syllables: ["es", "ta", "ba"], stressedSyllableIndex: 1 }]
       : [],
   };
@@ -273,6 +285,7 @@ export function buildMockAttemptEvaluation({
   attempt,
   assistanceUsed,
   isConversationReply = false,
+  lowConfidenceAttempt = false,
 }: {
   attempt: string;
   assistanceUsed: AssistanceUsed;
@@ -283,7 +296,28 @@ export function buildMockAttemptEvaluation({
    * reproduced the same bug the real evaluator had -- correct answers marked partial.
    */
   isConversationReply?: boolean;
+  /** Mirrors the real prompt's low_confidence_attempt short-circuit -- see lib/practice-prompts.ts. */
+  lowConfidenceAttempt?: boolean;
 }): AttemptEvaluation {
+  if (lowConfidenceAttempt) {
+    return {
+      meaningResult: "insufficient_evidence",
+      communicatedMeaningEn: "",
+      missingMeaningEn: null,
+      usedTargetChunk: false,
+      correctedPrimaryIssue: null,
+      observedBlocker: {
+        type: "insufficient_evidence",
+        confidence: "low",
+        evidence: "The audio wasn't clear enough to evaluate.",
+      },
+      assistanceUsed,
+      conciseFeedbackEn: "That didn't come through clearly enough to judge. Try again.",
+      correctedAttemptEs: null,
+      pronunciationTargets: [],
+    };
+  }
+
   const hasAttempt = attempt.trim().length >= 4;
   const usedChunk = /rica|deliciosa|tarde|porque/i.test(attempt);
   const meaningClear = hasAttempt && (isConversationReply || usedChunk);
@@ -306,7 +340,10 @@ export function buildMockAttemptEvaluation({
     // a manual run look like it proved the prompt rules. What it does prove is that both branches
     // exist, so the correction card can be seen with and without a sentence under OUTLOUD_MOCK_AI.
     correctedAttemptEs: meaningClear || !hasAttempt ? null : "Me gustan las casas grandes.",
-    pronunciationTargets: [],
+    // Independent of observedBlocker.type on purpose (mirrors the real prompt's decoupled rule) --
+    // exercises "primary issue is something else, pronunciation also flagged" under
+    // OUTLOUD_MOCK_AI=true whenever there's a real spoken attempt to judge.
+    pronunciationTargets: hasAttempt ? [{ word: "estaba", syllables: ["es", "ta", "ba"], stressedSyllableIndex: 1 }] : [],
   };
 }
 

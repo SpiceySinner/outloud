@@ -8,6 +8,20 @@ type Bucket = {
 
 const buckets = new Map<string, Bucket>();
 
+/**
+ * Per-device daily budget for the OpenAI-backed routes, shared across every scope.
+ *
+ * Production keeps the strict beta guard. Local development gets a workable number, because 25
+ * requests is roughly two full run-throughs -- after that the app cannot be exercised at all for
+ * the rest of the day. Fails safe: anything other than an explicit NODE_ENV=development, including
+ * an unset value, uses the strict default.
+ */
+export function openAiRequestsPerDay() {
+  return Number(
+    process.env.MAX_OPENAI_REQUESTS_PER_SESSION ?? (process.env.NODE_ENV === "development" ? 200 : 25),
+  );
+}
+
 export function checkRateLimit(request: Request, scope: string, limit: number, windowMs: number) {
   const now = Date.now();
   const key = `${scope}:${hashClientKey(request)}`;

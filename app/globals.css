@@ -178,6 +178,21 @@ html:not([data-outloud-hydrated="true"]) .app-shell button {
   pointer-events: none;
   user-select: none;
   -webkit-user-select: none;
+  transition: transform 240ms var(--ease-room);
+}
+
+/* The orb's own states only change once async work resolves, so without this a press produced no
+   immediate feedback at all. Skipped when disabled -- the canvas already carries that. */
+.room-orb-wrap:not(:disabled):active .room-orb {
+  transform: scale(0.98);
+  transition: transform 90ms var(--ease-room);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .room-orb,
+  .room-orb-wrap:not(:disabled):active .room-orb {
+    transition: none;
+  }
 }
 
 .room-copy {
@@ -290,6 +305,50 @@ html:not([data-outloud-hydrated="true"]) .app-shell button {
   font-weight: 400;
   line-height: 1.45;
   text-wrap: pretty;
+}
+
+/* English behind a tap. Mirrors the .coach-line fold: the toggle slot keeps a fixed height so
+   revealing the translation never shifts the layout under the learner's thumb. */
+.translation-fold {
+  appearance: none;
+  display: block;
+  margin: 0 auto;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: inherit;
+  cursor: pointer;
+}
+
+.translation-fold .room-translation {
+  overflow: hidden;
+  max-height: 120px;
+  transition:
+    max-height 420ms cubic-bezier(0.4, 0, 0.2, 1),
+    opacity 300ms ease;
+}
+
+.translation-fold.is-folded .room-translation {
+  max-height: 0;
+  margin-top: 0;
+  opacity: 0;
+}
+
+/* .coach-line-toggle defaults to opacity 0 and is only revealed by .coach-line.is-folded, so the
+   fold needs its own rule -- without it the English is hidden with no visible way to get it back. */
+.translation-fold .coach-line-toggle {
+  margin-top: 10px;
+}
+
+.translation-fold.is-folded .coach-line-toggle {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .translation-fold .room-translation {
+    transition: none;
+  }
 }
 
 .coach-tool {
@@ -424,6 +483,31 @@ html:not([data-outloud-hydrated="true"]) .app-shell button {
   color: var(--sage);
 }
 
+/*
+  #47 -- the session's focus, set by the evidence and never configured. It sits above the coach
+  line and must read as a label, not as something else to do: no border, no background, nothing
+  tappable. Deliberately quiet -- it is meant to be glanced at, not read every turn.
+*/
+.session-header {
+  margin: 0 0 -8px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.session-focus {
+  margin: 0;
+  color: var(--muted);
+  font-family: var(--font-schibsted), system-ui, sans-serif;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1;
+  text-align: center;
+  text-transform: lowercase;
+  letter-spacing: 0.02em;
+  opacity: 0.6;
+}
+
 .audio-actions {
   display: flex;
   flex-wrap: wrap;
@@ -442,7 +526,133 @@ html:not([data-outloud-hydrated="true"]) .app-shell button {
   font-size: 13.5px;
   font-weight: 500;
   line-height: 1;
-  cursor: default;
+  cursor: pointer;
+}
+
+/* Offered once when an open mic keeps coming back empty, so the learner never has to work out
+   that the room is the problem. */
+.noisy-offer {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+  animation: panel-in 220ms var(--ease-room) both;
+}
+
+.noisy-offer > button:first-child {
+  min-height: 34px;
+  padding: 0 14px;
+  border: 1px solid rgba(196, 69, 31, 0.35);
+  border-radius: 999px;
+  background: rgba(253, 251, 247, 0.9);
+  color: var(--terracotta);
+  font-family: var(--font-schibsted), system-ui, sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .noisy-offer {
+    animation: none;
+  }
+}
+
+/* "Step out": the learner leaves the roleplay to talk to the coach about what is actually in the
+   way. Kept visually distinct from every other room state on purpose -- the whole value of the
+   feature is knowing, without reading anything, that you are OUT of the scene and that the scene
+   is still there waiting. Sage rather than terracotta: this is the coach, not the character. */
+.step-out-chip {
+  appearance: none;
+  min-height: 32px;
+  margin-top: 16px;
+  padding: 0 14px;
+  border: 1px solid rgba(63, 107, 71, 0.28);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--sage);
+  font-family: var(--font-schibsted), system-ui, sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.step-out-chip:focus-visible {
+  outline: 2px solid rgba(63, 107, 71, 0.4);
+  outline-offset: 3px;
+}
+
+.aside-room {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  animation: panel-in 240ms var(--ease-room) both;
+}
+
+.aside-room h2 {
+  margin: 0;
+  text-align: center;
+}
+
+.aside-badge {
+  margin: 0;
+  color: var(--sage);
+  font-family: var(--font-schibsted), system-ui, sans-serif;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  text-transform: lowercase;
+  letter-spacing: 0.04em;
+  opacity: 0.75;
+}
+
+/* Everything already said. Capped and scrollable so a long aside cannot push the coach's current
+   line and the offer off a phone screen. */
+.aside-thread {
+  width: min(100%, 340px);
+  max-height: 132px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 2px 0;
+}
+
+.aside-thread p {
+  margin: 0;
+  font-family: var(--font-schibsted), system-ui, sans-serif;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.aside-said-coach {
+  color: var(--muted);
+}
+
+.aside-said-you {
+  color: var(--ink-soft);
+  text-align: right;
+  opacity: 0.75;
+}
+
+.aside-offer {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  animation: panel-in 220ms var(--ease-room) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .aside-room,
+  .aside-offer {
+    animation: none;
+  }
 }
 
 .session-tools {
@@ -452,6 +662,18 @@ html:not([data-outloud-hydrated="true"]) .app-shell button {
   justify-content: center;
   gap: 8px;
   margin-top: 18px;
+}
+
+/* Tools appear the first time they're relevant; fading them in reads as "unlocked" rather than
+   as the row jittering. Height is deliberately not animated. */
+.session-tools button.is-revealed {
+  animation: panel-in 220ms var(--ease-room) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .session-tools button.is-revealed {
+    animation: none;
+  }
 }
 
 .session-tools button {
@@ -725,6 +947,85 @@ html:not([data-outloud-hydrated="true"]) .app-shell button {
   text-align: center;
   text-transform: uppercase;
   letter-spacing: 0;
+}
+
+/*
+  #49 -- the one unprompted line when the learner beat their own blocker twice running. It is
+  spoken as part of the coach's turn, so on screen it must read as the coach noticing, not as a
+  badge: warm colour, no border, no icon, nothing that looks like a score.
+*/
+.session-callout {
+  margin: 0 0 10px;
+  color: var(--terracotta);
+  font-family: var(--font-schibsted), system-ui, sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.4;
+  text-align: center;
+  text-wrap: pretty;
+}
+
+/* Why the line is drawn at a login. Small, factual, never the loudest thing on the card. */
+.capture-fineprint {
+  margin: 10px auto 0;
+  max-width: 320px;
+  color: var(--muted);
+  font-family: var(--font-schibsted), system-ui, sans-serif;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.45;
+  text-align: center;
+  text-wrap: pretty;
+}
+
+/* The same truth at the end of every session, not only on the first verdict. */
+.account-nudge {
+  margin: 16px 0 0;
+  padding: 14px 16px;
+  border: 1px solid rgba(30, 27, 23, 0.1);
+  border-radius: 14px;
+  background: rgba(30, 27, 23, 0.03);
+  text-align: center;
+}
+
+.account-nudge p {
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-family: var(--font-schibsted), system-ui, sans-serif;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.45;
+  text-wrap: pretty;
+}
+
+/* Who is in the room (#29). Same weight as the focus line: both are facts about this session,
+   neither is something to act on. */
+.session-who {
+  margin: 0;
+  color: var(--muted);
+  font-family: var(--font-schibsted), system-ui, sans-serif;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1;
+  text-align: center;
+  /* Deliberately NOT lowercased like its sibling: this line contains a person's name, and the
+     product's lowercase voice does not extend to someone's name. The static words around it are
+     already written lowercase in the JSX. */
+  letter-spacing: 0.02em;
+  opacity: 0.6;
+}
+
+/* Only rendered when the verdict contradicts or complicates what the learner said (#46). */
+.verdict-evidence {
+  margin: 10px auto 0;
+  max-width: 320px;
+  color: var(--muted);
+  font-family: var(--font-schibsted), system-ui, sans-serif;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.45;
+  text-align: center;
+  text-wrap: pretty;
 }
 
 .verdict-moment {
@@ -1532,6 +1833,17 @@ html:not([data-outloud-hydrated="true"]) .app-shell button {
   flex-direction: column;
   gap: 8px;
   margin: 4px 0 16px;
+}
+
+/* Why this ladder is in this order (#48). One sentence, under the rungs, never a heading. */
+.ladder-why {
+  margin: -8px 0 16px;
+  color: var(--muted);
+  font-family: var(--font-schibsted), system-ui, sans-serif;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.45;
+  text-wrap: pretty;
 }
 
 .ladder-list button {

@@ -3,7 +3,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { converseResponseJsonSchema, converseResponseSchema } from "@/lib/converse-schema";
 import { isMockAiEnabled } from "@/lib/mock-ai";
-import { checkRateLimit } from "@/lib/rate-limit";
+import { checkRateLimit, openAiRequestsPerDay } from "@/lib/rate-limit";
 import { naturalSpanishSystemPrompt } from "@/lib/natural-spanish";
 import { retrievalVariationSchema } from "@/lib/practice-schema";
 import { rescueResponseSchema } from "@/lib/rescue-schema";
@@ -13,6 +13,12 @@ import type { ConverseResponse } from "@/lib/types";
 type ConversationState = {
   originalText: string;
   scenarioContext?: string | null;
+  /**
+   * True when this conversation replaces an earlier one because the learner stepped out and said
+   * the situation itself was wrong for them (see app/api/aside/route.ts). It inverts which of
+   * `originalText` and `scenarioContext` describes the scene -- see `baseSystemPrompt`.
+   */
+  sceneIsNew?: boolean;
   context: {
     who: string;
     dialect: string;
@@ -51,8 +57,47 @@ const requestSchema = z.object({
    * evaluated data, server owns "how to phrase it in character."
    */
   repairRequested: z.boolean().optional(),
+  /**
+   * #44 -- what the character is allowed to notice.
+   *
+   * `recentEvidence` is the real `/api/evaluate` verdict on EARLIER turns, already settled by the
+   * time this call is made, so it costs nothing to send and can be trusted about correctness.
+   * `thisTurn` is measurement only -- how the reply came out, not whether it was right -- because
+   * the evaluation of the current reply is still in flight when this request is sent.
+   *
+   * Without these the route knew only the raw attempt text and `repairRequested`, so the
+   * character answered in the same pleasant register whether the learner nailed it or dodged.
+   */
+  recentEvidence: z
+    .array(
+      z.object({
+        meaning: z.string(),
+        blocker: z.string().nullable(),
+        assistance: z.string(),
+      }),
+    )
+    .max(3)
+    .optional(),
+  thisTurn: z
+    .object({
+      assistance: z.string(),
+      usedSubtitle: z.boolean(),
+      unaidedRun: z.number().int().min(0).max(50),
+      secondsToFirstWord: z.number().nullable(),
+      hesitations: z.number().int().min(0).max(99),
+      englishWords: z.number().int().min(0).max(99),
+    })
+    .optional(),
   originalText: z.string().min(4).max(1600).optional(),
   scenarioContext: z.string().max(1600).nullable().optional(),
+  /**
+   * Set by a scene change out of an aside. Without it the first line of the new scene came out of
+   * the OLD situation -- a learner who had just said "ordering food is not my problem, it is my
+   * girlfriend's family at dinner" was moved to the family dinner and then asked what they would
+   * like to order, because `originalText` still described the cafe and the turn-0 guidance said to
+   * stay close to it.
+   */
+  sceneIsNew: z.boolean().optional().default(false),
   context: z
     .object({
       who: z.string().min(1),
@@ -66,7 +111,7 @@ const requestSchema = z.object({
 });
 
 export async function POST(request: Request) {
-  const limited = checkRateLimit(request, "converse", Number(process.env.MAX_OPENAI_REQUESTS_PER_SESSION ?? 25), 24 * 60 * 60 * 1000);
+  const limited = checkRateLimit(request, "converse", openAiRequestsPerDay(), 24 * 60 * 60 * 1000);
   if (limited) return limited;
 
   let body: unknown;
@@ -92,6 +137,7 @@ export async function POST(request: Request) {
       const state: ConversationState = {
         originalText: parsed.data.originalText,
         scenarioContext: parsed.data.scenarioContext ?? null,
+        sceneIsNew: parsed.data.sceneIsNew,
         context: parsed.data.context,
         rescue: parsed.data.rescue,
         transferPrompt: parsed.data.transferPrompt ?? null,
@@ -157,7 +203,10 @@ export async function POST(request: Request) {
     // to, instead of advancing. Only a turn the character actually understood advances the count
     // that `shouldClose`/`MAX_TURN_INDEX` are measured against.
     const nextTurnIndex = repairRequested ? state.currentTurnIndex : state.currentTurnIndex + 1;
-    const next = await generateTurn(parsed.data.conversationId, state, userAttempt, nextTurnIndex, repairRequested);
+    const next = await generateTurn(parsed.data.conversationId, state, userAttempt, nextTurnIndex, repairRequested, {
+      recentEvidence: parsed.data.recentEvidence ?? [],
+      thisTurn: parsed.data.thisTurn ?? null,
+    });
     state.turns.push({ turnIndex: nextTurnIndex, characterLineEs: next.characterLineEs, isRepairTurn: next.isRepairTurn });
     state.currentTurnIndex = nextTurnIndex;
     // The state object is a local copy of the stored row, so every mutation above (including the
@@ -180,9 +229,11 @@ const MOCK_PRESSURE_CURVEBALL_EN = "Really? Why?";
 const MOCK_ELABORATION_LINE_ES = "Cuéntame un poco más, ¿qué fue lo mejor?";
 const MOCK_ELABORATION_LINE_EN = "Tell me a little more, what was the best part?";
 
-function conversationDifficultyGuidance(turnIndex: number, pressureMode: boolean) {
+function conversationDifficultyGuidance(turnIndex: number, pressureMode: boolean, sceneIsNew = false) {
   if (turnIndex <= 0) {
-    return "Turn 1: stay close to the practiced pattern and the original situation. Prompt the user to use the phrase they just practiced.";
+    return sceneIsNew
+      ? "Turn 1: open the NEW scene described in scenarioContext, as the person in it. Your first line must be something that person would actually say in that place, to this learner, right now, about what is happening THERE. Do not open with the situation from originalText or the rescue card, and do not bring their errand, their topic or their objects along -- the learner has just told us that situation is not their problem, and opening there is the whole reason this scene exists. Do not hand them the practised pattern on this line either; let the scene ask for it."
+      : "Turn 1: stay close to the practiced pattern and the original situation. Prompt the user to use the phrase they just practiced.";
   }
   if (turnIndex === 1) {
     return pressureMode
@@ -204,6 +255,17 @@ async function generateTurn(
   userAttempt: string | null,
   turnIndex: number,
   repairRequested: boolean,
+  reaction: {
+    recentEvidence: Array<{ meaning: string; blocker: string | null; assistance: string }>;
+    thisTurn: {
+      assistance: string;
+      usedSubtitle: boolean;
+      unaidedRun: number;
+      secondsToFirstWord: number | null;
+      hesitations: number;
+      englishWords: number;
+    } | null;
+  } = { recentEvidence: [], thisTurn: null },
 ): Promise<ConverseResponse> {
   if (isMockAiEnabled()) {
     if (repairRequested) {
@@ -304,13 +366,60 @@ async function generateTurn(
     "Continue a short, bounded Spanish practice conversation. Act as the selected person, one realistic follow-up at a time. " +
     naturalSpanishSystemPrompt + " " +
     "Use short practice-appropriate Spanish, chosen tone/dialect, and meaning chunks rather than word-for-word translation. " +
-    "Treat originalText as the target message the user practiced. Treat scenarioContext as background only for relationship, setting, and topic coherence. " +
+    (state.sceneIsNew
+      ? // The learner asked for this scene by name. scenarioContext IS the situation now, and
+        // originalText survives only as evidence of how they speak -- never as the setting.
+        "scenarioContext IS the situation: it is the scene the learner asked to be put in, and every line you say belongs in it. " +
+        "originalText and the rescue card BOTH describe a DIFFERENT situation the learner has left behind -- its place, its topic, its errand, the specific thing they were trying to get. Carry over ONLY the pattern they are practising and the difficulty they have. Never set a line in that old situation, never mention its topic or the objects in it, and never ask them to do the errand it describes. The pattern transfers; the errand does not. "
+      : "Treat originalText as the target message the user practiced. Treat scenarioContext as background only for relationship, setting, and topic coherence. ") + +
     "If retrievalTransferPrompt is present, this is a retrieval session: keep the same learned skill, use the new related situation, and reduce help without launching a lesson. " +
     "Accept varied valid replies in the flow; do not imply there is only one exact sentence unless the user asks for the model answer. " +
+    // #14 -- the learner must produce more language than the coach. The coach route already caps
+    // its lines; this route, where most turns actually happen, had no limit at all, so the
+    // character could answer at any length it liked in a product whose point is the learner
+    // speaking. One idea per turn keeps the floor with them.
+    "characterLineEs is spoken out loud: keep it under 20 words and to ONE idea -- one question, or " +
+    "one reaction plus one question. Never stack a reaction, an explanation and a question in the " +
+    "same line, and never explain the learner's Spanish back to them; that is another surface's job. " +
+    "The learner should end every turn having said more than you did. " +
     "Close naturally within 4 to 8 character turns. Every response must set isRepairTurn and repairType -- on a normal turn, isRepairTurn is " +
     "false and repairType is null. Also produce suggestedReplyFrameEs (one natural Spanish sentence frame with exactly one blank, " +
     'e.g. "Sí, porque ___.") and suggestedReplyEs (one full natural Spanish answer the user could say for this turn\'s ' +
     "expectedCommunicativeFunction). Follow conversationDifficultyGuidance exactly for turn pacing. Output only structured JSON.";
+
+  /**
+   * #44 -- the character reacted identically whether the learner nailed it or dodged, because the
+   * route was never told which had happened.
+   *
+   * The split is deliberate and load-bearing: `recentEvidence` is settled, so the character may
+   * speak about it as fact. `thisTurn` is measurement of DELIVERY only -- the evaluation of the
+   * reply it just heard has not landed yet -- so reacting to it as if it were a verdict on the
+   * Spanish would be praising work nobody has checked, which is the exact failure Phase 0 spent
+   * itself removing.
+   */
+  const reactionPrompt = (() => {
+    if (!reaction.recentEvidence.length && !reaction.thisTurn) return "";
+    const lines = [
+      "You are given two kinds of signal about the learner. React to them AS THE CHARACTER, in one short beat before your line -- never as a teacher, never as a score, and never more than a handful of words.",
+    ];
+    if (reaction.recentEvidence.length) {
+      lines.push(
+        `recentEvidence is the settled verdict on their EARLIER replies, oldest first: ${JSON.stringify(reaction.recentEvidence)}. You may speak about these as fact. A run of "clear" with assistance "none" earns real, specific warmth -- surprise, even, if they used to need help. Repeated "unclear", or help climbing turn after turn, means stop being uniformly pleasant: slow down, make the next question smaller and more concrete.`,
+      );
+    }
+    if (reaction.thisTurn) {
+      lines.push(
+        `thisTurn describes only HOW the reply you just heard came out, not whether it was correct -- that evaluation has not finished: ${JSON.stringify(reaction.thisTurn)}. secondsToFirstWord and hesitations describe the pause before and inside their answer; englishWords is how much English leaked in; assistance and usedSubtitle are what they reached for on this turn; unaidedRun is how many replies in a row they have made without reaching for anything.`,
+      );
+      lines.push(
+        "You may react to delivery -- that it came out fast, or that they pushed through a long pause. You may NOT say or imply their Spanish was right, good, correct, perfect or well-formed on the basis of thisTurn: you have not been told that and it may be false. If they leaned on help or leaked English, do not congratulate; just carry on warmly and keep the next question small.",
+      );
+    }
+    lines.push(
+      "Never read these signals out loud, never mention timing in seconds, never name the help they used, and never let the reaction grow into a second sentence. It is a beat, then your line.",
+    );
+    return lines.join(" ");
+  })();
 
   const pressureModePrompt = state.pressureMode
     ? 'Pressure Mode is ON: you may, but do not have to, make this turn an unexpected_follow_up or brief subject change instead of the expected next beat. Keep it warm and never mocking. Good curveball examples to paraphrase: "¿por qué?", "¿en serio?", "espera, ¿qué?". If you use a curveball, keep it short and set expectedCommunicativeFunction to include unexpected_follow_up.'
@@ -326,8 +435,12 @@ async function generateTurn(
     'as "¿niños? ¿quieres niños?". Only use this when there is a real word in lastUserAttempt that could plausibly be ' +
     "misheard given the context -- never invent a mishearing out of nothing; if you are not sure, use non_comprehension " +
     "instead. characterLineEs is the confused line itself, in Spanish, in character. responseGuidanceEn should tell the " +
-    "user to try rephrasing, without revealing the correct answer, model phrasing, or any part of the target " +
-    "natural-version sentence or pattern. The character is a person who simply didn't catch it, not a judge or a teacher: " +
+    "user to try rephrasing IN THEIR OWN WORDS. This is the hardest rule on a repair turn and it was " +
+    "observed being broken: responseGuidanceEn must not contain any Spanish at all, must not name or " +
+    "quote a pattern or frame (nothing of the shape \"use 'Quisiera ___, por favor'\"), and must not " +
+    "hint at the target sentence. Say only that you did not catch it and to try saying it a different " +
+    "way. Handing them the phrasing here defeats the entire point: the learner is meant to repair " +
+    "their own meaning, which is the one skill a real conversation demands. The character is a person who simply didn't catch it, not a judge or a teacher: " +
     "stay warm and human, never mocking, never a wall of grammar correction -- this is confused dialogue, not feedback. " +
     "Do not end the conversation here: shouldClose must be false and closingReason must be null.";
 
@@ -338,8 +451,10 @@ async function generateTurn(
       {
         role: "system",
         content: repairRequested
+          // A repair turn deliberately gets no reaction prompt: the character did not understand,
+          // so it has nothing to be warm or pressing about yet.
           ? `${baseSystemPrompt} ${pressureModePrompt} ${repairSystemPrompt}`.trim()
-          : `${baseSystemPrompt} ${pressureModePrompt}`.trim(),
+          : `${baseSystemPrompt} ${pressureModePrompt} ${reactionPrompt}`.trim(),
       },
       {
         role: "user",
@@ -358,7 +473,7 @@ async function generateTurn(
           lastUserAttempt: userAttempt,
           repairRequested,
           pressureMode: state.pressureMode,
-          conversationDifficultyGuidance: conversationDifficultyGuidance(turnIndex, state.pressureMode),
+          conversationDifficultyGuidance: conversationDifficultyGuidance(turnIndex, state.pressureMode, state.sceneIsNew),
         }),
       },
     ],

@@ -4,7 +4,7 @@ import { z } from "zod";
 import { coachResponseJsonSchema, coachResponseSchema, type CoachPhase, type CoachResponse } from "@/lib/coach-schema";
 import { isMockAiEnabled } from "@/lib/mock-ai";
 import { naturalSpanishSystemPrompt } from "@/lib/natural-spanish";
-import { checkRateLimit } from "@/lib/rate-limit";
+import { checkRateLimit, openAiRequestsPerDay } from "@/lib/rate-limit";
 import { createSession, deleteSession, loadSession, saveSession } from "@/lib/session-store";
 
 /**
@@ -82,7 +82,7 @@ const requestSchema = z.discriminatedUnion("action", [
 ]);
 
 export async function POST(request: Request) {
-  const limited = checkRateLimit(request, "coach", Number(process.env.MAX_OPENAI_REQUESTS_PER_SESSION ?? 25), 24 * 60 * 60 * 1000);
+  const limited = checkRateLimit(request, "coach", openAiRequestsPerDay(), 24 * 60 * 60 * 1000);
   if (limited) return limited;
 
   let body: unknown;
@@ -316,6 +316,14 @@ function normalizeTurn(
     evidence: isOpening || phase !== "coaching"
       ? null
       : turn.evidence ?? { observedBlocker: "unclear", confidence: "low", noteEn: "No specific issue observed on this attempt." },
+    // Pinned to the scenario turn for the same reason `selfReportedBlocker` is pinned to framing:
+    // this is the one turn that introduces the person, and a later turn quietly replacing them
+    // would leave the learner talking to someone who was never introduced.
+    sceneCharacter: phase === "scenario" ? turn.sceneCharacter : null,
+    // Pinned to the framing turn structurally, not just by prompt: it is the only turn that has
+    // read the opening answer, and a later turn overwriting it would silently replace what the
+    // learner said about themselves with the model's own running read.
+    selfReportedBlocker: phase === "framing" ? turn.selfReportedBlocker : null,
     done,
     doneReason: mustFinish && !turn.doneReason ? "Enough for a first read." : turn.doneReason,
     intent: mustFinish ? "wrap_up" : turn.intent,
@@ -357,7 +365,7 @@ function pacingGuidance(
     return `Framing turn, IN ENGLISH. phase=framing, intent=probe, tool=path_choice with exactly two options. Structure of sayEs: (1) one short sentence that shows you heard them -- name the problem naturally, in your own words, like a coach would ("Words going missing mid-sentence -- that is the most common one."). NEVER start with "You said" and never quote their answer back; that phrasing is reserved for quoting their Spanish later. (2) one sentence that makes it normal and workable; (3) end with ONE question offering two concrete SITUATIONS to try it in, e.g. "Where do you want to try it first -- ordering at a cafe, or telling a friend about your weekend?". Both options MUST be situations (a place + a person + something to get done), phrased in the same grammatical form, never the skill itself (never "talking about vocabulary", "sentence structure practice", "grammar"). Option A: the situation from THEIR opening answer if they mentioned a place/person/moment; if they only named a skill, pick the everyday situation where exactly that skill bites hardest. Option B: a concrete situation built from rotationTopic: "${state.rotationTopic}". Each option: labelEn = 3-6 words naming the situation (shown as a button, e.g. "Ordering at a cafe"), scenarioEn = one sentence describing the scene: who they talk to and what they want. sayEs stays under 32 words total -- it is spoken AND shown on a phone screen. No Spanish yet.`;
   }
   if (turnIndex === 1) {
-    return `Scenario turn, IN ENGLISH. phase=scenario, intent=probe, tool=none (or preparation_time if their opening answer suggests they freeze). chosenScenario is "${state.chosenScenario ?? "their own context from the opening answer"}" (already resolved from what they said; if their answer named something else entirely, adopt that instead). NEVER offer the two directions again and never use path_choice from now on. YOU set the scene in one concrete sentence (who they are talking to, what they want -- e.g. "Her dad just asked how work is going."), then invite them: show me what you would say -- in Spanish, however it comes out. Do NOT ask them to describe the scene; you describe it, they speak in it. End on that invitation. sayEs under 40 words and ENTIRELY IN ENGLISH (the learner speaks Spanish next, you do not). No Spanish sentence to repeat; the point is that THEY produce it.`;
+    return `Scenario turn, IN ENGLISH. phase=scenario, intent=probe, tool=none (or preparation_time if their opening answer suggests they freeze). chosenScenario is "${state.chosenScenario ?? "their own context from the opening answer"}" (already resolved from what they said; if their answer named something else entirely, adopt that instead). NEVER offer the two directions again and never use path_choice from now on. YOU set the scene in one concrete sentence that NAMES the person and says what they are like -- a first name, their relation to the learner, and the one trait that makes them hard (e.g. "This is Carmen, your girlfriend's aunt -- warm, but she talks fast and won't slow down for you." or "This is Marco behind the counter -- friendly, but it is lunchtime and there are five people behind you."). A named stranger with a temperament is the whole point: the learner freezes in front of people, not in front of an exercise. Never a role alone ("the waiter"), never a name alone. Also fill sceneCharacter with exactly that person: name (first name only), relation (how they relate to the learner), traitEn (the one thing that makes them hard). It must match the sentence you just said, because the practice session that follows is with this same person. Then invite them: show me what you would say -- in Spanish, however it comes out. Do NOT ask them to describe the scene; you describe it, they speak in it. End on that invitation. sayEs under 40 words and ENTIRELY IN ENGLISH (the learner speaks Spanish next, you do not). No Spanish sentence to repeat; the point is that THEY produce it.`;
   }
   if (turnIndex === 2) {
     return `First coaching turn, phase=coaching. If the learner only agreed ("yes", "ok", "sure") or hesitated instead of speaking Spanish, become the other person in chosenScenario and open the scene with ONE short natural Spanish line they now have to answer (e.g. the waiter greeting them). If they already produced Spanish, react as the other person in the scene and continue. If what they produced is broken or half English (e.g. "do you wanna fiesta"), that IS the first stumble: repair now with one tool (keyword_card / sentence_frame / say_it_back), intent=retry, and let them say it again -- do not restart, do not re-explain the setup.${fineNote}`;
@@ -392,6 +400,7 @@ Always set "phase" to the phase you are in. Only framing and scenario are in Eng
 # How you work (coaching phase)
 - Cold water with a lifeline: ask ONE real, short question in Spanish that makes the learner actually speak — but the moment they stumble (empty, half-English, freeze, garbled), help immediately with exactly one tool and let them try the same thing again. Teaching is always allowed; diagnosis happens on the side.
 - Adapt everything to what they said trips them up. Missing words -> questions that need retrieval, keyword cards. Freezing under follow-ups -> unexpected but gentle follow-ups, preparation_time. Grammar -> sentence frames. Pronunciation -> say_it_back with slow_repeat.
+- From the scenario turn on you ARE the person you named -- same name, same temperament, every turn. Never rename them, never drop back into being a neutral coach mid-conversation, and never refer to yourself in the third person.
 - One idea per turn. sayEs is what you SAY OUT LOUD: max ~20 words, one question or one instruction. Never stack a question and an explanation in the same line.
 - Never test for the sake of testing. Every question must be something a real person might ask.
 - Tools are for repair, not decoration: attach a tool ONLY when the last attempt showed a need (or the learner asked). A good answer gets tool=none and a new question.
@@ -421,6 +430,12 @@ Always set "phase" to the phase you are in. Only framing and scenario are in Eng
 - On every coaching turn, evidence is REQUIRED and describes ONLY the last learner attempt: observedBlocker (short label like "vocabulary retrieval", "sentence assembly", "grammar control", "pronunciation intelligibility", "hesitation under pressure", "naturalness/register", "follow-up pressure", or "none" when it was fine), confidence, and one specific noteEn (e.g. "gender agreement: 'muy bueno' for 'la comida'", or "clean, natural, appropriate register"). Never write "unclear" if they said anything in Spanish -- judge it.
 - expectedCommunicativeFunction: what a good reply to sayEs would do (e.g. "name one thing you did yesterday").
 
+# The learner's own hypothesis
+- selfReportedBlocker classifies THEIR opening answer into one label. Set it on the framing turn ONLY (turnIndex 0); on every other turn it MUST be null, so a later turn cannot overwrite what they actually told you.
+- It is their hypothesis, not your diagnosis. Classify what they SAID, even when you already suspect they are wrong -- your own read belongs in evidence.observedBlocker, and the two are allowed to disagree. That disagreement is useful later; erasing it is not.
+- words_to_sentences: they know words but cannot build sentences. freeze_under_pressure: they blank when put on the spot. missing_words: the words will not come. pronunciation_nerves: they are hard to understand, or afraid of being. sounds_unnatural: understood, but textbook or socially off. grammar_falls_apart: tenses and agreement collapse. follow_ups_break_me: the opening is fine, the second question is not. not_sure: they described a feeling, a goal, or a situation without naming what breaks.
+- Use not_sure honestly and often. "I want to talk to my girlfriend's family" names a reason, not a blocker. Guessing a label there fabricates the one thing this whole flow exists to learn.
+
 # Ending
 - Set done=true when you can name the main blocker with medium/high confidence and the learner has had at least one successful retry after help, or when pacing tells you to. On the done turn, sayEs is a short warm closing line (no question), tool=none.
 - Follow the pacing field in the user message exactly. Output only structured JSON.
@@ -435,6 +450,20 @@ function mockTurn(
   mustFinish: boolean,
 ): CoachResponse {
   const noTool = { type: "none" as const, primaryEs: null, primaryEn: null, exampleEs: null, noteEn: null, options: null };
+  // Mock-only and deliberately crude -- the real classification is the model's job. This exists
+  // so the mock path exercises the same shape (set on framing, null everywhere else).
+  const mockSelfReported: CoachResponse["selfReportedBlocker"] =
+    turnIndex !== 0
+      ? null
+      : /\b(freeze|frozen|blank|panic|nervous)\b/i.test(state.openingAnswer)
+        ? "freeze_under_pressure"
+        : /\b(grammar|tense|conjugat)\b/i.test(state.openingAnswer)
+          ? "grammar_falls_apart"
+          : /\b(pronounc|accent)\b/i.test(state.openingAnswer)
+            ? "pronunciation_nerves"
+            : /\b(vocab|vocabulary|word|words)\b/i.test(state.openingAnswer)
+              ? "missing_words"
+              : "not_sure";
   const evidence =
     userAttempt === null || state.phase !== "coaching"
       ? null
@@ -455,6 +484,8 @@ function mockTurn(
       expectedCommunicativeFunction: "none",
       tool: noTool,
       evidence,
+      selfReportedBlocker: mockSelfReported,
+      sceneCharacter: null,
       done: true,
       doneReason: "Mock coach finished.",
     };
@@ -481,6 +512,8 @@ function mockTurn(
         ],
       },
       evidence: null,
+      selfReportedBlocker: mockSelfReported,
+      sceneCharacter: null,
       done: false,
       doneReason: null,
     };
@@ -490,13 +523,15 @@ function mockTurn(
     return {
       coachId,
       turnIndex,
-      sayEs: `Okay. Picture it: ${state.chosenScenario ?? "you are at the counter and the barista looks at you"}. Show me what you'd say — in Spanish, however it comes out.`,
+      sayEs: `Okay. This is Marco behind the counter — friendly, but it is lunchtime and there are five people behind you. ${state.chosenScenario ?? ""} Show me what you'd say — in Spanish, however it comes out.`.replace(/\s+/g, " "),
       meaningEn: "Scenario invitation.",
       intent: "probe",
       phase: "scenario",
       expectedCommunicativeFunction: "say your opening line in the scenario",
       tool: noTool,
       evidence: null,
+      selfReportedBlocker: mockSelfReported,
+      sceneCharacter: { name: "Marco", relation: "the barista", traitEn: "friendly, but it is lunchtime and there are five people behind you" },
       done: false,
       doneReason: null,
     };
@@ -533,5 +568,5 @@ function mockTurn(
     },
   ];
   const step = script[Math.min(turnIndex - 2, script.length - 1)];
-  return { coachId, turnIndex, ...step, phase: "coaching", evidence, done: false, doneReason: null };
+  return { coachId, turnIndex, ...step, phase: "coaching", evidence, selfReportedBlocker: mockSelfReported, sceneCharacter: null, done: false, doneReason: null };
 }

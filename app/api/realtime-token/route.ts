@@ -28,8 +28,20 @@ const requestSchema = z.discriminatedUnion("mode", [
   }),
 ]);
 
+// One token mint per page session (ensureRealtime short-circuits for the rest of the session), so
+// this is effectively "page loads per day" -- five is a sane production cost guard but makes the
+// voice layer impossible to iterate on locally. Defaults to the strict limit unless NODE_ENV is
+// explicitly "development", so an unset/unknown NODE_ENV in production fails safe.
+const realtimeSessionsPerDay = Number(
+  process.env.MAX_REALTIME_SESSIONS_PER_DAY ?? (process.env.NODE_ENV === "development" ? 100 : 5),
+);
+
+function realtimeTranscribeModel() {
+  return process.env.OPENAI_REALTIME_TRANSCRIBE_MODEL ?? "gpt-4o-mini-transcribe";
+}
+
 export async function POST(request: Request) {
-  const limited = checkRateLimit(request, "realtime", 5, 24 * 60 * 60 * 1000);
+  const limited = checkRateLimit(request, "realtime", realtimeSessionsPerDay, 24 * 60 * 60 * 1000);
   if (limited) return limited;
 
   if (process.env.OUTLOUD_REALTIME_ENABLED === "false") {
@@ -67,7 +79,15 @@ export async function POST(request: Request) {
             // gpt-4o-transcribe family does not return. This session instead needs a model that
             // streams input_audio_transcription.delta events so the placement screen can show the
             // transcript while the user is still speaking.
-            transcription: { model: process.env.OPENAI_REALTIME_TRANSCRIBE_MODEL ?? "gpt-4o-mini-transcribe" },
+            // The language hint is not optional here. Left to auto-detect, short learner replies
+            // came back as Korean ("아") and a clean Spanish "dónde está la biblioteca" came back
+            // as Danish ("Hvor er biblioteket?") -- the right meaning in the wrong language. Those
+            // transcripts are fed to the conversation as the learner's turn, so the character ends
+            // up answering something nobody said.
+            //
+            // The client restates this over `session.update` as the flow moves between its English
+            // scaffolding and the Spanish practice; this is only the opening value.
+            transcription: { model: realtimeTranscribeModel(), language: "en" },
             turn_detection: {
               type: "server_vad",
               threshold: 0.5,
@@ -95,6 +115,9 @@ export async function POST(request: Request) {
   return NextResponse.json({
     ok: true,
     model,
+    // The client has to restate the transcription model whenever it changes the language, because
+    // a partial `transcription` object would drop back to the session default.
+    transcribeModel: realtimeTranscribeModel(),
     voice,
     value,
     expiresAt: json.expires_at ?? json.client_secret?.expires_at ?? null,
@@ -124,7 +147,7 @@ ${naturalSpanishSystemPrompt}
   return `
 # Role & Objective
 You are Outloud's controlled live voice bridge, not a roleplay generator and not a tutor.
-The app owns every conversation turn. Your only job is to speak the exact Spanish text the app gives you in explicit response.create instructions.
+The app owns every conversation turn. Your only job is to speak the exact text the app gives you in explicit response.create instructions.
 ${naturalSpanishSystemPrompt}
 
 # Voice Bridge Rules
@@ -133,9 +156,10 @@ ${naturalSpanishSystemPrompt}
 - Never invent dialogue, continue the story, ask a follow-up, coach, correct, summarize, or add filler.
 - Never respond automatically to the learner's microphone input. The app will evaluate their transcript and decide the next line.
 - If asked to repeat more slowly, speak the same literal line more slowly without changing the wording.
+- MOST lines are Spanish, but not all of them: the app steps out of the roleplay to talk to the learner directly, and those lines are English. Say every line in the language it is written in. Never translate a line, never switch its language, and never read an English line with a Spanish accent.
 
 # Delivery Style Only
-- Deliver literal Spanish lines using ${data.context.dialect} Spanish pronunciation and a ${data.context.tone.toLowerCase()} tone.
+- Deliver literal Spanish lines using ${data.context.dialect} Spanish pronunciation and a ${data.context.tone.toLowerCase()} tone. An English line is spoken as natural English, warm and unhurried.
 - Treat the character as ${data.context.who} only for warmth, pace, and delivery style; do not use that context to create new content.
 
 # Character Delivery

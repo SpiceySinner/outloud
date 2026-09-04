@@ -2,14 +2,31 @@
 
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { OrbCanvas } from "./components/OrbCanvas";
-import { derivePracticeLedgerState } from "@/lib/learning-loop";
-import { createInterventionOutcome } from "@/lib/teaching-policy";
-import type { AssistanceUsed, AttemptEvaluation, FreezeSignals, RescueResponse } from "@/lib/types";
+import { assistanceRank, derivePracticeLedgerState } from "@/lib/learning-loop";
+import { shouldTriggerRepair } from "@/lib/repair-loop";
+import {
+  assistanceOrderFor,
+  blockerHypothesisMap,
+  chooseTeachingPolicy,
+  createInterventionOutcome,
+  teachingRationaleFor,
+} from "@/lib/teaching-policy";
+import { blockerFocusLabels, normalizeObservedBlocker } from "@/lib/blocker-taxonomy";
+import type {
+  AssistanceUsed,
+  AttemptEvaluation,
+  BlockerType,
+  FreezeSignals,
+  RescueResponse,
+  SelfReportedBlocker,
+} from "@/lib/types";
 import { openingPrompt, staticAudioForText } from "@/lib/static-lines";
 import type { CoachResponse } from "@/lib/coach-schema";
+import type { AsideResponse } from "@/lib/aside-schema";
 import Link from "next/link";
 import { getSupabaseBrowser } from "@/lib/supabase-browser";
 import { resumeMomentKey, type ResumeMoment } from "@/lib/account-links";
+import type { TranscriptionConfidenceTier } from "@/lib/transcription-confidence";
 
 type RoomMode = "landing" | "speaks-first" | "stung";
 type TurnState = "ready" | "listening" | "still-listening" | "thinking" | "speaking";
@@ -36,8 +53,18 @@ type ConverseReply = {
   expectedCommunicativeFunction?: string;
   suggestedReplyFrameEs: string;
   suggestedReplyEs?: string;
+  /** The single most useful word for this turn -- see converseResponseSchema. */
+  keyWord?: { es: string; en: string } | null;
   responseGuidanceEn: string;
   shouldClose?: boolean;
+  /**
+   * True when this line is the character admitting it did not understand, rather than a normal
+   * next beat. Already on the wire (see `lib/types.ts`); the local type simply never declared it,
+   * so the client could not tell a repair turn from an ordinary one -- which is exactly what
+   * `shouldTriggerRepair` needs in order not to fire twice in a row.
+   */
+  isRepairTurn?: boolean;
+  repairType?: "non_comprehension" | "mishearing" | null;
 };
 
 type PlacementPrompt = {
@@ -54,6 +81,13 @@ type PlacementAttempt = PlacementPrompt & {
    * probe = answered a real question; retry = repeated something the coach handed over.
    */
   kind: "setup" | "probe" | "retry";
+  /**
+   * True when this attempt's capture confidence was borderline. Carried per-attempt rather than
+   * as one shared flag because finishPlacement batches and re-evaluates multiple attempts
+   * collected across the whole coaching conversation -- a shared "last capture" flag would
+   * mislabel earlier attempts in that batch.
+   */
+  lowConfidence?: boolean;
 };
 
 type SessionTurn = {
@@ -92,6 +126,8 @@ type RealtimeTokenResponse = {
   ok: true;
   value: string;
   model: string;
+  /** Restated on every language switch; a partial `transcription` object would drop the model. */
+  transcribeModel?: string;
   voice: string;
   expiresAt: string | null;
 };
@@ -126,6 +162,8 @@ const ignorableRealtimeErrorCodes = new Set([
 
 // How long the orb waits after the coach finishes before it stops listening on its own.
 const autoListenIdleMs = 10000;
+// How long an armed (open but not capturing) mic may sit in silence before it closes itself.
+const armedIdleCutoffMs = 120000;
 // A press longer than this is treated as classic push-to-talk (release ends the turn).
 const holdToTalkThresholdMs = 700;
 
@@ -166,12 +204,6 @@ const emptyFreezeSignals: FreezeSignals = {
   summary: "No spoken timing available.",
 };
 
-function inferSelfReportedBlocker(attempt: string) {
-  return /\b(vocab|vocabulary|word|words|phrase|phrases)\b/i.test(attempt)
-    ? "missing_words"
-    : "not_sure";
-}
-
 function buildPlacementText(openingAnswer: string, attempts: PlacementAttempt[], mode: RoomMode) {
   const setup = attempts.filter((attempt) => attempt.kind === "setup").map((attempt) => attempt.userAttempt);
   const scenario = setup.length ? ` Chosen scenario: ${setup[0]}.` : "";
@@ -198,6 +230,15 @@ function looksBrokenAttempt(attempt: string) {
     attempt.includes("...") ||
     /\b(uh|um|ehm|how do you say|the|and|you|want|is|was|do|don't|know)\b/i.test(attempt)
   );
+}
+
+/** Never let a logging call throw on a circular or exotic value. */
+function safeJson(value: unknown) {
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
+  }
 }
 
 function nowMs() {
@@ -234,6 +275,18 @@ const mediaRecorderTypes = [
   "audio/mp4",
   "audio/aac",
 ];
+
+// Shared by both capture paths so they can't drift: echo cancellation is what stops an open mic
+// from hearing the coach through the speaker, and the recorder fallback needs it just as much as
+// the realtime path does.
+const micConstraints: MediaStreamConstraints = {
+  audio: {
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true,
+    channelCount: 1,
+  },
+};
 
 const feedbackQuestions: FeedbackQuestion[] = [
   {
@@ -316,14 +369,6 @@ function visibleFeedbackQuestions(answers: FeedbackAnswer[]) {
       (helped?.selected === "kind of" || helped?.selected === "no"),
   );
 }
-
-const assistanceRungs = [
-  ["wait", "a little more time", ""],
-  ["nudge", "small clue", "think about who you're talking to"],
-  ["keyword", "one useful word", "porque"],
-  ["frame", "sentence shape", "me cuesta ___"],
-  ["model answer", "hear it once", "me cuesta encontrar las palabras."],
-];
 
 function ExitIcon() {
   return (
@@ -410,6 +455,7 @@ type VerdictSnapshot = {
   placementRescue: RescueResponse;
   coachLoot: Array<{ es: string; en: string | null }>;
   coachEvidence: string[];
+  reportedBlocker: SelfReportedBlocker | null;
 };
 
 function ProfileGlyph() {
@@ -603,8 +649,30 @@ export default function Home() {
   const realtimeOutputAudioActiveRef = useRef(false);
   const overlayRef = useRef<RoomOverlay>(null);
   const typedFallbackOpenRef = useRef(false);
+  // Read from realtime event handlers, which can fire inside the render the state changed in.
+  const flowPhaseRef = useRef<FlowPhase>("opening");
+  const coachPhaseRef = useRef<CoachResponse["phase"] | null>(null);
   const pressStartedAtRef = useRef(0);
   const pressKindRef = useRef<"start" | "finish" | "interrupt" | null>(null);
+  /**
+   * What the microphone is doing right now. Replaces the scattered track.enabled flipping with one
+   * derived value, because full-duplex adds a third state between "off" and "recording":
+   *
+   * - `closed`    -- track disabled. Nothing reaches the server.
+   * - `armed`     -- track live but no turn is in progress. Speaking starts one. Runs the stricter
+   *                  `guard` VAD profile so room noise doesn't open a turn nobody asked for.
+   * - `capturing` -- a turn is in progress and being transcribed.
+   */
+  const micWindowRef = useRef<"closed" | "armed" | "capturing">("closed");
+  const micModeRef = useRef<"open" | "push">("open");
+  /**
+   * Mirror of the `micAsleep` state, for the derivation and event handlers that run outside render.
+   * The state drives the copy; the ref is what deriveMicWindow can read synchronously.
+   */
+  const micSleepingRef = useRef(false);
+  /** Consecutive captures that produced nothing usable -- the signal that a room is too noisy. */
+  const noisyStrikesRef = useRef(0);
+  const noisyOfferShownRef = useRef(false);
   const [mode, setMode] = useState<RoomMode>("landing");
   const [turnState, setTurnState] = useState<TurnState>("speaking");
   const [interruptible, setInterruptible] = useState(false);
@@ -619,10 +687,24 @@ export default function Home() {
   const restoreVerdictAfterAuthRef = useRef<(email: string) => void>(() => undefined);
   const [typedFallbackOpen, setTypedFallbackOpen] = useState(false);
   const [typedAttempt, setTypedAttempt] = useState("");
+  // True when the typed-fallback box is open to confirm/repair a just-captured spoken transcript,
+  // rather than because voice wasn't available at all -- changes the box's copy and inputMode.
+  const [transcriptNeedsConfirm, setTranscriptNeedsConfirm] = useState(false);
+  // Carries the captured attempt's confidence tier through the confirm step to /api/evaluate.
+  const [pendingAttemptConfidence, setPendingAttemptConfidence] = useState(false);
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [turnIndex, setTurnIndex] = useState(0);
   const [coachLine, setCoachLine] = useState<string | null>(null);
   const [coachMeaning, setCoachMeaning] = useState<string | null>(null);
+  /**
+   * Whether coachMeaning currently holds a TRANSLATION of the Spanish line or an INSTRUCTION the
+   * learner is being asked to follow ("say this back once..."). Only translations get folded behind
+   * a tap -- hiding an instruction would hide the thing they're supposed to do.
+   */
+  const [coachMeaningKind, setCoachMeaningKind] = useState<"translation" | "instruction" | null>(null);
+  // Collapsed state of the English translation. Manual only -- no auto-fold timer, deliberately:
+  // a timed reveal would teach "wait two seconds and the answer appears."
+  const [englishFolded, setEnglishFolded] = useState(true);
   const [, setLastTranscript] = useState<string | null>(null);
   const [roomNote, setRoomNote] = useState<string | null>(null);
   const [overlay, setOverlay] = useState<RoomOverlay>(null);
@@ -633,6 +715,23 @@ export default function Home() {
   const [feedbackSubmitting, setFeedbackSubmitting] = useState(false);
   const [feedbackSaved, setFeedbackSaved] = useState(false);
   const [eyesOffMode, setEyesOffMode] = useState(false);
+  /**
+   * "open" keeps the mic live while it is the learner's turn, so they just talk -- the whole point
+   * of full-duplex, since nobody reads "tap the orb to speak". "push" is the pre-full-duplex
+   * behaviour, kept intact as the one-value rollback and as the fallback offered when a room turns
+   * out to be too noisy for an open mic.
+   */
+  const [micMode, setMicMode] = useState<"open" | "push">(() => {
+    if (typeof window === "undefined") return "open";
+    return window.localStorage.getItem("outloud-mic-mode") === "push" ? "push" : "open";
+  });
+  /** The one-tap "noisy room?" offer, shown once per session after repeated dead captures. */
+  const [noisyOfferOpen, setNoisyOfferOpen] = useState(false);
+  /** An armed mic that closed itself after a long silence. Drives the copy, so it must be state. */
+  const [micAsleep, setMicAsleep] = useState(false);
+  // How real the character feels. "patient" behaves like "real" for now -- there is no
+  // differentiated server behavior for it yet, only real/pressure branch anything server-side.
+  const [toneMode, setToneMode] = useState<"patient" | "real" | "pressure">("real");
   const [askDraft, setAskDraft] = useState("");
   const [askStatus, setAskStatus] = useState<"idle" | "asking" | "answered" | "error">("idle");
   const [askAnswer, setAskAnswer] = useState<LifelineResponse | null>(null);
@@ -640,6 +739,11 @@ export default function Home() {
   const [correctionRetryResult, setCorrectionRetryResult] = useState<AttemptEvaluation | null>(null);
   const [pronunciationResult, setPronunciationResult] = useState<PronunciationCoaching | null>(null);
   const [lastVoiceFreeze, setLastVoiceFreeze] = useState<FreezeSignals | null>(null);
+  // Whisper's confidence tier for the last file-transcribed capture -- null on the realtime path,
+  // which has no equivalent signal. Surfaced in the correction sheet per item #15.
+  const [lastTranscriptionConfidence, setLastTranscriptionConfidence] = useState<TranscriptionConfidenceTier | null>(
+    null,
+  );
   const [flowPhase, setFlowPhase] = useState<FlowPhase>("opening");
   const [openingAnswer, setOpeningAnswer] = useState("");
   const [coachId, setCoachId] = useState<string | null>(null);
@@ -648,6 +752,130 @@ export default function Home() {
   const [coachLoot, setCoachLoot] = useState<Array<{ es: string; en: string | null }>>([]);
   // Per-turn coach observations, passed to /api/rescue so the card matches the actual session.
   const [coachEvidence, setCoachEvidence] = useState<string[]>([]);
+  /**
+   * The learner's own hypothesis about what trips them up, classified by the coach from their
+   * opening answer. This used to be a client-side regex that could only ever return
+   * "missing_words" or "not_sure", which made six of the eight blockers in the taxonomy
+   * unreachable and filed most learners under "not_sure" -- the value that maps to the generic
+   * teaching policy. Everything downstream (the verdict's stated-vs-observed line, the session
+   * focus line, the saved moment) reads this, so it had to become real first.
+   */
+  const [reportedBlocker, setReportedBlocker] = useState<SelfReportedBlocker | null>(null);
+  /**
+   * The strongest help the learner actually reached for on the CURRENT session turn.
+   *
+   * `/api/evaluate` was being sent a hardcoded `assistanceUsed: "none"` on every session turn, so
+   * every stored intervention outcome claimed the learner needed no help -- which both poisons
+   * `derivePersonalTeachingModel` and would make an "you did that without me" callout (#49) fire
+   * after someone read the model answer. That is a Phase-0 class lie, so the callout could not be
+   * built until this was real.
+   *
+   * Rank order comes from `assistanceRank`: a turn records the highest rung reached, not the last.
+   */
+  const turnAssistanceRef = useRef<AssistanceUsed>("none");
+  /**
+   * Consecutive session turns that came out clear without the learner escalating past the
+   * always-visible guidance. A ref, not state: it is read inside the submit handler immediately
+   * after the evaluation lands, where a state value would still be a render behind.
+   */
+  const unaidedRunRef = useRef(0);
+  /**
+   * Whether the learner opened the English subtitle on the current turn.
+   *
+   * Kept apart from `turnAssistanceRef` on purpose. `assistanceUsed` describes help with
+   * PRODUCING the reply and feeds the teaching model, and reading what the coach said is
+   * comprehension, not production -- filing it as `repeat` or `english_explanation` would teach
+   * the model the wrong thing about which interventions work. But the callout claims the learner
+   * did not reach for help *at all*, and opening the subtitle is plainly reaching. So it blocks
+   * the callout without touching the graded value.
+   */
+  const turnSubtitleRef = useRef(false);
+  /**
+   * Opt-in tracing of the whole voice path. Enable with:
+   *   localStorage["outloud-debug-realtime"] = "1"
+   *
+   * The voice layer fails silently in a dozen places by design -- a closed data channel, a
+   * superseded press, a guard that returns early, a `catch {}` that drops to the MediaRecorder
+   * fallback. From the outside every one of them looks identical: "the mic does nothing". This
+   * makes each of them say so.
+   */
+  const realtimeDebugRef = useRef(false);
+  /**
+   * True from the moment a capture is closed until its transcript resolves.
+   *
+   * Transcription for a turn ALWAYS arrives after the mic window has closed -- `finishRealtimeListening`
+   * closes it and only then waits for the text. The guard on transcript accumulation therefore
+   * cannot key on "window is closed" alone; doing so discarded every real transcript on the
+   * realtime path while letting through exactly nothing. This marks the window in which a closed
+   * mic is still expecting its own result.
+   */
+  const awaitingTranscriptRef = useRef(false);
+  /** Returned by the token route so a language switch can restate it. */
+  const realtimeTranscribeModelRef = useRef("gpt-4o-mini-transcribe");
+  /** The language currently pinned on the realtime transcriber, to avoid redundant updates. */
+  const realtimeLanguageRef = useRef<"en" | "es">("en");
+  function vlog(scope: string, ...rest: unknown[]) {
+    if (!realtimeDebugRef.current) return;
+    const line = [
+      `[voice:${scope}]`,
+      ...rest.map((value) =>
+        typeof value === "string" || typeof value === "number" || typeof value === "boolean"
+          ? String(value)
+          : value instanceof Error
+            ? `${value.name}: ${value.message}`
+            : safeJson(value),
+      ),
+      `| mic:${micWindowRef.current} mode:${micModeRef.current} turn:${turnStateRef.current} capturing:${realtimeActiveCaptureRef.current}`,
+    ].join(" ");
+    // Written to a buffer as well as the console. Console filters (and DevTools opened after the
+    // fact) silently hide console.log, which during this bug looked exactly like "no logging".
+    // `__outloudVoiceDump()` survives both.
+    const store = window as unknown as { __outloudVoiceLog?: string[] };
+    store.__outloudVoiceLog ??= [];
+    store.__outloudVoiceLog.push(`${new Date().toISOString().slice(11, 23)} ${line}`);
+    console.log(line);
+  }
+  const calloutSpokenRef = useRef(false);
+  const [sessionCallout, setSessionCallout] = useState<string | null>(null);
+  /**
+   * Who the learner is talking to (#29), named by the coach on the scenario turn and carried into
+   * the practice session. Without this the session fell back to `who: "an OutLoud Spanish coach"`
+   * -- a role, not a person -- and the named stranger the learner had just been introduced to
+   * silently became an anonymous tutor, which is the opposite of the social pressure the whole
+   * scenario exists to create.
+   */
+  const [sceneCharacter, setSceneCharacter] = useState<CoachResponse["sceneCharacter"]>(null);
+  /**
+   * "Step out": the learner leaves the scene mid-turn to talk to the coach about what is actually
+   * in their way, then comes back to the same sentence.
+   *
+   * Deliberately NOT an overlay. `deriveMicWindow` closes the mic whenever `overlayRef` is set,
+   * so an aside built as a sheet would be silent -- and a silent "let's talk about it" is the one
+   * shape this cannot have. It is a mode inside the room instead: same orb, same mic, same
+   * `turnState` machine, different register.
+   *
+   * The scene is frozen, never torn down. `conversationId`, `turnIndex` and
+   * `currentConversationTurn` are untouched for the whole aside, so an aside costs no practice
+   * turns and `restoreCurrentTurn` puts the learner back on the exact line they walked out of.
+   */
+  const [asideActive, setAsideActive] = useState(false);
+  // Read by deriveMicWindow, expectsEnglishAnswerNow and the realtime handlers, all of which run
+  // outside render -- the state alone would lag them by one commit.
+  const asideActiveRef = useRef(false);
+  const [asideLine, setAsideLine] = useState<string | null>(null);
+  const [asideOffer, setAsideOffer] = useState<AsideResponse["offer"]>(null);
+  /** What has been said in this aside, oldest first. Shown so the learner can see the thread. */
+  const [asideExchange, setAsideExchange] = useState<Array<{ who: "coach" | "you"; text: string }>>([]);
+  /**
+   * A blocker the learner corrected the coach on. Takes precedence over both the observed and the
+   * stated focus for the rest of the session: they just told us to our face what is wrong, which
+   * outranks anything inferred from a transcript.
+   */
+  const [asideFocusOverride, setAsideFocusOverride] = useState<BlockerType | null>(null);
+  /** Consecutive replies that were understood but did not land -- the "this isn't working" signal. */
+  const asideStrikesRef = useRef(0);
+  const asideNudgeShownRef = useRef(false);
+  const [asideNudgeOpen, setAsideNudgeOpen] = useState(false);
   const [authOpen, setAuthOpen] = useState(false);
   // Which side of the dialog to land on, decided by where the visitor tapped.
   const [authIntent, setAuthIntent] = useState<"signup" | "signin">("signup");
@@ -664,6 +892,16 @@ export default function Home() {
   const [returnEmail, setReturnEmail] = useState("");
   const [returnEmailStatus, setReturnEmailStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [profileEvidenceIndex, setProfileEvidenceIndex] = useState(0);
+  /**
+   * Who the learner is talking to, for every route that takes a context. `who` drives register
+   * and tone judgments in the rescue and the evaluation as well as the conversation itself, so a
+   * named person with a temperament produces better calls than the role string it replaces.
+   */
+  const conversationWho = sceneCharacter
+    ? `${sceneCharacter.name}, ${sceneCharacter.relation} (${sceneCharacter.traitEn})`
+    : mode === "stung"
+      ? "a real person from the learner's situation"
+      : defaultConversationContext.who;
   const [clientSessionId] = useState<string | null>(() => {
     if (typeof window === "undefined") return null;
     const key = "outloud-session-id";
@@ -678,30 +916,48 @@ export default function Home() {
   const [lastReviewUrl, setLastReviewUrl] = useState<string | null>(null);
   const isLanding = mode === "landing";
   const isStung = mode === "stung";
+  const pressureMode = toneMode === "pressure";
   const isUserTurn = turnState === "ready" || turnState === "listening" || turnState === "still-listening";
+  // Single source of truth for "the orb cannot be pressed right now", used by both the button's
+  // disabled prop and its visual state so the two can never disagree.
+  const orbDisabled =
+    isLanding ||
+    Boolean(overlay) ||
+    typedFallbackOpen ||
+    turnState === "thinking" ||
+    (turnState === "speaking" && !interruptible);
   const orbState =
-    turnState === "still-listening"
-      ? "still-listening"
-      : turnState === "ready"
-        ? "ready"
-        : turnState;
+    // A line the learner can only listen to. This is the one case where they genuinely cannot act,
+    // so it gets the inert grey config -- previously it rendered the MOST inviting one in the set.
+    (turnState === "speaking" && !interruptible) || typedFallbackOpen
+      ? "quiet"
+      : turnState === "still-listening"
+        ? "still-listening"
+        : turnState === "ready"
+          ? "ready"
+          : // "thinking" keeps its fast spin: it reads as working, not as shut off.
+            turnState;
+  // With an open mic every "tap the orb" instruction is a lie, and wrong instructions are worse
+  // than none -- the whole reason for full-duplex is that people don't read them. `micLive` is the
+  // one condition that decides which wording is true right now.
+  const micLive = micMode === "open" && !micAsleep;
   const roomLabel = {
-    ready: "your turn",
+    ready: micLive ? "just start talking" : "tap the orb to speak",
     listening: "listening",
     "still-listening": "still listening",
     thinking: "thinking",
     speaking: "speaking",
   }[turnState];
   const roomSubcopy = {
-    ready: "tap the orb to speak",
-    listening: "just talk — tap when you're done",
+    ready: "",
+    listening: micLive ? "take your time — I'll know when you stop" : "just talk — tap when you're done",
     "still-listening": "take your time",
     thinking: "putting that together",
     speaking: interruptible ? "tap the orb to interrupt" : "",
   }[turnState];
   const holdLabel = {
-    ready: "tap the orb to talk",
-    listening: "tap when you're done",
+    ready: micLive ? "the mic is on — just start talking" : "tap the orb to talk",
+    listening: micLive ? "listening — stop when you're done" : "tap when you're done",
     "still-listening": "still listening",
     thinking: "thinking",
     speaking: interruptible ? "tap to interrupt" : "listen",
@@ -712,8 +968,29 @@ export default function Home() {
     activeFeedbackQuestions[Math.min(feedbackStep, activeFeedbackQuestions.length - 1)] ??
     activeFeedbackQuestions[0];
   const overlayKind = isPrimaryCard(overlay) ? "card" : "sheet";
+  // Hidden while the coach talks: during speech the only affordance that matters is cutting in.
   const showSessionTools =
-    !isLanding && flowPhase === "session" && !typedFallbackOpen && turnState !== "thinking";
+    !isLanding &&
+    flowPhase === "session" &&
+    // help / fix / pronounce all act on the Spanish turn. Stepped out there is no Spanish turn,
+    // and a "pronounce" chip under a conversation about why this is not working is absurd.
+    !asideActive &&
+    !typedFallbackOpen &&
+    turnState !== "thinking" &&
+    turnState !== "speaking";
+  /**
+   * The escape hatch, and deliberately not part of `showSessionTools`: it survives progressive
+   * disclosure (it is the one thing that must be there on turn one) and it survives the coach
+   * speaking, because "actually, hang on" most often arrives mid-sentence.
+   */
+  const showStepOut =
+    !isLanding &&
+    flowPhase === "session" &&
+    !asideActive &&
+    !overlay &&
+    !typedFallbackOpen &&
+    Boolean(currentConversationTurn) &&
+    turnState !== "thinking";
   const currentPlacementPrompt: PlacementPrompt | null = coachTurn
     ? {
         characterLineEs: coachTurn.sayEs,
@@ -769,6 +1046,106 @@ export default function Home() {
     latestSessionEvaluation?.pronunciationTargets[0] ??
     placementRescue?.pronunciationTargets[0] ??
     null;
+  /**
+   * Session tools appear the first time they can actually do something, so turn one shows the orb
+   * and one help affordance instead of five controls, three of which are meaningless before the
+   * learner has made a mistake.
+   *
+   * Derived rather than latched in state because `sessionTurns` is append-only within a session
+   * (and reset by enterRoom), which makes these naturally sticky: once a turn has produced a
+   * correction or a pronunciation target, the `.some(...)` stays true even though the "latest"
+   * derivations above can go null again on a later turn. A chip that appears, vanishes and returns
+   * would be worse than showing all five from the start.
+   */
+  const everFix = sessionTurns.some((turn) => Boolean(turn.evaluation?.correctedAttemptEs));
+  const everPronounce =
+    Boolean(activePronunciationTarget) ||
+    sessionTurns.some((turn) => (turn.evaluation?.pronunciationTargets.length ?? 0) > 0);
+  const everAsk = sessionTurns.length >= 1;
+  // The escalating help ladder, built from what this session actually has to offer. It used to be
+  // a hardcoded array with invented sample text ("porque", "me cuesta ___") and a fixed current
+  // rung -- help that shows fabricated help is worse than no help button at all.
+  /**
+   * #47 -- the one thing this session is about, named at the top of the room so the learner can
+   * glance at any session and see it is about their thing. Set by the evidence, never configured
+   * by the user.
+   *
+   * Evidence outranks the hypothesis: what actually happened is a better answer than what they
+   * guessed. But `insufficient_evidence` is not evidence -- it is the absence of it -- so it
+   * falls through to what they told us rather than printing "finding out what trips you up" over
+   * a learner who already said.
+   *
+   * Deliberately read from the PLACEMENT, not from `latestSessionEvaluation`. Keyed to the latest
+   * turn it drifted: the line read "today: the words that go missing", then three turns later
+   * "today: sounding like a person", and the profile card disagreed with the line above the orb
+   * in the same room. A focus that changes every turn is not a focus. The placement verdict is
+   * fixed for the whole session, which is exactly what "today: X" claims to be.
+   */
+  const observedFocus: BlockerType | null =
+    placementRescue?.actionable_feedback.issueType ??
+    (placementRescue ? normalizeObservedBlocker(placementRescue.observed_blocker.type) : null);
+  const statedFocus: BlockerType | null =
+    reportedBlocker && reportedBlocker !== "not_sure" ? blockerHypothesisMap[reportedBlocker] : null;
+  const focusBlocker: BlockerType | null =
+    // The learner correcting us in an aside wins over both: `observedFocus` is inferred from
+    // transcripts and `statedFocus` from one answer at intake, but the override is them saying it
+    // outright, mid-session, after seeing what the session actually does.
+    asideFocusOverride ??
+    (!observedFocus || observedFocus === "insufficient_evidence" ? statedFocus ?? observedFocus : observedFocus);
+  const sessionFocusLine = focusBlocker ? blockerFocusLabels[focusBlocker] : null;
+  //
+  // #48 -- the ladder used to be one fixed order shown to everyone. What each rung IS comes from
+  // this session; the ORDER now comes from the diagnosed blocker via `assistanceOrderFor`. Same
+  // correction moment, different medicine: missing words get the word first, a sentence that will
+  // not assemble gets the shape first, a freeze gets time first.
+  //
+  // Keyed by `AssistanceUsed` so the catalog and the policy cannot drift apart -- adding a rung
+  // to the policy without a catalog entry becomes a type error rather than a silently missing
+  // rung.
+  const assistanceCatalog: Record<AssistanceUsed, { label: string; sample: string }> = {
+    none: { label: "a little more time", sample: "" },
+    repeat: { label: "hear the question again", sample: currentConversationTurn?.characterLineEs ?? "" },
+    keyword: {
+      label: "one useful word",
+      // This turn's key word first: important_phrase is a whole phrase from the placement, which
+      // reads oddly under a "one useful word" label.
+      sample: currentConversationTurn?.keyWord?.es ?? placementRescue?.important_phrase.spanish ?? "",
+    },
+    slower_audio: { label: "hear it slowly", sample: currentConversationTurn?.characterLineEs ?? "" },
+    english_explanation: { label: "what to get across", sample: currentConversationTurn?.responseGuidanceEn ?? "" },
+    sentence_frame: {
+      label: "sentence shape",
+      sample:
+        currentConversationTurn?.suggestedReplyFrameEs ?? placementRescue?.transferableChunk.patternEs ?? "",
+    },
+    full_model: {
+      label: "hear it once",
+      // The answer to the line on screen, not the placement's natural version -- that one is a
+      // concatenation of the whole intake and reads as a wall of unrelated sentences here.
+      sample: currentConversationTurn?.suggestedReplyEs || activeCorrection.naturalVersion,
+    },
+  };
+  const assistanceRungNames: Record<AssistanceUsed, string> = {
+    none: "wait",
+    repeat: "again",
+    keyword: "keyword",
+    slower_audio: "slower",
+    english_explanation: "nudge",
+    sentence_frame: "frame",
+    full_model: "model answer",
+  };
+  // "wait" is pinned to the top rather than taken from the policy: it costs nothing, is always
+  // available, and every order that omits it still starts by giving the learner a moment.
+  const assistanceOrder = ([
+    "none",
+    ...(focusBlocker ? assistanceOrderFor(focusBlocker) : ["keyword", "sentence_frame", "full_model"]),
+  ] as AssistanceUsed[]).filter((step, index, all) => all.indexOf(step) === index);
+  const assistanceLadder = assistanceOrder
+    .map((step) => ({ step, name: assistanceRungNames[step], ...assistanceCatalog[step] }))
+    .filter((rung) => rung.step === "none" || rung.sample.trim().length > 0);
+  // The lowest rung that can actually offer something beyond waiting.
+  const currentAssistanceRung = assistanceLadder.find((rung) => rung.sample.trim().length > 0)?.name ?? null;
+  const assistanceRationale = focusBlocker ? teachingRationaleFor(focusBlocker) : null;
   const activePronunciationSyllables =
     activePronunciationTarget?.syllables?.length
       ? activePronunciationTarget.syllables
@@ -789,41 +1166,66 @@ export default function Home() {
         ? "you got at least one real reply across clearly."
         : "we found the exact reply to practice next.";
   const tomorrowWork = formatBlockerLabel(almostBeaten);
-  const profileRows = [
-    {
-      name: "finding words",
-      state: latestSessionEvaluation?.observedBlocker.type === "vocabulary_retrieval" ? "working on it now" : "watching",
-      tone: latestSessionEvaluation?.observedBlocker.type === "vocabulary_retrieval" ? "terracotta" : "sage",
-      evidence:
-        latestSessionEvaluation?.observedBlocker.type === "vocabulary_retrieval"
-          ? latestSessionEvaluation.observedBlocker.evidence
-          : placementRescue?.observed_blocker.evidence,
-    },
-    {
-      name: "building sentences",
-      state: latestSessionEvaluation?.observedBlocker.type === "sentence_assembly" ? "working on it now" : "improving",
-      tone: latestSessionEvaluation?.observedBlocker.type === "sentence_assembly" ? "terracotta" : "sage",
-      evidence: latestSessionEvaluation?.conciseFeedbackEn ?? placementRescue?.one_correction,
-    },
-    {
-      name: "follow-up replies",
-      state: sessionTurns.length ? "seen in session" : "not enough yet",
-      tone: sessionTurns.length ? "terracotta" : "sage",
-      evidence: sessionTurns[0]
-        ? `"${sessionTurns[0].userAttempt}"`
-        : "OutLoud needs one conversation turn before it keeps this.",
-    },
-    {
-      name: "pronunciation",
-      state: (latestSessionEvaluation?.pronunciationTargets.length ?? placementRescue?.pronunciationTargets.length ?? 0) > 0 ? "has a target" : "no clear issue",
-      tone: (latestSessionEvaluation?.pronunciationTargets.length ?? placementRescue?.pronunciationTargets.length ?? 0) > 0 ? "terracotta" : "sage",
-      evidence:
-        latestSessionEvaluation?.pronunciationTargets[0]?.word ??
-        placementRescue?.pronunciationTargets[0]?.word ??
-        "No pronunciation target came back from the engine.",
-    },
-  ];
-  const activeEvidence = profileRows[profileEvidenceIndex] ?? profileRows[0];
+  /**
+   * #50 -- the profile has to show the dimension the learner named, moving. It used to be four
+   * hardcoded rows ("finding words", "building sentences", "follow-up replies", "pronunciation"),
+   * which covered four of the eight blockers in the taxonomy: anyone whose problem was grammar,
+   * register or freezing under pressure simply could not see their own thing here. Two of the
+   * four rows also carried a fixed `state` string that was true by construction rather than by
+   * evidence ("improving", "watching"), which is the kind of invented progress this product
+   * cannot afford.
+   *
+   * Rows are now derived: the session's focus dimension first and always present, then any other
+   * dimension this session produced real evidence for. A dimension with nothing behind it is not
+   * listed, because an empty row that says "watching" claims observation that never happened.
+   */
+  const blockersSeenThisSession = sessionTurns
+    .map((turn) => turn.evaluation?.observedBlocker.type)
+    // `insufficient_evidence` is the absence of a finding. Listed as a row it reads as an
+    // observation ("finding out what actually trips you up -- seen today"), which claims the
+    // opposite of what it means.
+    .filter((type): type is BlockerType => Boolean(type) && type !== "insufficient_evidence");
+  const evidenceByBlocker = new Map<BlockerType, string>();
+  for (const turn of sessionTurns) {
+    const type = turn.evaluation?.observedBlocker.type;
+    const evidence = turn.evaluation?.observedBlocker.evidence;
+    // Last one wins: the most recent observation is the one worth showing.
+    if (type && evidence) evidenceByBlocker.set(type, evidence);
+  }
+  if (placementRescue) {
+    const placementType = placementRescue.actionable_feedback.issueType;
+    if (!evidenceByBlocker.has(placementType)) {
+      evidenceByBlocker.set(placementType, placementRescue.observed_blocker.evidence);
+    }
+  }
+  // Within-session movement for the focus dimension. Across sessions lives on /profile, which is
+  // the only surface that holds history; claiming a trend from one session would be theatre.
+  const evaluatedTurns = sessionTurns.filter((turn) => Boolean(turn.evaluation));
+  const clearTurns = evaluatedTurns.filter((turn) => turn.evaluation?.meaningResult === "clear").length;
+  const focusMovement =
+    evaluatedTurns.length === 0
+      ? "no replies scored yet today."
+      : `${clearTurns} of ${evaluatedTurns.length} ${evaluatedTurns.length === 1 ? "reply" : "replies"} came out clear today.`;
+  const profileRows = (
+    focusBlocker ? [focusBlocker, ...blockersSeenThisSession] : blockersSeenThisSession
+  )
+    .filter((blocker, index, all) => all.indexOf(blocker) === index)
+    .map((blocker) => {
+      const isFocus = blocker === focusBlocker;
+      return {
+        blocker,
+        name: blockerFocusLabels[blocker],
+        state: isFocus ? "working on it now" : "seen today",
+        tone: isFocus ? "terracotta" : "sage",
+        evidence: isFocus
+          ? [evidenceByBlocker.get(blocker), focusMovement].filter(Boolean).join(" ")
+          : evidenceByBlocker.get(blocker),
+      };
+    });
+  // Explicitly nullable: the derived rows can legitimately be empty before anything has been
+  // observed, where the old fixed four-row array always had something to index into.
+  const activeEvidence: (typeof profileRows)[number] | null =
+    profileRows[profileEvidenceIndex] ?? profileRows[0] ?? null;
   const journeyRows = [
     ["answer the coach's first question", placementAttempts.some((item) => item.kind !== "setup") ? "done" : "ahead", placementAttempts.find((item) => item.kind !== "setup")?.userAttempt ?? ""],
     ["retry after a hint", placementAttempts.some((item) => item.kind === "retry") ? "done" : "ahead", placementAttempts.find((item) => item.kind === "retry")?.userAttempt ?? ""],
@@ -845,6 +1247,166 @@ export default function Home() {
   function clearTimers() {
     timers.current.forEach((timer) => window.clearTimeout(timer));
     timers.current = [];
+  }
+
+  /**
+   * Sends one event on the realtime data channel. Returns false when the channel isn't usable, so
+   * callers can fall back rather than assume delivery. A closing channel throwing here is expected
+   * -- the connection-state handler takes over.
+   */
+  function sendRealtimeEvent(payload: Record<string, unknown>) {
+    const channel = realtimeChannelRef.current;
+    if (channel?.readyState !== "open") {
+      vlog("send", "DROPPED (channel not open):", payload.type, "readyState:", channel?.readyState ?? "no channel");
+      return false;
+    }
+    try {
+      channel.send(JSON.stringify(payload));
+      vlog("send", "ok:", payload.type);
+      return true;
+    } catch (error) {
+      vlog("send", "THREW:", payload.type, error);
+      return false;
+    }
+  }
+
+  /**
+   * Server-VAD tuning, sent live over the data channel rather than baked into the token, because
+   * the token route mints once per session (and is rate limited), so mint-time values can never
+   * change mid-session.
+   *
+   * - `capture`: actively listening to the learner. Sensitive, with a long silence window so a
+   *   thinking pause doesn't end their turn.
+   * - `guard`: mic is open but it is not the learner's turn. The raised threshold is the primary
+   *   defense against room noise and coach echo tripping a false turn.
+   *
+   * create_response/interrupt_response are restated on every update: a partial turn_detection
+   * object would otherwise let them fall back to defaults, and create_response: true would let the
+   * realtime model start answering the learner directly -- it is only a voice bridge here.
+   */
+  /**
+   * Pins the transcriber to the language the learner is actually expected to answer in.
+   *
+   * Auto-detection turned short replies into Korean and a clean Spanish sentence into Danish --
+   * the right meaning, the wrong language -- and those transcripts are submitted as the learner's
+   * turn, so the conversation derails on input nobody produced. The flow genuinely switches
+   * language (English scaffolding, Spanish practice), so this has to move with it rather than be
+   * fixed at mint time.
+   */
+  function applyTranscriptionLanguage(language: "en" | "es") {
+    if (realtimeLanguageRef.current === language) return false;
+    realtimeLanguageRef.current = language;
+    vlog("vad", "transcription language ->", language);
+    return sendRealtimeEvent({
+      type: "session.update",
+      session: {
+        type: "realtime",
+        audio: {
+          input: {
+            // The model is restated deliberately: a partial `transcription` object drops it.
+            transcription: { model: realtimeTranscribeModelRef.current, language },
+          },
+        },
+      },
+    });
+  }
+
+  function applyVadProfile(profile: "capture" | "guard") {
+    vlog("vad", "applying profile:", profile, "threshold: 0.5");
+    return sendRealtimeEvent({
+      type: "session.update",
+      session: {
+        type: "realtime",
+        audio: {
+          input: {
+            turn_detection: {
+              type: "server_vad",
+              // Both profiles sit at the API default. `guard` was 0.75, invented as a defence
+              // against the coach's own voice tripping a turn -- but the mic is only ever armed
+              // while `turnState === "ready"`, which is precisely when the coach is silent. Voice
+              // barge-in, the one case where an armed mic would hear the coach, is not built. So
+              // the raised threshold guarded nothing and only made "just start talking" miss quiet
+              // speakers. Raise it again when Half B lands, not before.
+              threshold: 0.5,
+              prefix_padding_ms: 300,
+              silence_duration_ms: profile === "guard" ? 600 : pressureMode ? 850 : 1200,
+              create_response: false,
+              interrupt_response: false,
+            },
+          },
+        },
+      },
+    });
+  }
+
+  /**
+   * Moves the turn state and its ref together. The ref is otherwise synced by a post-commit effect,
+   * so it lags one render -- fine for click handlers, but the realtime event handlers read it to
+   * decide whether speech should open a turn, and they can fire within that gap.
+   */
+  function setTurn(next: TurnState) {
+    turnStateRef.current = next;
+    setTurnState(next);
+  }
+
+  /** Writes the sleep flag to both its ref (read synchronously) and its state (drives the copy). */
+  function setMicSleeping(asleep: boolean) {
+    micSleepingRef.current = asleep;
+    setMicAsleep(asleep);
+  }
+
+  /**
+   * Which language the learner is expected to answer in right now. The opening question and the
+   * coach's framing/scenario turns are answered in English; everything else is the Spanish
+   * practice. Read by the suspicion router (English filler words are not evidence of a broken
+   * attempt on an English turn) and by the realtime transcriber's language pin.
+   */
+  function expectsEnglishAnswerNow() {
+    return (
+      // Stepping out is an English conversation about the learner, not Spanish practice. Without
+      // this the transcriber stays pinned to Spanish and turns everything they say into mush.
+      asideActiveRef.current ||
+      flowPhaseRef.current === "opening" ||
+      (flowPhaseRef.current === "coach" &&
+        (coachPhaseRef.current === "framing" || coachPhaseRef.current === "scenario"))
+    );
+  }
+
+  function deriveMicWindow(): "closed" | "armed" | "capturing" {
+    if (realtimeActiveCaptureRef.current) return "capturing";
+    if (micModeRef.current === "push" || micSleepingRef.current) return "closed";
+    // Never armed while the coach is talking or thinking: there is nothing to interrupt yet (voice
+    // barge-in is a later step), no UI for a turn, and anything captured would only pollute the
+    // next transcript. Static clips are excluded too -- the mic permission prompt is still racing
+    // the clip at that point, and a pre-rendered <audio> element is the least reliable case for
+    // browser echo cancellation.
+    if (turnStateRef.current !== "ready") return "closed";
+    if (overlayRef.current || typedFallbackOpenRef.current || staticAudioRef.current) return "closed";
+    return "armed";
+  }
+
+  /** Single place that decides whether the mic transmits, and under which VAD profile. */
+  function syncRealtimeMic() {
+    const next = deriveMicWindow();
+    const changed = micWindowRef.current !== next;
+    const before = micWindowRef.current;
+    micWindowRef.current = next;
+    const tracks = realtimeStreamRef.current?.getAudioTracks() ?? [];
+    tracks.forEach((track) => {
+      track.enabled = next !== "closed";
+    });
+    if (changed) {
+      vlog(
+        "mic",
+        `window ${before} -> ${next}`,
+        "| tracks:", tracks.length,
+        "| enabled:", tracks.map((t) => t.enabled),
+        "| muted:", tracks.map((t) => t.muted),
+      );
+    }
+    if (changed && next !== "closed") {
+      applyVadProfile(next === "capturing" ? "capture" : "guard");
+    }
   }
 
   function stopMediaStream() {
@@ -883,14 +1445,10 @@ export default function Home() {
     resolve?.();
   }
 
-  function disableRealtimeMic() {
-    realtimeStreamRef.current?.getAudioTracks().forEach((track) => {
-      track.enabled = false;
-    });
-  }
 
   function disconnectRealtime() {
     realtimeActiveCaptureRef.current = false;
+    awaitingTranscriptRef.current = false;
     realtimeConnectPromiseRef.current = null;
     realtimeModeRef.current = null;
     realtimeFallbackRef.current = false;
@@ -938,16 +1496,39 @@ export default function Home() {
           : "The learner is entering a guided first conversation from the coached intake.",
       context: defaultConversationContext,
       rescue: placementRescue,
-      pressureMode: false,
+      pressureMode,
     };
   }
 
   function handleRealtimeEvent(event: RealtimeServerEvent) {
     const type = event.type ?? "";
 
+    // Opt-in trace of the realtime data channel. It is a WebRTC data channel, so none of this is
+    // visible in the network tab, which makes "the mic just does nothing" almost impossible to
+    // diagnose from the outside. Enable with:
+    //   localStorage["outloud-debug-realtime"] = "1"
+    if (realtimeDebugRef.current) {
+      console.log(
+        "[rt]",
+        type,
+        "| micWindow:", micWindowRef.current,
+        "| turn:", turnStateRef.current,
+        "| capture:", realtimeActiveCaptureRef.current,
+        "| speechSeen:", realtimeSpeechSeenRef.current,
+        "| transcript:", JSON.stringify(realtimeTranscriptRef.current),
+        type === "error" ? event.error : "",
+      );
+    }
+
     if (type === "error") {
       if (event.error?.code && ignorableRealtimeErrorCodes.has(event.error.code)) {
         return;
+      }
+      // Any unhandled error silently drops the whole session to the MediaRecorder path, which is
+      // very hard to notice while developing -- a malformed session.update looks like "voice just
+      // got worse". Surface it locally; production stays quiet.
+      if (process.env.NODE_ENV === "development") {
+        console.warn("[realtime] unhandled error event", event.error?.code, event.error?.message);
       }
       realtimeFallbackRef.current = true;
       resolveRealtimeCapture(realtimeTranscriptRef.current);
@@ -958,8 +1539,20 @@ export default function Home() {
     if (type === "input_audio_buffer.speech_started") {
       realtimeSpeechActiveRef.current = true;
       realtimeSpeechSeenRef.current = true;
-      // The learner started talking, so the idle timeout no longer applies.
-      clearTimers();
+
+      if (realtimeActiveCaptureRef.current) {
+        // The learner started talking, so the idle timeout no longer applies. Guarded: with an
+        // armed mic this fires on room noise too, and clearTimers() wipes every pending timer --
+        // including the speak fallback that hands the turn back.
+        clearTimers();
+        return;
+      }
+
+      // Armed and it is their turn: talking IS the tap. This is what full-duplex buys -- nobody has
+      // to read an instruction to start.
+      if (micWindowRef.current === "armed" && turnStateRef.current === "ready") {
+        void startRealtimeListening(null, { resumingSpeech: true });
+      }
       return;
     }
 
@@ -986,11 +1579,24 @@ export default function Home() {
       return;
     }
 
+    // Transcription can arrive for audio captured outside a turn -- an armed mic hears the room.
+    // The transcript ref is only cleared when a turn STARTS, so anything accepted here would
+    // otherwise be prepended to whatever the learner says next.
+    if (
+      micWindowRef.current === "closed" &&
+      !awaitingTranscriptRef.current &&
+      type.includes("input_audio_transcription")
+    ) {
+      vlog("transcript", "IGNORED (closed, no capture awaiting):", type, event.transcript ?? event.delta ?? "");
+      return;
+    }
+
     if (typeof event.delta === "string" && type.includes("input_audio_transcription.delta")) {
       realtimeTranscriptRef.current += event.delta;
     }
 
     if (typeof event.transcript === "string" && type.includes("input_audio_transcription")) {
+      vlog("transcript", type, JSON.stringify(event.transcript));
       realtimeTranscriptRef.current = event.transcript;
       if (type.endsWith(".completed")) {
         realtimeTranscriptFinalRef.current = true;
@@ -1072,11 +1678,16 @@ export default function Home() {
     }
 
     if (realtimeConnectPromiseRef.current) {
+      vlog("connect", "already connecting, awaiting existing promise");
       return realtimeConnectPromiseRef.current;
     }
 
     const requestBody = realtimeRequestFor(nextMode);
-    if (!requestBody) return false;
+    if (!requestBody) {
+      vlog("connect", "ABORT: no request body for mode", nextMode, "(no rescue/placement yet?)");
+      return false;
+    }
+    vlog("connect", "starting, mode:", nextMode);
 
     realtimeConnectPromiseRef.current = (async () => {
       try {
@@ -1107,22 +1718,25 @@ export default function Home() {
           void audio.play().catch(() => undefined);
         };
         peer.onconnectionstatechange = () => {
+          vlog("connect", "peer state:", peer.connectionState);
           if (peer.connectionState === "failed" || peer.connectionState === "closed") {
             realtimeFallbackRef.current = true;
           }
         };
 
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-        });
+        if (token.transcribeModel) realtimeTranscribeModelRef.current = token.transcribeModel;
+        realtimeLanguageRef.current = "en";
+        vlog("connect", "token minted, requesting microphone");
+        const stream = await navigator.mediaDevices.getUserMedia(micConstraints);
         stream.getAudioTracks().forEach((track) => {
           track.enabled = false;
           peer.addTrack(track, stream);
         });
+        vlog(
+          "connect",
+          "microphone granted:",
+          stream.getAudioTracks().map((t) => `${t.label} (muted:${t.muted}, state:${t.readyState})`),
+        );
 
         const channel = peer.createDataChannel("oai-events");
         channel.addEventListener("message", (message) => {
@@ -1132,7 +1746,8 @@ export default function Home() {
             // Ignore malformed transport events; the app state is driven by our engine.
           }
         });
-        channel.addEventListener("error", () => {
+        channel.addEventListener("error", (event) => {
+          vlog("connect", "DATA CHANNEL ERROR -> falling back to MediaRecorder", event);
           realtimeFallbackRef.current = true;
         });
 
@@ -1153,6 +1768,7 @@ export default function Home() {
         });
 
         if (!sdpResponse.ok) {
+          vlog("connect", "SDP exchange failed:", sdpResponse.status, await sdpResponse.text().catch(() => ""));
           throw new Error("Realtime session could not connect.");
         }
 
@@ -1166,8 +1782,17 @@ export default function Home() {
           throw new Error("Realtime channel did not open.");
         }
 
+        // State the VAD profile explicitly rather than inheriting whatever the token was minted
+        // with -- the token is minted once per session, so its values can never change again.
+        applyVadProfile("capture");
+        vlog("connect", "CONNECTED — data channel open");
+
         return true;
-      } catch {
+      } catch (error) {
+        // This used to be a bare `catch {}`. Every connection failure -- a 429 on the token, a
+        // denied microphone, a rejected SDP -- became an identical silent drop to the
+        // MediaRecorder path, which is indistinguishable from "the mic just does nothing".
+        vlog("connect", "FAILED -> MediaRecorder fallback:", error);
         realtimeFallbackRef.current = true;
         disconnectRealtime();
         return false;
@@ -1183,9 +1808,27 @@ export default function Home() {
     text: string,
     speechMode: RealtimeSpeechMode,
     fallbackDelay: number,
-    options: { onDone?: () => void; autoListen?: boolean; interruptible?: boolean; slow?: boolean } = {},
+    options: {
+      onDone?: () => void;
+      autoListen?: boolean;
+      interruptible?: boolean;
+      slow?: boolean;
+      /**
+       * False when the caller drives the turn state itself after this line -- the closing coach
+       * line, where finishPlacement is already running in parallel. Without it, this function's
+       * "ready" would land mid-placement and invite the learner to answer a question that is no
+       * longer being asked, while /api/rescue is still in flight.
+       */
+      handBackTurn?: boolean;
+    } = {},
   ) {
-    const { onDone, autoListen = true, interruptible: canInterrupt = true, slow = false } = options;
+    const {
+      onDone,
+      autoListen = true,
+      interruptible: canInterrupt = true,
+      slow = false,
+      handBackTurn = true,
+    } = options;
     clearTimers();
     setTurnState("speaking");
 
@@ -1210,7 +1853,7 @@ export default function Home() {
 
       if (played) {
         await warmup;
-        setTurnState("ready");
+        if (handBackTurn) setTurnState("ready");
         onDone?.();
         if (autoListen) {
           void beginAutoListen();
@@ -1224,7 +1867,7 @@ export default function Home() {
 
     if (!connected || !channel || channel.readyState !== "open") {
       later(() => {
-        setTurnState("ready");
+        if (handBackTurn) setTurnState("ready");
         onDone?.();
       }, fallbackDelay);
       return;
@@ -1233,12 +1876,8 @@ export default function Home() {
     // If a previous line is still being generated or played out, cut it before starting the
     // next one -- otherwise the new text shows while the old audio keeps talking.
     if (realtimeSpeakingResolveRef.current || realtimeOutputAudioActiveRef.current) {
-      try {
-        channel.send(JSON.stringify({ type: "response.cancel" }));
-        channel.send(JSON.stringify({ type: "output_audio_buffer.clear" }));
-      } catch {
-        // Channel may be closing; the connection state handler takes over.
-      }
+      sendRealtimeEvent({ type: "response.cancel" });
+      sendRealtimeEvent({ type: "output_audio_buffer.clear" });
       resolveRealtimeSpeaking();
     }
 
@@ -1254,21 +1893,19 @@ export default function Home() {
       realtimeSpeakingTimerRef.current = window.setTimeout(resolveRealtimeSpeaking, Math.max(2400, fallbackDelay + 5000));
     });
 
-    channel.send(
-      JSON.stringify({
-        type: "response.create",
-        response: {
-          // Out-of-band: this response must not see (or join) the session's conversation history.
-          // The realtime model is a voice bridge here; with history it sometimes "answers" the
-          // learner's last utterance or repeats an earlier line instead of reading this one.
-          conversation: "none",
-          output_modalities: ["audio"],
-          instructions: slow
-            ? `Say this exact line and nothing else, noticeably slower and very clearly, without changing a word: ${text}`
-            : `Say this exact line and nothing else: ${text}`,
-        },
-      }),
-    );
+    sendRealtimeEvent({
+      type: "response.create",
+      response: {
+        // Out-of-band: this response must not see (or join) the session's conversation history.
+        // The realtime model is a voice bridge here; with history it sometimes "answers" the
+        // learner's last utterance or repeats an earlier line instead of reading this one.
+        conversation: "none",
+        output_modalities: ["audio"],
+        instructions: slow
+          ? `Say this exact line and nothing else, noticeably slower and very clearly, without changing a word: ${text}`
+          : `Say this exact line and nothing else: ${text}`,
+      },
+    });
 
     await finishedSpeaking;
     realtimeInterruptibleRef.current = false;
@@ -1281,7 +1918,7 @@ export default function Home() {
       return;
     }
 
-    setTurnState("ready");
+    if (handBackTurn) setTurnState("ready");
     onDone?.();
 
     if (autoListen) {
@@ -1335,21 +1972,36 @@ export default function Home() {
     const started = await startRealtimeListening(null);
     if (!started) return;
 
-    // Nobody spoke: hand the turn back to the learner instead of listening to a silent room forever.
+    // Nobody spoke. In push mode that closes the mic and hands the turn back. In open mode the
+    // turn still ends, but the mic only steps down to `armed` -- closing it would break the
+    // promise that they can just start talking whenever they're ready.
     later(() => {
       if (!realtimeActiveCaptureRef.current || realtimeSpeechSeenRef.current) return;
       realtimeActiveCaptureRef.current = false;
       holdingRef.current = false;
-      disableRealtimeMic();
-      setRoomNote("tap the orb whenever you're ready.");
-      setTurnState("ready");
+      setTurn("ready");
+      syncRealtimeMic();
+      setRoomNote(micModeRef.current === "open" ? null : "tap the orb whenever you're ready.");
+      if (micModeRef.current === "open") armIdleCutoff();
     }, autoListenIdleMs);
+  }
+
+  /**
+   * A mic left armed indefinitely is a trust problem, not just a battery one. After a long silence
+   * the room closes it and says so; tapping the orb wakes it back up.
+   */
+  function armIdleCutoff() {
+    later(() => {
+      if (micWindowRef.current !== "armed") return;
+      setMicSleeping(true);
+      syncRealtimeMic();
+      setRoomNote("mic went to sleep. tap the orb when you're back.");
+    }, armedIdleCutoffMs);
   }
 
   // Stops whatever the coach is saying (clip or live) without opening the mic.
   function cancelSpeaking() {
     if (turnStateRef.current !== "speaking") return;
-    const channel = realtimeChannelRef.current;
     realtimeInterruptedRef.current = true;
     realtimeInterruptibleRef.current = false;
     setInterruptible(false);
@@ -1357,14 +2009,8 @@ export default function Home() {
       stopStaticAudio(true);
       return;
     }
-    if (channel?.readyState === "open") {
-      try {
-        channel.send(JSON.stringify({ type: "response.cancel" }));
-        channel.send(JSON.stringify({ type: "output_audio_buffer.clear" }));
-      } catch {
-        // Connection state handler takes over if the channel is gone.
-      }
-    }
+    sendRealtimeEvent({ type: "response.cancel" });
+    sendRealtimeEvent({ type: "output_audio_buffer.clear" });
     resolveRealtimeSpeaking();
   }
 
@@ -1386,12 +2032,8 @@ export default function Home() {
     if (staticPlaying) {
       stopStaticAudio(true);
     } else {
-      try {
-        channel?.send(JSON.stringify({ type: "response.cancel" }));
-        channel?.send(JSON.stringify({ type: "output_audio_buffer.clear" }));
-      } catch {
-        // If the channel dropped mid-line the connection state handler takes over.
-      }
+      sendRealtimeEvent({ type: "response.cancel" });
+      sendRealtimeEvent({ type: "output_audio_buffer.clear" });
       resolveRealtimeSpeaking();
     }
 
@@ -1400,15 +2042,77 @@ export default function Home() {
     });
   }
 
+  /**
+   * Replays the line the coach just said, optionally slower. autoListen stays false on purpose:
+   * they asked to HEAR it again, not to answer yet -- reopening the mic would put them back on the
+   * spot, which is the opposite of what asking for a replay means.
+   */
+  /**
+   * Records help usage for the current turn, keeping the strongest rung reached. Called from every
+   * surface that reveals something the learner could otherwise have had to produce themselves.
+   */
+  function noteAssistance(used: AssistanceUsed) {
+    if (assistanceRank[used] > assistanceRank[turnAssistanceRef.current]) {
+      turnAssistanceRef.current = used;
+    }
+  }
+
+  /**
+   * #49 -- one spoken line, unprompted, the moment the learner beats their own blocker twice in a
+   * row. This is the payoff for having told OutLoud anything, so the claim has to be exactly true:
+   * it fires only on a clear meaning with `turnAssistanceRef` still at "none", which means they
+   * opened no sheet, replayed no audio and asked nothing on that turn.
+   *
+   * The wording deliberately does NOT say "without me". `responseGuidanceEn` is on screen the
+   * whole time, so some help was always present; what they did not do is reach for more. Claiming
+   * more than that would be the same overclaim the rest of Phase 0 exists to remove.
+   *
+   * Once per session. A second one stops being a moment and starts being a scoreboard.
+   */
+  function calloutForTurn(evaluation: AttemptEvaluation | null, closing: boolean) {
+    const unaided =
+      turnAssistanceRef.current === "none" &&
+      !turnSubtitleRef.current &&
+      evaluation?.meaningResult === "clear";
+    unaidedRunRef.current = unaided ? unaidedRunRef.current + 1 : 0;
+    if (!unaided || closing || calloutSpokenRef.current || unaidedRunRef.current < 2) return null;
+    calloutSpokenRef.current = true;
+    return "twice in a row now — and you didn't reach for help once.";
+  }
+
+  function replayCoachLine(slow: boolean) {
+    const line = coachLine;
+    const state = turnStateRef.current;
+    // A replay while a response is already generating would stack two lines on one channel.
+    if (!line || state === "speaking" || state === "thinking") return;
+
+    setRoomNote(null);
+    noteAssistance(slow ? "slower_audio" : "repeat");
+    void speakCoachText(line, currentRealtimeMode(), 1800, { autoListen: false, slow });
+  }
+
   function currentRealtimeMode() {
     return flowPhase === "session" && placementRescue ? "conversation" : "intake";
   }
 
-  async function startRealtimeListening(pressSession: number | null) {
+  /**
+   * `resumingSpeech` means the learner is ALREADY talking -- VAD fired and this call is promoting
+   * an armed mic into a real turn. Two things must not be reset in that case:
+   *
+   * - the transcript ref, which already holds the deltas for the word that started the turn;
+   * - the speech flags, because speech_started will not fire a second time for the same utterance,
+   *   and finishRealtimeListening discards any transcript that arrives with speechSeen false as a
+   *   noise hallucination. Without this, every voice-started turn would be silently thrown away.
+   */
+  async function startRealtimeListening(
+    pressSession: number | null,
+    options: { resumingSpeech?: boolean } = {},
+  ) {
     const connected = await ensureRealtime(currentRealtimeMode());
     const channel = realtimeChannelRef.current;
 
     if (!connected || !channel || channel.readyState !== "open") {
+      vlog("listen", "REFUSED: connected:", connected, "channel:", channel?.readyState ?? "none");
       return false;
     }
 
@@ -1417,22 +2121,35 @@ export default function Home() {
       (pressSession !== null && pressSessionRef.current !== pressSession) ||
       realtimeActiveCaptureRef.current
     ) {
+      vlog(
+        "listen",
+        "SKIPPED:",
+        realtimeActiveCaptureRef.current ? "already capturing" : "press superseded",
+        "| press:", pressSession,
+        "| current:", pressSessionRef.current,
+      );
       return true;
     }
+    vlog("listen", "OPENING capture, resumingSpeech:", options.resumingSpeech === true);
+    applyTranscriptionLanguage(expectsEnglishAnswerNow() ? "en" : "es");
 
+    const { resumingSpeech = false } = options;
     clearTimers();
     setRoomNote(null);
     setLastTranscript(null);
-    realtimeTranscriptRef.current = "";
     realtimeTranscriptFinalRef.current = false;
-    realtimeSpeechActiveRef.current = false;
-    realtimeSpeechSeenRef.current = false;
+    // A new capture supersedes any transcript the previous one was still waiting on.
+    awaitingTranscriptRef.current = false;
+    if (!resumingSpeech) {
+      realtimeTranscriptRef.current = "";
+    }
+    realtimeSpeechActiveRef.current = resumingSpeech;
+    realtimeSpeechSeenRef.current = resumingSpeech;
     realtimeActiveCaptureRef.current = true;
     holdingRef.current = true;
-    realtimeStreamRef.current?.getAudioTracks().forEach((track) => {
-      track.enabled = true;
-    });
-    setTurnState("listening");
+    setMicSleeping(false);
+    setTurn("listening");
+    syncRealtimeMic();
 
     later(() => {
       setTurnState((current) => (current === "listening" ? "still-listening" : current));
@@ -1444,21 +2161,25 @@ export default function Home() {
   // manual = the learner tapped/released to end the turn. Otherwise server VAD ended it and the
   // buffer is already committed.
   async function finishRealtimeListening(manual: boolean) {
-    if (!realtimeActiveCaptureRef.current) return;
+    if (!realtimeActiveCaptureRef.current) {
+      vlog("finish", "IGNORED: no active capture (manual:", manual, ")");
+      return;
+    }
+    vlog("finish", "closing capture, manual:", manual, "| speechSeen:", realtimeSpeechSeenRef.current);
+    // Set BEFORE the mic window closes below: the transcript for this capture is still to come,
+    // and the accumulation guard must not mistake it for stray room noise.
+    awaitingTranscriptRef.current = true;
     realtimeActiveCaptureRef.current = false;
     holdingRef.current = false;
     clearTimers();
-    disableRealtimeMic();
-    setTurnState("thinking");
+    setTurn("thinking");
+    // Closes the mic: "thinking" never derives to armed, so this also covers open mode.
+    syncRealtimeMic();
 
     const speechSeen = realtimeSpeechSeenRef.current;
-    const channel = realtimeChannelRef.current;
-    if (manual && realtimeSpeechActiveRef.current && channel?.readyState === "open") {
-      try {
-        channel.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-      } catch {
-        // WebRTC may have already committed via VAD; wait for any transcript already in flight.
-      }
+    if (manual && realtimeSpeechActiveRef.current) {
+      // May already have been committed by VAD; either way we wait for the transcript in flight.
+      sendRealtimeEvent({ type: "input_audio_buffer.commit" });
     }
     realtimeSpeechActiveRef.current = false;
 
@@ -1468,23 +2189,65 @@ export default function Home() {
         return;
       }
 
+      vlog("finish", "waiting for transcript, timeout:", speechSeen ? 6000 : 2000, "ms");
       realtimeCaptureResolveRef.current = resolve;
       realtimeCaptureTimerRef.current = window.setTimeout(
         () => {
+          vlog("finish", "TIMED OUT waiting for transcript; using:", JSON.stringify(realtimeTranscriptRef.current));
           resolveRealtimeCapture(realtimeTranscriptRef.current);
         },
         speechSeen ? 6000 : 2000,
       );
     });
 
-    if (!transcript.trim()) {
-      setRoomNote("nothing came through. tap the orb to try again, or type.");
-      setTurnState("ready");
+    vlog("finish", "transcript:", JSON.stringify(transcript), "| speechSeen:", speechSeen);
+    awaitingTranscriptRef.current = false;
+
+    // Voice activity was never detected during this capture, yet a transcript came back --
+    // almost certainly a hallucination from background noise, not a real reply. There's no
+    // graded confidence signal on the realtime path, so VAD is the only gate available.
+    if (!transcript.trim() || !speechSeen) {
+      vlog(
+        "finish",
+        "DISCARDED as dud —",
+        !speechSeen ? "server VAD never reported speech (threshold too high?)" : "transcript came back empty",
+        "| transcript:", JSON.stringify(transcript),
+      );
+      registerDudCapture();
+      setTurn("ready");
+      syncRealtimeMic();
       return;
     }
 
+    noisyStrikesRef.current = 0;
     setLastTranscript(transcript.trim());
-    await submitAttempt(transcript.trim(), "spoken");
+    // No graded confidence tier exists on the realtime path -- VAD is the only signal, and it
+    // already passed the gate above.
+    routeCapturedTranscript(transcript.trim(), false);
+  }
+
+  /**
+   * A capture that produced nothing usable. Two in a row is already a bad experience with an open
+   * mic, so that's where the room stops guessing and offers hold-to-talk instead of making the
+   * learner work out that their kitchen is the problem.
+   */
+  function registerDudCapture() {
+    vlog("dud", "strike", noisyStrikesRef.current + 1);
+    noisyStrikesRef.current += 1;
+    const noisy = noisyStrikesRef.current >= 2 && micModeRef.current === "open";
+
+    if (noisy && !noisyOfferShownRef.current) {
+      noisyOfferShownRef.current = true;
+      setNoisyOfferOpen(true);
+      setRoomNote("I keep missing you. noisy room?");
+      return;
+    }
+
+    setRoomNote(
+      micModeRef.current === "open"
+        ? "didn't catch that. try again whenever you're ready."
+        : "nothing came through. tap the orb to try again, or type.",
+    );
   }
 
   function later(callback: () => void, delay: number) {
@@ -1492,16 +2255,38 @@ export default function Home() {
     timers.current.push(timer);
   }
 
-  function showCoachReply(reply: ConverseReply) {
+  /**
+   * Sets the English line under the Spanish, tagged with what it actually is. `folded` is passed
+   * explicitly rather than derived from flowPhase because several callers run after an `await`,
+   * where the captured flowPhase would be stale.
+   */
+  function showMeaning(
+    text: string | null,
+    kind: "translation" | "instruction" | null,
+    options: { folded?: boolean } = {},
+  ) {
+    setCoachMeaning(text);
+    setCoachMeaningKind(text ? kind : null);
+    if (options.folded !== undefined) setEnglishFolded(options.folded);
+  }
+
+  function showCoachReply(reply: ConverseReply, callout: string | null = null) {
     clearTimers();
+    // A new turn: whatever help the last one needed is history.
+    turnAssistanceRef.current = "none";
+    turnSubtitleRef.current = false;
+    setSessionCallout(callout);
     setConversationId(reply.conversationId);
     setTurnIndex(reply.turnIndex);
     setCoachLine(reply.characterLineEs);
-    setCoachMeaning(reply.characterMeaningEn);
+    // A real session turn: the translation starts hidden, always one tap away.
+    showMeaning(reply.characterMeaningEn, "translation", { folded: true });
     setCurrentConversationTurn(reply);
     setRoomNote(reply.responseGuidanceEn || null);
     setTurnState("speaking");
-    void speakCoachText(reply.characterLineEs, "conversation", 1800, {
+    // The callout rides on the same utterance rather than a second `response.create`: two
+    // out-of-band responses on one channel would have the second cut off the first.
+    void speakCoachText(callout ? `${callout} ${reply.characterLineEs}` : reply.characterLineEs, "conversation", 1800, {
       autoListen: !reply.shouldClose,
       interruptible: !reply.shouldClose,
       onDone: () => {
@@ -1530,7 +2315,7 @@ export default function Home() {
   function buildPlacementRequest(openingText: string, attempts: PlacementAttempt[]) {
     const originalText = clipForApi(buildPlacementText(openingText, attempts, mode));
     const combinedAttempt = clipForApi(attempts.map((item) => item.userAttempt).join(" "));
-    const selfReportedBlocker = inferSelfReportedBlocker(`${openingText} ${combinedAttempt}`);
+    const selfReportedBlocker = reportedBlocker ?? "not_sure";
 
     return {
       entryMode: "wanted_to_say",
@@ -1544,7 +2329,7 @@ export default function Home() {
       ),
       context: {
         ...defaultConversationContext,
-        who: mode === "stung" ? "a real person from the learner's situation" : defaultConversationContext.who,
+        who: conversationWho,
       },
       selfReportedBlocker,
       selfReportedBlockers: [selfReportedBlocker],
@@ -1577,6 +2362,7 @@ export default function Home() {
             expectedCommunicativeFunction: attempt.expectedCommunicativeFunction,
           },
           variation: null,
+          lowConfidenceAttempt: attempt.lowConfidence ?? false,
         }),
       }),
     );
@@ -1631,6 +2417,10 @@ export default function Home() {
       const line = `${turn.evidence.observedBlocker} (${turn.evidence.confidence}): ${turn.evidence.noteEn}`;
       setCoachEvidence((current) => (current.includes(line) ? current : [...current, line]));
     }
+    // Only the framing turn carries this (the route pins it there), so the truthiness guard is
+    // belt and braces -- but it keeps a null on a later turn from erasing what they told us.
+    if (turn.selfReportedBlocker) setReportedBlocker(turn.selfReportedBlocker);
+    if (turn.sceneCharacter) setSceneCharacter(turn.sceneCharacter);
   }
 
   function showCoachTurn(turn: CoachResponse) {
@@ -1640,7 +2430,13 @@ export default function Home() {
     setCoachLine(turn.sayEs);
     setCoachLineFolded(false);
     // Framing/scenario turns are already English; a "meaning" line under them is just noise.
-    setCoachMeaning(turn.phase === "framing" || turn.phase === "scenario" ? null : turn.meaningEn);
+    // Shown unfolded: this is the scaffolding before a real session, where the learner has no
+    // context yet and hiding the meaning would just be an obstacle.
+    showMeaning(
+      turn.phase === "framing" || turn.phase === "scenario" ? null : turn.meaningEn,
+      "translation",
+      { folded: false },
+    );
     setRoomNote(null);
     setTurnState("speaking");
     void speakCoachText(turn.sayEs, "intake", 1400, {
@@ -1650,7 +2446,7 @@ export default function Home() {
     });
   }
 
-  async function handleCoachAttempt(attempt: string, inputMode: "spoken" | "written") {
+  async function handleCoachAttempt(attempt: string, inputMode: "spoken" | "written", lowConfidence = false) {
     const turn = coachTurn;
     if (!coachId || !turn) {
       setRoomNote("the coach needs a moment. try again.");
@@ -1666,6 +2462,7 @@ export default function Home() {
         expectedCommunicativeFunction: turn.expectedCommunicativeFunction,
         userAttempt: attempt,
         inputMode,
+        lowConfidence,
         kind:
           turn.phase === "framing" || turn.phase === "scenario"
             ? "setup"
@@ -1689,9 +2486,16 @@ export default function Home() {
         setCoachTurn(next);
         collectCoachLoot(next);
         setCoachLine(next.sayEs);
-        setCoachMeaning(next.meaningEn);
+        // Still the coach/intake scaffolding, not a session turn.
+        showMeaning(next.meaningEn, "translation", { folded: false });
         setTurnState("speaking");
-        void speakCoachText(next.sayEs, "intake", 1400, { autoListen: false, interruptible: false });
+        // finishPlacement owns the turn state from here: it is already fetching the rescue, and a
+        // "ready" from the closing line would let the learner answer into a finished conversation.
+        void speakCoachText(next.sayEs, "intake", 1400, {
+          autoListen: false,
+          interruptible: false,
+          handBackTurn: false,
+        });
         void finishPlacement(nextAttempts);
         return;
       }
@@ -1713,6 +2517,8 @@ export default function Home() {
     setCoachTurn(null);
     setCoachLoot([]);
     setCoachEvidence([]);
+    setReportedBlocker(null);
+    setSceneCharacter(null);
     setFlowPhase("coach");
     setTurnState("thinking");
 
@@ -1753,6 +2559,11 @@ export default function Home() {
     setConversationId(null);
     setTurnIndex(0);
     setSessionTurns([]);
+    setSessionCallout(null);
+    unaidedRunRef.current = 0;
+    calloutSpokenRef.current = false;
+    turnAssistanceRef.current = "none";
+    turnSubtitleRef.current = false;
     setCurrentConversationTurn(null);
     setSavedMomentId(null);
     setSaveStatus("idle");
@@ -1774,10 +2585,10 @@ export default function Home() {
                 : "Start from the learner's coached-conversation evidence.",
             context: {
               ...defaultConversationContext,
-              who: mode === "stung" ? "a real person from the learner's situation" : defaultConversationContext.who,
+              who: conversationWho,
             },
             rescue: placementRescue,
-            pressureMode: false,
+            pressureMode,
           }),
         }),
       );
@@ -1790,7 +2601,7 @@ export default function Home() {
     }
   }
 
-  async function evaluateSessionAttempt(attempt: string, turn: ConverseReply) {
+  async function evaluateSessionAttempt(attempt: string, turn: ConverseReply, lowConfidence = false) {
     if (!placementRescue || !placementSummary) return null;
 
     return readJson<AttemptEvaluation>(
@@ -1805,19 +2616,22 @@ export default function Home() {
               : "Evaluate this reply inside the learner's first OutLoud session.",
           context: {
             ...defaultConversationContext,
-            who: mode === "stung" ? "a real person from the learner's situation" : defaultConversationContext.who,
+            who: conversationWho,
           },
           rescue: placementRescue,
           attempt,
           inputMode: "spoken",
           stage: "changed_context",
-          assistanceUsed: "none",
+          // Was hardcoded "none". Every stored intervention outcome therefore claimed the learner
+          // needed no help, whatever they actually reached for.
+          assistanceUsed: turnAssistanceRef.current,
           conversationTurn: {
             characterLineEs: turn.characterLineEs,
             characterMeaningEn: turn.characterMeaningEn,
             expectedCommunicativeFunction: turn.expectedCommunicativeFunction ?? "continue the conversation",
           },
           variation: null,
+          lowConfidenceAttempt: lowConfidence,
         }),
       }),
     );
@@ -1826,10 +2640,341 @@ export default function Home() {
   function restoreCurrentTurn(note: string) {
     if (currentConversationTurn) {
       setCoachLine(currentConversationTurn.characterLineEs);
-      setCoachMeaning(currentConversationTurn.characterMeaningEn);
+      // Back into the live session turn, so the translation folds away again.
+      showMeaning(currentConversationTurn.characterMeaningEn, "translation", { folded: true });
     }
     setRoomNote(note);
     setTurnState("ready");
+  }
+
+  /**
+   * Step out of the scene and talk to the coach about what is actually in the way.
+   *
+   * `trigger` records who decided: "learner" when they reached for it, "offered" when the room
+   * noticed two replies in a row not landing and put it in front of them. The coach opens
+   * differently for each -- see `asideTurnGuidance` in app/api/aside/route.ts -- because "you
+   * walked out, what is up" and "that was not working, what is going on" are not the same
+   * question, and asking the wrong one wastes the first turn.
+   */
+  async function enterAside(trigger: "learner" | "offered") {
+    if (asideActiveRef.current || !currentConversationTurn) return;
+
+    clearTimers();
+    setAsideNudgeOpen(false);
+    setNoisyOfferOpen(false);
+    closeOverlay();
+    setTypedFallbackOpen(false);
+    setTranscriptNeedsConfirm(false);
+    // A drill they walked out of does not survive the detour: with `retryTarget` still set, the
+    // first thing they said to the coach would be scored as an attempt at a Spanish phrase.
+    setRetryTarget(null);
+
+    asideActiveRef.current = true;
+    setAsideActive(true);
+    setAsideLine(null);
+    setAsideOffer(null);
+    setAsideExchange([]);
+    setRoomNote(null);
+    setTurn("thinking");
+    syncRealtimeMic();
+
+    const turn = currentConversationTurn;
+    try {
+      const first = await readJson<AsideResponse>(
+        await fetch("/api/aside", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            trigger,
+            // /api/aside is stateless: the whole aside travels on every call. Empty here because
+            // nothing has been said yet.
+            exchange: [],
+            scene: {
+              characterEn: conversationWho,
+              scenarioEn: sceneCharacter
+                ? `${sceneCharacter.name} -- ${sceneCharacter.relation}. ${sceneCharacter.traitEn}`
+                : null,
+              characterLineEs: turn.characterLineEs,
+              characterMeaningEn: turn.characterMeaningEn,
+            },
+            focus: {
+              current: focusBlocker,
+              stated: statedFocus,
+              observed: observedFocus,
+            },
+            // Enough to tell one bad turn from a pattern, and no more: the coach is here to hear
+            // what the learner says is wrong, not to re-litigate the transcript.
+            recentTurns: sessionTurns
+              .filter((sessionTurn) => sessionTurn.userAttempt)
+              .slice(-3)
+              .map((sessionTurn) => ({
+                characterLineEs: sessionTurn.characterLineEs,
+                userAttempt: sessionTurn.userAttempt ?? "",
+                meaning: sessionTurn.evaluation?.meaningResult ?? "unclear",
+              })),
+          }),
+        }),
+      );
+      showAsideTurn(first, []);
+    } catch (error) {
+      // Never strand them outside the scene. If the coach cannot come to the phone, put them back
+      // where they were and say so, rather than leaving a dead room with no way forward.
+      const message = error instanceof Error ? error.message : "OutLoud could not step out just now.";
+      leaveAside(null);
+      setRoomNote(`${message} the conversation is still here.`);
+    }
+  }
+
+  /**
+   * `base` is the exchange this turn was generated FROM, passed in rather than read from state:
+   * the reply and the message that prompted it are appended in the same tick, and a functional
+   * update would race the request that is already in flight with the older thread.
+   */
+  function showAsideTurn(turn: AsideResponse, base: Array<{ who: "coach" | "you"; text: string }>) {
+    setAsideLine(turn.sayEn);
+    setAsideExchange([...base, { who: "coach", text: turn.sayEn }]);
+    setAsideOffer(turn.offer);
+    setRoomNote(null);
+    setTurn("speaking");
+    // Still `autoListen` when there is an offer on screen: an offer is the coach reading them, not
+    // a verdict, and "no, that is not it either" has to be sayable without hunting for a button.
+    // The aside session is kept alive on the server for exactly that reason -- it is closed by
+    // `leaveAside`, never by `done`.
+    void speakCoachText(turn.sayEn, "conversation", 1600, { autoListen: true, interruptible: true });
+  }
+
+  async function handleAsideAttempt(text: string) {
+    const turn = currentConversationTurn;
+    if (!turn) {
+      leaveAside(null);
+      return;
+    }
+
+    const sent: Array<{ who: "coach" | "you"; text: string }> = [...asideExchange, { who: "you", text }];
+    setAsideExchange(sent);
+    // They kept talking instead of taking the offer, so the offer is no longer the live question.
+    setAsideOffer(null);
+    setTurn("thinking");
+    syncRealtimeMic();
+
+    try {
+      const next = await readJson<AsideResponse>(
+        await fetch("/api/aside", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            exchange: sent,
+            scene: {
+              characterEn: conversationWho,
+              scenarioEn: sceneCharacter
+                ? `${sceneCharacter.name} -- ${sceneCharacter.relation}. ${sceneCharacter.traitEn}`
+                : null,
+              characterLineEs: turn.characterLineEs,
+              characterMeaningEn: turn.characterMeaningEn,
+            },
+            focus: { current: focusBlocker, stated: statedFocus, observed: observedFocus },
+          }),
+        }),
+      );
+      showAsideTurn(next, sent);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "OutLoud could not answer that yet.";
+      setAsideLine(message);
+      setRoomNote("try that again, or head back to the conversation.");
+      setTurn("ready");
+      syncRealtimeMic();
+    }
+  }
+
+  async function acceptAsideOffer() {
+    const offer = asideOffer;
+    if (!offer) return;
+
+    if (offer.kind === "change_focus" && offer.newFocus) {
+      setAsideFocusOverride(offer.newFocus as BlockerType);
+      leaveAside("got it. that is what we are working on from here.");
+      return;
+    }
+
+    if (offer.kind === "change_scenario" && offer.newScenarioEn && offer.newCharacter) {
+      await restartSceneFromAside(offer.newScenarioEn, offer.newCharacter);
+      return;
+    }
+
+    leaveAside("okay, back to it.");
+  }
+
+  /**
+   * Back into the scene, which was never torn down: `conversationId`, `turnIndex` and
+   * `currentConversationTurn` are exactly as they were, so this is a re-entry, not a restart.
+   *
+   * The character line is spoken again rather than just re-rendered. The learner has been away
+   * having a different conversation in a different language; dropping them back onto a silent
+   * Spanish sentence they last heard three minutes ago is how you lose the thread.
+   */
+  function leaveAside(spokenLeadIn: string | null) {
+    asideActiveRef.current = false;
+    setAsideActive(false);
+    setAsideLine(null);
+    setAsideOffer(null);
+    setAsideExchange([]);
+    setAsideNudgeOpen(false);
+    // Whatever was not landing before, they have now been heard about it. Making them earn the
+    // offer a second time on the next stumble would read as nagging.
+    asideStrikesRef.current = 0;
+
+    const turn = currentConversationTurn;
+    if (!turn) {
+      setTurn("ready");
+      syncRealtimeMic();
+      return;
+    }
+
+    setCoachLine(turn.characterLineEs);
+    showMeaning(turn.characterMeaningEn, "translation", { folded: true });
+    setRoomNote(turn.responseGuidanceEn || null);
+    setTurn("speaking");
+    void speakCoachText(
+      spokenLeadIn ? `${spokenLeadIn} ${turn.characterLineEs}` : turn.characterLineEs,
+      "conversation",
+      1800,
+      { autoListen: true, interruptible: true },
+    );
+  }
+
+  /**
+   * The learner said the situation itself was wrong for them, and the coach agreed. New scene,
+   * new person, same learner and same diagnosis.
+   *
+   * `sessionTurns` survives: those turns happened, the evidence in them is real, and the end card
+   * and the profile are built from it. The unaided run does not -- "twice in a row now, and you
+   * did not reach for help once" across a scene change would be counting two conversations as one.
+   */
+  async function restartSceneFromAside(
+    scenarioEn: string,
+    character: { name: string; relation: string; traitEn: string },
+  ) {
+    if (!placementRescue || !placementSummary) {
+      leaveAside("okay, back to it.");
+      return;
+    }
+
+    const previousConversationId = conversationId;
+
+    asideActiveRef.current = false;
+    setAsideActive(false);
+    setAsideLine(null);
+    setAsideOffer(null);
+    setAsideExchange([]);
+    setAsideNudgeOpen(false);
+    asideStrikesRef.current = 0;
+    unaidedRunRef.current = 0;
+
+    setSceneCharacter(character);
+    setRoomNote(null);
+    setTurn("thinking");
+    syncRealtimeMic();
+
+    // Built here rather than read from `conversationWho`, which is derived from `sceneCharacter`
+    // and still holds the person they just left for the rest of this render.
+    const who = `${character.name}, ${character.relation} (${character.traitEn})`;
+
+    /**
+     * A scene-neutral stand-in for `placementSummary`, and the fix for the worst bug this feature
+     * had: `buildPlacementText` packs the ENTIRE transcript of the first coached conversation into
+     * that string, so a learner who said "the cafe is not my problem, it is my girlfriend's family
+     * at dinner" was moved to the dinner and greeted with "something to drink while we look at the
+     * menu?". No amount of instruction outweighs a transcript full of restaurant lines; the
+     * transcript simply must not travel to a scene the learner asked to leave it for.
+     *
+     * What does travel is what they are practising and what breaks -- which is the whole point of
+     * moving them: same skill, somewhere it matters to them.
+     */
+    const carriedOver = [
+      `The learner is practising this pattern: "${placementRescue.transferableChunk.patternEs}"`,
+      `(${placementRescue.transferableChunk.communicativeFunction}).`,
+      focusBlocker ? `What breaks for them: ${blockerFocusLabels[focusBlocker]}.` : "",
+      "They asked to practise this somewhere else, so use only the pattern and the difficulty --",
+      "the earlier situation is deliberately not included.",
+    ]
+      .filter(Boolean)
+      .join(" ");
+
+    try {
+      const first = await readJson<ConverseReply>(
+        await fetch("/api/converse", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "start",
+            originalText: carriedOver,
+            scenarioContext: scenarioEn,
+            // Without this the new scene inherits the old situation: the route treats
+            // scenarioContext as background and anchors turn 0 in originalText, which still
+            // describes the place the learner just told us is not their problem.
+            sceneIsNew: true,
+            context: { ...defaultConversationContext, who },
+            rescue: placementRescue,
+            pressureMode,
+          }),
+        }),
+      );
+      if (previousConversationId) {
+        void fetch("/api/converse", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "close", conversationId: previousConversationId }),
+        }).catch(() => undefined);
+      }
+      showCoachReply(first, `okay, you are with ${character.name} now.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "OutLoud could not set up that scene.";
+      // The old scene is still live on the server, so falling back into it is a real recovery.
+      leaveAside(null);
+      setRoomNote(`${message} we stayed where we were.`);
+    }
+  }
+
+  /**
+   * The other way out of the scene: the room noticing before the learner asks.
+   *
+   * Counts replies that were HEARD but did not land -- not dead captures, which
+   * `registerDudCapture` already owns and answers with hold-to-talk. The two must not share a
+   * counter: "I keep missing you, noisy room?" and "that is not working, what is going on?" are
+   * answers to different problems, and offering the wrong one is worse than offering neither.
+   *
+   * Once per session, and never stacked on top of the noisy-room offer.
+   */
+  function noteAsideSignal(evaluation: AttemptEvaluation | null, spokenFreeze: FreezeSignals | null) {
+    if (asideActiveRef.current || asideNudgeShownRef.current) return;
+
+    // Reaching for English mid-Spanish-turn is the same frustration in a different form, and it is
+    // the signal closest to "I actually want to say something else right now".
+    const reachedForEnglish = (spokenFreeze?.englishWordCount ?? 0) >= 4;
+
+    // No verdict means /api/evaluate failed, not that the learner did. Counting an outage of ours
+    // toward "this has stopped working for you" would put the offer in front of someone whose only
+    // problem is our server -- and stepping out cannot fix that. Neither a strike nor a reset:
+    // the run of turns is simply unmeasured.
+    if (!evaluation) {
+      if (!reachedForEnglish) return;
+    } else if (
+      (evaluation.meaningResult === "clear" || evaluation.meaningResult === "partial") &&
+      !reachedForEnglish
+    ) {
+      asideStrikesRef.current = 0;
+      // A landed turn also makes any offer still on screen stale -- it is answering a question the
+      // learner has just stopped having.
+      setAsideNudgeOpen(false);
+      return;
+    }
+
+    asideStrikesRef.current += 1;
+    vlog("aside", "strike", asideStrikesRef.current, "| meaning:", evaluation?.meaningResult ?? "none");
+    if (asideStrikesRef.current < 2 || noisyOfferOpen) return;
+
+    asideNudgeShownRef.current = true;
+    setAsideNudgeOpen(true);
   }
 
   function startCorrectionRetry() {
@@ -1848,9 +2993,10 @@ export default function Home() {
     });
     closeOverlay();
     setCoachLine(activeCorrection.naturalVersion);
-    setCoachMeaning("say this back once, then we return to the conversation.");
-    setRoomNote("tap the orb and say it back.");
-    setTurnState("ready");
+    showMeaning("say this back once, then we return to the conversation.", "instruction");
+    setRoomNote(micModeRef.current === "open" ? "say it back whenever you're ready." : "tap the orb and say it back.");
+    setTurn("ready");
+    syncRealtimeMic();
   }
 
   function startPronunciationRetry() {
@@ -1870,12 +3016,13 @@ export default function Home() {
     });
     closeOverlay();
     setCoachLine(phraseEs);
-    setCoachMeaning("make it clear enough to understand.");
-    setRoomNote("tap the orb and say it once.");
-    setTurnState("ready");
+    showMeaning("make it clear enough to understand.", "instruction");
+    setRoomNote(micModeRef.current === "open" ? "say it once whenever you're ready." : "tap the orb and say it once.");
+    setTurn("ready");
+    syncRealtimeMic();
   }
 
-  async function submitRetryAttempt(attempt: string, inputMode: "spoken" | "written") {
+  async function submitRetryAttempt(attempt: string, inputMode: "spoken" | "written", lowConfidence = false) {
     const target = retryTarget;
     if (!target) return;
 
@@ -1899,7 +3046,11 @@ export default function Home() {
 
         setPronunciationResult(result);
 
-        if (result.intelligible || nextAttempts >= 2) {
+        // #38 -- this used to end the attempt at `nextAttempts >= 2` whether the learner was
+        // done or not, in an app whose entire premise is that people give up on speaking too
+        // early. The count survives, but it now changes what is OFFERED, never what is allowed:
+        // after a couple of tries the way out becomes visible instead of being taken for them.
+        if (result.intelligible) {
           setRetryTarget(null);
           restoreCurrentTurn(`${result.coachingNoteEn} Back to the conversation.`);
           return;
@@ -1907,8 +3058,12 @@ export default function Home() {
 
         setRetryTarget({ ...target, attempts: nextAttempts });
         setCoachLine(target.phraseEs);
-        setCoachMeaning(target.phraseMeaningEn);
-        setRoomNote(`${result.coachingNoteEn} Try it one more time.`);
+        showMeaning(target.phraseMeaningEn, "instruction");
+        setRoomNote(
+          nextAttempts >= 2
+            ? `${result.coachingNoteEn} Go again, or move on — this one keeps.`
+            : `${result.coachingNoteEn} Try it one more time.`,
+        );
         setTurnState("ready");
         return;
       }
@@ -1934,6 +3089,7 @@ export default function Home() {
             assistanceUsed: "repeat",
             conversationTurn: null,
             variation: null,
+            lowConfidenceAttempt: lowConfidence,
           }),
         }),
       );
@@ -1948,7 +3104,7 @@ export default function Home() {
 
       setRetryTarget({ ...target, attempts: nextAttempts });
       setCoachLine(target.phraseEs);
-      setCoachMeaning(target.phraseMeaningEn);
+      showMeaning(target.phraseMeaningEn, "instruction");
       setRoomNote(evaluation.conciseFeedbackEn || "Try the natural version once more.");
       setTurnState("ready");
     } catch (error) {
@@ -2036,7 +3192,7 @@ export default function Home() {
           : [],
       ),
     ].filter(Boolean);
-    const selfReportedBlocker = inferSelfReportedBlocker(`${openingAnswer} ${placementSummary}`);
+    const selfReportedBlocker = reportedBlocker ?? "not_sure";
 
     setSaveStatus("saving");
     setSavedMomentId(momentId);
@@ -2058,11 +3214,19 @@ export default function Home() {
             entryMode: "wanted_to_say",
             context: {
               ...defaultConversationContext,
-              who: mode === "stung" ? "a real person from the learner's situation" : defaultConversationContext.who,
+              who: conversationWho,
             },
             selfReportedBlocker,
             selfReportedBlockers: [selfReportedBlocker],
-            teachingPolicy: null,
+            // Was hardcoded null, so `teaching_policy_json` was empty for every moment ever
+            // saved and nothing downstream could learn which help order this learner was given.
+            teachingPolicy: chooseTeachingPolicy({
+              selectedHypotheses: [selfReportedBlocker],
+              rescue: placementRescue,
+              // The client does not hold the learner's saved history; with none, the policy is
+              // the base order for the blocker, which is exactly what the room just showed them.
+              history: [],
+            }),
             interventionOutcomes,
             personalTeachingModel: null,
             attempt: openingAnswer || placementAttempts[0]?.userAttempt || placementSummary,
@@ -2272,6 +3436,7 @@ export default function Home() {
       placementRescue,
       coachLoot,
       coachEvidence,
+      reportedBlocker,
     };
     try {
       window.localStorage.setItem(pendingVerdictKey, JSON.stringify(snapshot));
@@ -2303,6 +3468,9 @@ export default function Home() {
       setPlacementSummary(snapshot.placementSummary);
       setCoachLoot(snapshot.coachLoot);
       setCoachEvidence(snapshot.coachEvidence);
+      // Older snapshots (written before the coach classified this) have no field; "not_sure"
+      // would assert a hypothesis the learner never gave, so an absent value stays null.
+      setReportedBlocker(snapshot.reportedBlocker ?? null);
       setPlacementEvaluations([]);
       setFlowPhase("verdict");
       setTurnState("ready");
@@ -2347,7 +3515,7 @@ export default function Home() {
       setPlacementEvaluations([]);
       setSavedMomentId(resume.momentId);
       setCoachLine("picking this back up.");
-      setCoachMeaning(null);
+      showMeaning(null, null);
       setFlowPhase("verdict");
       setTurnState("ready");
       setOverlay("verdict");
@@ -2395,6 +3563,19 @@ export default function Home() {
     turnStateRef.current = turnState;
   }, [turnState]);
 
+  useEffect(() => {
+    flowPhaseRef.current = flowPhase;
+    coachPhaseRef.current = coachTurn?.phase ?? null;
+  }, [flowPhase, coachTurn]);
+
+  // Pressure mode shortens how long a pause can run before the turn ends. That value used to be
+  // frozen into the token at mint time, so switching tone mid-session changed nothing; pushing it
+  // over the open channel is what actually makes the toggle real.
+  useEffect(() => {
+    if (realtimeActiveCaptureRef.current) applyVadProfile("capture");
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only the tone change should re-send.
+  }, [pressureMode]);
+
   // Fold the coach line a beat after the coach stops talking, so the learner gets a moment to
   // finish reading before the room quiets down around the orb and the tools.
   useEffect(() => {
@@ -2421,10 +3602,52 @@ export default function Home() {
     if ((overlay || typedFallbackOpen) && realtimeActiveCaptureRef.current) {
       realtimeActiveCaptureRef.current = false;
       holdingRef.current = false;
-      disableRealtimeMic();
+      turnStateRef.current = "ready";
       setTurnState("ready");
     }
+    // Re-derived rather than force-closed: an overlay closing in open mode should re-arm the mic.
+    syncRealtimeMic();
+    // syncRealtimeMic reads refs only; re-creating this effect for it would just churn.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [overlay, typedFallbackOpen]);
+
+  // Keep the mic in step with the turn and the chosen mode. Refs the derivation also reads (an
+  // active capture, a playing static clip) are not reactive, so the imperative syncRealtimeMic()
+  // calls at those transitions stay necessary -- this only covers the render-visible inputs.
+  useEffect(() => {
+    micModeRef.current = micMode;
+    if (typeof window !== "undefined") window.localStorage.setItem("outloud-mic-mode", micMode);
+    syncRealtimeMic();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- reads refs; deps would only churn.
+  }, [turnState, micMode]);
+
+  useEffect(() => {
+    const store = window as unknown as {
+      __outloudVoiceLog?: string[];
+      __outloudVoiceDebug?: (on?: boolean) => string;
+      __outloudVoiceDump?: () => string;
+    };
+    try {
+      realtimeDebugRef.current = window.localStorage.getItem("outloud-debug-realtime") === "1";
+    } catch {
+      // Storage blocked: tracing simply stays off.
+    }
+    // Toggling without a reload, and a dump that does not depend on the console being open or
+    // unfiltered when the events happened.
+    store.__outloudVoiceDebug = (on = true) => {
+      realtimeDebugRef.current = on;
+      try {
+        window.localStorage.setItem("outloud-debug-realtime", on ? "1" : "0");
+      } catch {
+        // Non-fatal: tracing still works for this page load.
+      }
+      return `voice tracing ${on ? "ON" : "off"}`;
+    };
+    store.__outloudVoiceDump = () => (store.__outloudVoiceLog ?? []).join(String.fromCharCode(10)) || "(nothing recorded)";
+    if (realtimeDebugRef.current) {
+      console.log("%c[voice] tracing ON — run __outloudVoiceDump() to copy the log", "color:#c1440e");
+    }
+  }, []);
 
   useEffect(() => {
     document.documentElement.dataset.outloudHydrated = "true";
@@ -2473,6 +3696,7 @@ export default function Home() {
     setOverlay(null);
     setTypedFallbackOpen(false);
     setTypedAttempt("");
+    setTranscriptNeedsConfirm(false);
     setRoomNote(null);
     setLastTranscript(null);
     setFlowPhase("opening");
@@ -2481,6 +3705,7 @@ export default function Home() {
     setCoachTurn(null);
     setCoachLoot([]);
     setCoachEvidence([]);
+    setReportedBlocker(null);
     setEmailFallbackOpen(false);
     setPlacementAttempts([]);
     setPlacementRescue(null);
@@ -2488,6 +3713,11 @@ export default function Home() {
     setPlacementSummary("");
     setCurrentConversationTurn(null);
     setSessionTurns([]);
+    setSessionCallout(null);
+    unaidedRunRef.current = 0;
+    calloutSpokenRef.current = false;
+    turnAssistanceRef.current = "none";
+    turnSubtitleRef.current = false;
     setReturnEmail("");
     setReturnEmailStatus("idle");
     setFeedbackAnswers(blankFeedbackAnswers());
@@ -2498,12 +3728,13 @@ export default function Home() {
     setCorrectionRetryResult(null);
     setPronunciationResult(null);
     setLastVoiceFreeze(null);
+    setLastTranscriptionConfidence(null);
     setProfileEvidenceIndex(0);
     setSavedMomentId(null);
     setSaveStatus("idle");
     setLastReviewUrl(null);
     setCoachLine(nextMode === "stung" ? null : openingPrompt);
-    setCoachMeaning(null);
+    showMeaning(null, null, { folded: false });
     stopMediaStream();
 
     if (nextMode === "stung") {
@@ -2527,10 +3758,18 @@ export default function Home() {
       currentTurnState === "listening" ||
       currentTurnState === "still-listening"
     ) {
+      vlog(
+        "hold",
+        "BLOCKED — landing:", isLanding,
+        "overlay:", overlay,
+        "typed:", typedFallbackOpen,
+        "state:", currentTurnState,
+      );
       return;
     }
 
     if (!navigator.mediaDevices?.getUserMedia) {
+      vlog("hold", "BLOCKED: getUserMedia unavailable in this browser/context");
       setRoomNote("voice is not available here. typing works too.");
       setTypedFallbackOpen(true);
       return;
@@ -2545,6 +3784,7 @@ export default function Home() {
       setRoomNote(null);
       setLastTranscript(null);
 
+      vlog("hold", "starting, press session:", pressSession);
       if (await startRealtimeListening(pressSession)) {
         return;
       }
@@ -2556,7 +3796,7 @@ export default function Home() {
         return;
       }
 
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia(micConstraints);
 
       // A newer press superseded this one while the mic permission was pending.
       if (pressSessionRef.current !== pressSession || holdingRef.current) {
@@ -2605,8 +3845,10 @@ export default function Home() {
     pressingRef.current = false;
 
     if (!holdingRef.current) {
+      vlog("hold", "stop IGNORED: not holding");
       return;
     }
+    vlog("hold", "stopping | realtime capture:", realtimeActiveCaptureRef.current, "| recorder:", mediaRecorderRef.current?.state ?? "none");
 
     clearTimers();
     holdingRef.current = false;
@@ -2633,6 +3875,7 @@ export default function Home() {
   function handleOrbPress() {
     pressStartedAtRef.current = nowMs();
     const state = turnStateRef.current;
+    vlog("orb", "press, state:", state);
 
     if (state === "speaking") {
       pressKindRef.current = "interrupt";
@@ -2651,11 +3894,13 @@ export default function Home() {
       return;
     }
 
+    vlog("orb", "press IGNORED in state:", state);
     pressKindRef.current = null;
   }
 
   function handleOrbRelease() {
     const kind = pressKindRef.current;
+    vlog("orb", "release, kind:", kind, "| held:", Math.round(nowMs() - pressStartedAtRef.current), "ms");
     pressKindRef.current = null;
     pressingRef.current = false;
 
@@ -2670,6 +3915,7 @@ export default function Home() {
   }
 
   async function submitAudioAttempt(blob: Blob, durationMs: number) {
+    vlog("recorder", "submitting blob:", blob.size, "bytes,", Math.round(durationMs), "ms");
     if (blob.size === 0) {
       setRoomNote("nothing came through. typing works too.");
       setTurnState("ready");
@@ -2683,16 +3929,24 @@ export default function Home() {
         "metrics",
         JSON.stringify({ firstSpeechMs: null, hesitationCount: 0, durationMs }),
       );
-      const voiceAttempt = await readJson<{ transcript: string; freeze: FreezeSignals }>(
-        await fetch("/api/transcribe", { method: "POST", body: formData }),
-      );
+      const voiceAttempt = await readJson<{
+        transcript: string;
+        freeze: FreezeSignals;
+        transcriptionConfidence: TranscriptionConfidenceTier;
+      }>(await fetch("/api/transcribe", { method: "POST", body: formData }));
       const transcript = voiceAttempt.transcript.trim();
       if (!transcript) {
         throw new Error("nothing came through.");
       }
+      if (voiceAttempt.transcriptionConfidence === "unreliable") {
+        setRoomNote("that didn't come through clearly. try again, or type.");
+        setTurnState("ready");
+        return;
+      }
       setLastTranscript(transcript);
       setLastVoiceFreeze(voiceAttempt.freeze);
-      await submitAttempt(transcript, "spoken");
+      setLastTranscriptionConfidence(voiceAttempt.transcriptionConfidence);
+      routeCapturedTranscript(transcript, voiceAttempt.transcriptionConfidence === "borderline");
     } catch (error) {
       const message = error instanceof Error ? error.message : "voice did not come through.";
       setRoomNote(`${message} typing works too.`);
@@ -2700,17 +3954,67 @@ export default function Home() {
     }
   }
 
-  async function submitAttempt(attempt: string, inputMode: "spoken" | "written" = "written") {
+  // Opens the typed-fallback box pre-filled with a just-captured spoken transcript so the user
+  // can catch a bad transcription before it's judged, instead of it being scored as-is. lowConfidence
+  // carries the capture's confidence tier through to /api/evaluate even if they send without editing.
+  function requestTranscriptConfirmation(transcript: string, lowConfidence: boolean) {
+    clearTimers();
+    setTypedAttempt(transcript);
+    setTranscriptNeedsConfirm(true);
+    setPendingAttemptConfidence(lowConfidence);
+    setTypedFallbackOpen(true);
+    setTurnState("ready");
+  }
+
+  /**
+   * Decides whether a captured transcript needs the confirm step or can go straight to scoring.
+   * Confirming EVERY spoken turn is the wrong trade once the mic is open -- it re-adds exactly the
+   * tap that full-duplex removes -- so the box is reserved for transcripts that look wrong.
+   *
+   * The language branch matters: looksBrokenAttempt keys on English filler words ("the", "you",
+   * "want"...) as evidence that English leaked into Spanish. On the turns that are SUPPOSED to be
+   * answered in English -- the opening question and the coach's framing/scenario turns -- that same
+   * check fires on nearly every honest answer, so it must not be used there.
+   */
+  function routeCapturedTranscript(transcript: string, lowConfidence: boolean) {
+    const expectsEnglishAnswer = expectsEnglishAnswerNow();
+    const wordCount = transcript.trim().split(/\s+/).filter(Boolean).length;
+    const suspicious = expectsEnglishAnswer
+      ? lowConfidence || transcript.includes("...") || wordCount <= 1
+      : lowConfidence || looksBrokenAttempt(transcript) || transcript.trim().length < 3;
+
+    if (suspicious) {
+      requestTranscriptConfirmation(transcript, lowConfidence);
+      return;
+    }
+
+    void submitAttempt(transcript, "spoken", lowConfidence);
+  }
+
+  async function submitAttempt(
+    attempt: string,
+    inputMode: "spoken" | "written" = "written",
+    lowConfidence = false,
+  ) {
     const trimmed = attempt.trim();
     if (!trimmed) return;
 
     clearTimers();
     setTypedFallbackOpen(false);
     setTypedAttempt("");
+    setTranscriptNeedsConfirm(false);
     setTurnState("thinking");
 
+    // Checked before everything else: while the learner is stepped out, nothing they say is a
+    // Spanish attempt. Routing it anywhere below would score a sentence about their week as
+    // practice and hand the evaluator English to judge.
+    if (asideActiveRef.current) {
+      await handleAsideAttempt(trimmed);
+      return;
+    }
+
     if (retryTarget) {
-      await submitRetryAttempt(trimmed, inputMode);
+      await submitRetryAttempt(trimmed, inputMode, lowConfidence);
       return;
     }
 
@@ -2720,7 +4024,7 @@ export default function Home() {
     }
 
     if (flowPhase === "coach") {
-      await handleCoachAttempt(trimmed, inputMode);
+      await handleCoachAttempt(trimmed, inputMode, lowConfidence);
       return;
     }
 
@@ -2737,9 +4041,27 @@ export default function Home() {
 
     try {
       const repliedTo = currentConversationTurn;
-      const evaluationPromise = repliedTo
-        ? evaluateSessionAttempt(trimmed, repliedTo).catch(() => null)
-        : Promise.resolve(null);
+      /**
+       * Serialized on purpose, where this used to run in parallel with the coach reply.
+       *
+       * The character can only admit it did not understand if the verdict on what it just heard
+       * exists before its line is generated. That costs the evaluation's latency on every turn --
+       * measured at roughly +2.3s of a ~6s turn -- and it buys back the entire repair path, which
+       * was fully written on the server and unreachable because the client always sent
+       * `repairRequested: false`.
+       */
+      const evaluation = repliedTo
+        ? await evaluateSessionAttempt(trimmed, repliedTo, lowConfidence).catch(() => null)
+        : null;
+      // Same verdict, a second question: repair asks "should the character admit it did not
+      // understand", this asks "has this stopped working for the person". A turn can be both.
+      noteAsideSignal(evaluation, inputMode === "spoken" ? lastVoiceFreeze : null);
+      const repairDecision = shouldTriggerRepair({
+        evaluation,
+        assistanceUsed: turnAssistanceRef.current,
+        lastTurnWasRepair: Boolean(currentConversationTurn?.isRepairTurn),
+        lowConfidence,
+      });
       const next = await readJson<ConverseReply>(
         await fetch("/api/converse", {
           method: "POST",
@@ -2749,12 +4071,34 @@ export default function Home() {
             conversationId,
             turnIndex,
             userAttempt: trimmed,
-            repairRequested: false,
-            pressureMode: false,
+            repairRequested: repairDecision.repair,
+            pressureMode,
+            // #44 -- what the character is allowed to notice. Settled verdicts on earlier turns
+            // (safe to speak about as fact) and measurements of how THIS reply came out. The
+            // evaluation of this reply is still in flight, which is exactly why the current turn
+            // contributes delivery only; see the route's reactionPrompt.
+            recentEvidence: sessionTurns
+              .filter((turn) => turn.evaluation)
+              .slice(-3)
+              .map((turn) => ({
+                meaning: turn.evaluation?.meaningResult ?? "unclear",
+                blocker: turn.evaluation?.observedBlocker.type ?? null,
+                assistance: turn.evaluation?.assistanceUsed ?? "none",
+              })),
+            thisTurn: {
+              assistance: turnAssistanceRef.current,
+              usedSubtitle: turnSubtitleRef.current,
+              unaidedRun: unaidedRunRef.current,
+              // Freeze metrics describe a SPOKEN attempt. `lastVoiceFreeze` outlives the turn it
+              // was measured on, so sending it for a typed reply would have the character react
+              // to a pause that never happened on this turn.
+              secondsToFirstWord: inputMode === "spoken" ? lastVoiceFreeze?.timeToFirstWordSeconds ?? null : null,
+              hesitations: inputMode === "spoken" ? lastVoiceFreeze?.hesitationCount ?? 0 : 0,
+              englishWords: inputMode === "spoken" ? lastVoiceFreeze?.englishWordCount ?? 0 : 0,
+            },
           }),
         }),
       );
-      const evaluation = await evaluationPromise;
       const nextTurns = repliedTo
         ? [
             ...sessionTurns,
@@ -2775,7 +4119,7 @@ export default function Home() {
       if (repliedTo) {
         setSessionTurns(nextTurns);
       }
-      showCoachReply(next);
+      showCoachReply(next, calloutForTurn(evaluation, Boolean(next.shouldClose)));
       if (next.shouldClose) {
         void saveCurrentMoment(nextTurns, next);
       }
@@ -2802,14 +4146,20 @@ export default function Home() {
               setMode("landing");
               setTypedFallbackOpen(false);
               setTypedAttempt("");
+              setTranscriptNeedsConfirm(false);
               setConversationId(null);
               setCoachLine(null);
-              setCoachMeaning(null);
+              showMeaning(null, null, { folded: false });
               setLastTranscript(null);
               setRoomNote(null);
               setEyesOffMode(false);
               setCurrentConversationTurn(null);
               setSessionTurns([]);
+    setSessionCallout(null);
+    unaidedRunRef.current = 0;
+    calloutSpokenRef.current = false;
+    turnAssistanceRef.current = "none";
+    turnSubtitleRef.current = false;
               setReturnEmail("");
               setReturnEmailStatus("idle");
               setFeedbackAnswers(blankFeedbackAnswers());
@@ -2847,17 +4197,41 @@ export default function Home() {
           )}
         </header>
 
+        {/*
+          #47 -- the session's focus, above the orb rather than next to the mic status. Under the
+          status label it read as a second instruction about what to do right now; here it reads
+          as what this whole session is about, which is what it is.
+        */}
+        {flowPhase === "session" && !overlay && !asideActive && (sessionFocusLine || sceneCharacter) ? (
+          <div className="session-header">
+            {sessionFocusLine ? <p className="session-focus">today: {sessionFocusLine}</p> : null}
+            {/*
+              #29 -- the coach names them once, out loud, on the scenario turn. Two turns later
+              nobody remembers, and the orb goes back to being a faceless blob. The name is also
+              what lets the orb stop doing three jobs at once (#40).
+            */}
+            {sceneCharacter ? (
+              <p className="session-who">
+                {/*
+                  A name that already contains the relation ("your girlfriend's sister") would
+                  otherwise render as "with your girlfriend's sister — girlfriend's sister". The
+                  prompts ask for a first name; this is what happens when they do not get one.
+                */}
+                {sceneCharacter.relation &&
+                !sceneCharacter.name.toLowerCase().includes(sceneCharacter.relation.toLowerCase()) &&
+                !sceneCharacter.relation.toLowerCase().includes(sceneCharacter.name.toLowerCase())
+                  ? `with ${sceneCharacter.name} — ${sceneCharacter.relation}`
+                  : `with ${sceneCharacter.name}`}
+              </p>
+            ) : null}
+          </div>
+        ) : null}
+
         <button
           className={`room-orb-wrap ${turnState}`}
           type="button"
           aria-label={holdLabel}
-          disabled={
-            isLanding ||
-            Boolean(overlay) ||
-            typedFallbackOpen ||
-            turnState === "thinking" ||
-            (turnState === "speaking" && !interruptible)
-          }
+          disabled={orbDisabled}
           onPointerDown={(event) => {
             event.preventDefault();
             event.currentTarget.setPointerCapture(event.pointerId);
@@ -2886,20 +4260,81 @@ export default function Home() {
           {roomSubcopy ? <p className="turn-subcopy">{roomSubcopy}</p> : null}
           {typedFallbackOpen ? (
             <div className="type-fallback" aria-label="Typed fallback">
-              <h2>I can&apos;t hear you yet.</h2>
-              <p>type it instead — we&apos;ll keep going.</p>
+              <h2>{transcriptNeedsConfirm ? "here's what I heard." : "I can't hear you yet."}</h2>
+              <p>
+                {transcriptNeedsConfirm
+                  ? "fix anything that's wrong, then send."
+                  : "type it instead — we'll keep going."}
+              </p>
               <textarea
                 aria-label="what were you trying to say?"
                 placeholder="what were you trying to say?"
                 value={typedAttempt}
                 onChange={(event) => setTypedAttempt(event.target.value)}
               />
-              <button type="button" onClick={() => void submitAttempt(typedAttempt)}>
+              <button
+                type="button"
+                onClick={() =>
+                  void submitAttempt(
+                    typedAttempt,
+                    transcriptNeedsConfirm ? "spoken" : "written",
+                    transcriptNeedsConfirm ? pendingAttemptConfidence : false,
+                  )
+                }
+              >
                 send
               </button>
-              <button className="quiet-link" type="button" onClick={() => setTypedFallbackOpen(false)}>
-                try voice again
+              <button
+                className="quiet-link"
+                type="button"
+                onClick={() => {
+                  setTypedFallbackOpen(false);
+                  setTranscriptNeedsConfirm(false);
+                }}
+              >
+                {transcriptNeedsConfirm ? "start over" : "try voice again"}
               </button>
+            </div>
+          ) : asideActive ? (
+            <div className="aside-room" aria-label="Stepped out">
+              <p className="aside-badge">stepped out — the scene is on pause</p>
+              {/*
+                Everything already said, oldest first, with the newest coach line pulled out below
+                as the heading. On a phone this is the only way the learner can see that they are
+                in a conversation rather than being asked a series of unrelated questions.
+              */}
+              {asideExchange.length > 1 ? (
+                <div className="aside-thread">
+                  {asideExchange.slice(0, -1).map((entry, index) => (
+                    <p key={`${entry.who}-${index}`} className={entry.who === "you" ? "aside-said-you" : "aside-said-coach"}>
+                      {entry.text}
+                    </p>
+                  ))}
+                </div>
+              ) : null}
+              <h2>{asideLine ?? "one second."}</h2>
+              {asideOffer ? (
+                <div className="aside-offer">
+                  <button className="sheet-primary" type="button" onClick={() => void acceptAsideOffer()}>
+                    {asideOffer.labelEn}
+                  </button>
+                  {asideOffer.reasonEn ? <p className="tiny-note">{asideOffer.reasonEn}</p> : null}
+                </div>
+              ) : null}
+              {roomNote ? <p className="room-note">{roomNote}</p> : null}
+              {/*
+                Always available, even mid-offer: an aside the learner cannot walk out of is just
+                a different cage. `null` means no spoken lead-in -- they chose to leave, so the
+                character line comes back on its own without the coach narrating the exit.
+              */}
+              <button className="quiet-link" type="button" onClick={() => leaveAside(null)}>
+                back to the conversation
+              </button>
+              {turnState === "ready" ? (
+                <button className="quiet-link" type="button" onClick={() => setTypedFallbackOpen(true)}>
+                  rather type?
+                </button>
+              ) : null}
             </div>
           ) : isStung && flowPhase === "opening" ? (
             <>
@@ -2913,6 +4348,7 @@ export default function Home() {
             <>
               {turnState === "thinking" ? null : (
                 <>
+                  {sessionCallout ? <p className="session-callout">{sessionCallout}</p> : null}
                   {(() => {
                     const line = coachLine ?? openingPrompt;
                     const foldable = line.length > 90;
@@ -2933,7 +4369,32 @@ export default function Home() {
                       <h2>{line}</h2>
                     );
                   })()}
-                  {coachMeaning ? <p className="room-translation">{coachMeaning}</p> : null}
+                  {coachMeaning ? (
+                    // Only a translation is foldable. An instruction is something the learner is
+                    // being asked to DO, so it always renders plainly.
+                    coachMeaningKind === "translation" ? (
+                      <button
+                        type="button"
+                        className={englishFolded ? "translation-fold is-folded" : "translation-fold"}
+                        aria-expanded={!englishFolded}
+                        onClick={() => {
+                          setEnglishFolded((current) => {
+                            // Only opening counts. Closing it again does not un-read it, and the
+                            // session translation starts folded, so opening is always a choice.
+                            if (current) turnSubtitleRef.current = true;
+                            return !current;
+                          });
+                        }}
+                      >
+                        <p className="room-translation">{coachMeaning}</p>
+                        <span className="coach-line-toggle" aria-hidden="true">
+                          {englishFolded ? "what that means" : ""}
+                        </span>
+                      </button>
+                    ) : (
+                      <p className="room-translation">{coachMeaning}</p>
+                    )
+                  ) : null}
                   {coachTool ? (
                     <CoachToolCard
                       tool={coachTool}
@@ -2942,12 +4403,57 @@ export default function Home() {
                         cancelSpeaking();
                         realtimeActiveCaptureRef.current = false;
                         holdingRef.current = false;
-                        disableRealtimeMic();
+                        syncRealtimeMic();
                         void submitAttempt(label, "written");
                       }}
                     />
                   ) : null}
                   {roomNote ? <p className="room-note">{roomNote}</p> : null}
+                  {asideNudgeOpen ? (
+                    <div className="noisy-offer" aria-label="Step out of the scene">
+                      <button type="button" onClick={() => void enterAside("offered")}>
+                        step out and talk about it
+                      </button>
+                      <p className="tiny-note">the scene waits — nothing you have done is lost.</p>
+                      <button
+                        className="quiet-link"
+                        type="button"
+                        onClick={() => {
+                          setAsideNudgeOpen(false);
+                          // Not reset: they said no once, and asking again two turns later is
+                          // nagging. `asideNudgeShownRef` already keeps it to once per session.
+                          asideStrikesRef.current = 0;
+                        }}
+                      >
+                        keep going
+                      </button>
+                    </div>
+                  ) : null}
+                  {noisyOfferOpen ? (
+                    <div className="noisy-offer" aria-label="Noisy room">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setMicMode("push");
+                          setNoisyOfferOpen(false);
+                          setRoomNote("switched to tap-to-talk. tap the orb when you're ready.");
+                        }}
+                      >
+                        switch to hold-to-talk
+                      </button>
+                      <p className="tiny-note">headphones help too — they stop the mic hearing the coach.</p>
+                      <button
+                        className="quiet-link"
+                        type="button"
+                        onClick={() => {
+                          setNoisyOfferOpen(false);
+                          setRoomNote(null);
+                        }}
+                      >
+                        keep the mic open
+                      </button>
+                    </div>
+                  ) : null}
                   {flowPhase === "verdict" && !overlay ? (
                     <button className="reopen-card" type="button" onClick={() => setOverlay("verdict")}>
                       see your card again &rarr;
@@ -2955,32 +4461,68 @@ export default function Home() {
                   ) : null}
                   {flowPhase === "session" && coachLine ? (
                     <div className="audio-actions" aria-label="Audio controls">
-                      <button type="button">🔊 hear again</button>
-                      <button type="button">🐢 slower</button>
+                      <button type="button" onClick={() => replayCoachLine(false)}>
+                        🔊 hear again
+                      </button>
+                      <button type="button" onClick={() => replayCoachLine(true)}>
+                        🐢 slower
+                      </button>
                     </div>
+                  ) : null}
+                  {showStepOut ? (
+                    <button className="step-out-chip" type="button" onClick={() => void enterAside("learner")}>
+                      hold on — can we talk?
+                    </button>
                   ) : null}
                   {showSessionTools ? (
                     <div className="session-tools" aria-label="Session tools">
-                      <button type="button" onClick={() => setOverlay("assistance")}>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          // Opening the ladder shows every rung this turn has, model answer
+                          // included -- so the honest record is the strongest thing on offer.
+                          noteAssistance(currentAssistanceRung === "model answer" ? "full_model" : "sentence_frame");
+                          setOverlay("assistance");
+                        }}
+                      >
                         help
                       </button>
-                      <button type="button" onClick={() => setOverlay("correction")}>
-                        fix
-                      </button>
-                      <button type="button" onClick={() => setOverlay("pronunciation")}>
-                        pronounce
-                      </button>
-                      <button type="button" onClick={() => setOverlay("ask")}>
-                        ask
-                      </button>
-                      <button
-                        className={eyesOffMode ? "is-active" : ""}
-                        type="button"
-                        aria-pressed={eyesOffMode}
-                        onClick={() => setEyesOffMode((current) => !current)}
-                      >
-                        eyes off
-                      </button>
+                      {everFix ? (
+                        <button
+                          className="is-revealed"
+                          type="button"
+                          onClick={() => {
+                            noteAssistance("full_model");
+                            setOverlay("correction");
+                          }}
+                        >
+                          fix
+                        </button>
+                      ) : null}
+                      {everPronounce ? (
+                        <button
+                          className="is-revealed"
+                          type="button"
+                          onClick={() => {
+                            noteAssistance("slower_audio");
+                            setOverlay("pronunciation");
+                          }}
+                        >
+                          pronounce
+                        </button>
+                      ) : null}
+                      {everAsk ? (
+                        <button
+                          className="is-revealed"
+                          type="button"
+                          onClick={() => {
+                            noteAssistance("english_explanation");
+                            setOverlay("ask");
+                          }}
+                        >
+                          ask
+                        </button>
+                      ) : null}
                     </div>
                   ) : null}
                   {turnState === "ready" ? (
@@ -3038,7 +4580,26 @@ export default function Home() {
               {overlay === "verdict" ? (
               <section className="room-sheet verdict-card" aria-label="Verdict">
                 <p className="verdict-kicker">what OutLoud heard</p>
-                <h2>you have enough Spanish. the gap is getting it out fast enough.</h2>
+                {/*
+                  This used to be the sentence above, hardcoded -- the same claim for every
+                  learner, printed where a diagnosis belongs. It is now the model's read of what
+                  they said trips them up against what actually happened (#46). The old string
+                  survives only as the fallback for moments saved before the field existed.
+                */}
+                <h2>
+                  {placementRescue?.stated_vs_observed?.line_en ||
+                    "you have enough Spanish. the gap is getting it out fast enough."}
+                </h2>
+                {/*
+                  Telling someone their own read was wrong is the highest-stakes sentence in the
+                  app, so it never stands alone: when the verdict contradicts or complicates what
+                  they said, the evidence for it is shown right underneath.
+                */}
+                {(placementRescue?.stated_vs_observed?.result === "correct" ||
+                  placementRescue?.stated_vs_observed?.result === "both") &&
+                placementRescue.observed_blocker.evidence ? (
+                  <p className="verdict-evidence">{placementRescue.observed_blocker.evidence}</p>
+                ) : null}
                 {momentAfter ? (
                   <div className="verdict-moment">
                     <span>your moment</span>
@@ -3100,19 +4661,34 @@ export default function Home() {
                     </>
                   ) : (
                     <>
+                  {/*
+                    This used to say the words "disappear when you close this", which is both an
+                    understatement and the wrong problem. The run IS saved -- with whatever email
+                    is given and `user_id: null` -- but reading anything back goes through
+                    `getAuthedUser`, so without an account OutLoud greets a returning learner as a
+                    stranger while their practice sits in the database. Someone hit exactly that.
+                    So the card now says what an account does, why the line is drawn at a login,
+                    and that signing up on the same address claims what is already there (which
+                    /api/library really does, on first load).
+                  */}
                   <p className="capture-sub">
-                    these words disappear when you close this. keep them — and get them back tomorrow in a new
-                    situation.
+                    nothing here comes back on its own. an account is what lets OutLoud remember
+                    you — what trips you up, every session, all of it.
                   </p>
                   <button className="account-button" type="button" onClick={() => openAuth("signup")}>
                     create a free account
                   </button>
+                  <p className="capture-fineprint">
+                    your practice is tied to a login, not to a typed-in address — otherwise anyone
+                    who guessed your email could read it. sign up with the same address and
+                    everything you already saved comes with you.
+                  </p>
                   <button
                     className="quiet-link"
                     type="button"
                     onClick={() => setEmailFallbackOpen((current) => !current)}
                   >
-                    or just email me the words
+                    or just email me a link to this one
                   </button>
                   {emailFallbackOpen ? (
                     <div className="email-capture verdict-capture">
@@ -3138,7 +4714,9 @@ export default function Home() {
                           {returnEmailStatus === "saving" ? "saving" : "save them"}
                         </button>
                       </div>
-                      {returnEmailStatus === "saved" ? <small>saved. see you tomorrow.</small> : null}
+                      {returnEmailStatus === "saved" ? (
+                        <small>sent. that link opens this session only — it won&apos;t know you next time.</small>
+                      ) : null}
                       {returnEmailStatus === "error" ? <small>couldn&apos;t save yet. try once more.</small> : null}
                     </div>
                   ) : null}
@@ -3184,7 +4762,12 @@ export default function Home() {
                   </p>
                 ) : null}
                 <div className="email-capture">
-                  <label htmlFor="return-email">want me to bring this back tomorrow?</label>
+                  {/*
+                    Was "want me to bring this back tomorrow?" -- a promise an email alone cannot
+                    keep. It buys a private token link to this one session; being remembered is a
+                    different thing and needs an account.
+                  */}
+                  <label htmlFor="return-email">email me a link back to this session</label>
                   <div>
                     <input
                       id="return-email"
@@ -3206,9 +4789,21 @@ export default function Home() {
                       {returnEmailStatus === "saving" ? "sending" : "send it"}
                     </button>
                   </div>
-                  {returnEmailStatus === "saved" ? <small>saved for tomorrow.</small> : null}
+                  {returnEmailStatus === "saved" ? <small>sent — that link opens this session.</small> : null}
                   {returnEmailStatus === "error" ? <small>couldn&apos;t save yet. try once more.</small> : null}
                 </div>
+                {authedEmail ? null : (
+                  <div className="account-nudge">
+                    <p>
+                      OutLoud won&apos;t know you next time without an account. that&apos;s the
+                      only way it keeps what trips you up and picks up where you stopped — and it
+                      takes the same email you just used.
+                    </p>
+                    <button className="account-button" type="button" onClick={() => openAuth("signup")}>
+                      create a free account
+                    </button>
+                  </div>
+                )}
                 <div className="sheet-split-actions">
                   <button type="button" onClick={() => setOverlay("transcript")}>
                     review transcript
@@ -3217,6 +4812,16 @@ export default function Home() {
                     keep going
                   </button>
                 </div>
+                {/*
+                  The only way into "what OutLoud knows about you". That card and the evidence
+                  card behind it opened each other and nothing else opened either -- a closed loop
+                  with no door, so the surface that is supposed to prove the app remembers your
+                  problem (#50) could not be reached at all. The end of a session is the right
+                  door: it is the moment the learner is already looking at what just happened.
+                */}
+                <button className="sheet-link sage-link" type="button" onClick={() => setOverlay("profile")}>
+                  what OutLoud knows about you
+                </button>
                 <button
                   className="sheet-primary"
                   type="button"
@@ -3233,6 +4838,16 @@ export default function Home() {
 
               {overlay === "feedback" ? (
               <section className="room-sheet" aria-label="Feedback">
+                {/* eyes off is a mode, not a per-turn action, so it lives here rather than in the
+                    session tool row. The header pill this sheet opens from is already its indicator. */}
+                <button
+                  className={eyesOffMode ? "quiet-link is-active" : "quiet-link"}
+                  type="button"
+                  aria-pressed={eyesOffMode}
+                  onClick={() => setEyesOffMode((current) => !current)}
+                >
+                  {eyesOffMode ? "eyes off is on — turn it off" : "switch to eyes off"}
+                </button>
                 {feedbackDone ? (
                   <div className="feedback-complete">
                     <span className="complete-mark">✓</span>
@@ -3310,9 +4925,14 @@ export default function Home() {
               <section className="room-sheet" aria-label="What OutLoud knows about you">
                 <h2>what OutLoud knows about you</h2>
                 <div className="skill-list">
+                  {profileRows.length === 0 ? (
+                    <p className="page-body">
+                      nothing observed yet — one conversation turn and your thing shows up here.
+                    </p>
+                  ) : null}
                   {profileRows.map((row, index) => (
                     <button
-                      key={row.name}
+                      key={row.blocker}
                       type="button"
                       onClick={() => {
                         setProfileEvidenceIndex(index);
@@ -3356,10 +4976,10 @@ export default function Home() {
 
             {overlay === "evidence" ? (
               <section className="room-sheet" aria-label="Evidence">
-                <h2>{activeEvidence.name}</h2>
+                <h2>{activeEvidence?.name ?? "nothing observed yet"}</h2>
                 <div className="evidence-card">
-                  <p>{activeEvidence.evidence ?? "OutLoud needs one more reply before it keeps this."}</p>
-                  <small>{activeEvidence.state}</small>
+                  <p>{activeEvidence?.evidence || "OutLoud needs one more reply before it keeps this."}</p>
+                  <small>{activeEvidence?.state ?? "not enough yet"}</small>
                 </div>
                 <button className="sheet-link sage-link" type="button" onClick={() => setOverlay("profile")}>
                   why OutLoud thinks this
@@ -3402,12 +5022,34 @@ export default function Home() {
               <section className="room-sheet" aria-label="Pressure">
                 <h2>how real should it feel?</h2>
                 <div className="pressure-list">
-                  <button type="button">patient</button>
-                  <button className="is-active" type="button">real person</button>
-                  <button type="button">under pressure</button>
+                  <button
+                    className={toneMode === "patient" ? "is-active" : ""}
+                    type="button"
+                    onClick={() => setToneMode("patient")}
+                  >
+                    patient
+                  </button>
+                  <button
+                    className={toneMode === "real" ? "is-active" : ""}
+                    type="button"
+                    onClick={() => setToneMode("real")}
+                  >
+                    real person
+                  </button>
+                  <button
+                    className={toneMode === "pressure" ? "is-active" : ""}
+                    type="button"
+                    onClick={() => setToneMode("pressure")}
+                  >
+                    under pressure
+                  </button>
                 </div>
                 <p className="sheet-note sage-note">
-                  some interruptions. natural follow-ups. a little less waiting.
+                  {toneMode === "pressure"
+                    ? "more interruptions, real curveballs, less waiting."
+                    : toneMode === "patient"
+                      ? "same pace as real person for now — a calmer mode is coming."
+                      : "some interruptions. natural follow-ups. a little less waiting."}
                 </p>
                 <p className="tiny-note">you can change this anytime.</p>
               </section>
@@ -3417,14 +5059,24 @@ export default function Home() {
               <section className="room-sheet" aria-label="Assistance ladder">
                 <h2>a little help</h2>
                 <div className="ladder-list">
-                  {assistanceRungs.map(([name, label, sample], index) => (
-                    <button className={index === 2 ? "is-current" : ""} type="button" key={name}>
-                      <span>{name}</span>
-                      <strong>{label}</strong>
-                      {sample ? <em>{sample}</em> : null}
+                  {assistanceLadder.map((rung) => (
+                    <button
+                      className={rung.name === currentAssistanceRung ? "is-current" : ""}
+                      type="button"
+                      key={rung.name}
+                    >
+                      <span>{rung.name}</span>
+                      <strong>{rung.label}</strong>
+                      {rung.sample ? <em>{rung.sample}</em> : null}
                     </button>
                   ))}
                 </div>
+                {/*
+                  Without this the reordered ladder just looks arbitrary -- two learners see a
+                  different order and neither is told why. It is one sentence and it is the whole
+                  point of #48: the help is shaped by what was diagnosed.
+                */}
+                {assistanceRationale ? <p className="ladder-why">{assistanceRationale}</p> : null}
                 <div className="sheet-split-actions">
                   <button type="button" onClick={() => setOverlay("correction")}>
                     fix the sentence
@@ -3453,6 +5105,18 @@ export default function Home() {
                     <p>{activeCorrection.naturalVersion || "finish one reply and this will fill in."}</p>
                   </div>
                 </div>
+                {activePronunciationTarget ? (
+                  <button
+                    type="button"
+                    className="quiet-link"
+                    onClick={() => setOverlay("pronunciation")}
+                  >
+                    pronunciation also affected clarity — practice it →
+                  </button>
+                ) : null}
+                {lastTranscriptionConfidence === "borderline" ? (
+                  <p className="tiny-note">this was hard to hear clearly — the correction above may be less reliable.</p>
+                ) : null}
                 {correctionRetryResult ? (
                   <p className="sheet-note sage-note">{correctionRetryResult.conciseFeedbackEn}</p>
                 ) : null}
@@ -3498,7 +5162,20 @@ export default function Home() {
                 >
                   try again
                 </button>
-                <p className="tiny-note">two tries max.</p>
+                {retryTarget?.kind === "pronunciation" ? (
+                  <button
+                    className="quiet-link"
+                    type="button"
+                    onClick={() => {
+                      setRetryTarget(null);
+                      restoreCurrentTurn("Back to the conversation.");
+                      setOverlay(null);
+                    }}
+                  >
+                    that&apos;s enough for now
+                  </button>
+                ) : null}
+                <p className="tiny-note">go as many times as you want.</p>
               </section>
             ) : null}
 
@@ -3553,9 +5230,27 @@ export default function Home() {
               <section className="room-sheet" aria-label="Eyes off mode">
                 <h2>eyes off</h2>
                 <div className="eyes-off-stack">
-                  <button type="button">repeat that</button>
-                  <button type="button">slower pacing</button>
-                  <button type="button">give me the next word</button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      closeOverlay();
+                      replayCoachLine(false);
+                    }}
+                  >
+                    repeat that
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      closeOverlay();
+                      replayCoachLine(true);
+                    }}
+                  >
+                    slower pacing
+                  </button>
+                  <button type="button" onClick={() => setOverlay("assistance")}>
+                    give me the next word
+                  </button>
                 </div>
                 <button
                   className="sheet-primary"

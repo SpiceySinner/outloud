@@ -5,7 +5,7 @@ import { lifelineResponseJsonSchema, lifelineResponseSchema } from "@/lib/lifeli
 import { isMockAiEnabled } from "@/lib/mock-ai";
 import { backgroundModel } from "@/lib/model-config";
 import { naturalSpanishSystemPrompt } from "@/lib/natural-spanish";
-import { checkRateLimit } from "@/lib/rate-limit";
+import { checkRateLimit, openAiRequestsPerDay } from "@/lib/rate-limit";
 import { rescueResponseSchema } from "@/lib/rescue-schema";
 
 const requestSchema = z.object({
@@ -27,7 +27,7 @@ const requestSchema = z.object({
 });
 
 export async function POST(request: Request) {
-  const limited = checkRateLimit(request, "lifeline", Number(process.env.MAX_OPENAI_REQUESTS_PER_SESSION ?? 25), 24 * 60 * 60 * 1000);
+  const limited = checkRateLimit(request, "lifeline", openAiRequestsPerDay(), 24 * 60 * 60 * 1000);
   if (limited) return limited;
 
   let body: unknown;

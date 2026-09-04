@@ -315,6 +315,14 @@ export function OrbCanvas({
 }: OrbCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const pointsRef = useRef(createPoints());
+  // The state is read through a ref inside the loop so the render effect never re-runs on a state
+  // change. Keyed on [state], it restarted the animation clock every transition, which snapped the
+  // orb's rotation and breathing phase back to zero -- visible as a hitch on every turn change.
+  const stateRef = useRef(state);
+
+  useEffect(() => {
+    stateRef.current = state;
+  }, [state]);
 
   useEffect(() => {
     let frame = 0;
@@ -323,14 +331,14 @@ export function OrbCanvas({
     const loop = (now: number) => {
       const canvas = canvasRef.current;
       if (canvas) {
-        paint(canvas, pointsRef.current, ORB_CONFIGS[state], (now - startedAt) / 1000);
+        paint(canvas, pointsRef.current, ORB_CONFIGS[stateRef.current], (now - startedAt) / 1000);
       }
       frame = requestAnimationFrame(loop);
     };
 
     frame = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(frame);
-  }, [state]);
+  }, []);
 
   return (
     <canvas

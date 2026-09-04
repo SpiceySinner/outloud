@@ -12,6 +12,7 @@ export function buildAttemptEvaluationPrompt({
   assistanceUsed,
   conversationTurn,
   variation,
+  lowConfidenceAttempt = false,
 }: {
   originalText: string;
   scenarioContext?: string | null;
@@ -28,6 +29,8 @@ export function buildAttemptEvaluationPrompt({
     expectedCommunicativeFunction?: string;
   } | null;
   variation?: RetrievalVariation | null;
+  /** True when the capture itself is suspect (low ASR confidence / no speech detected). */
+  lowConfidenceAttempt?: boolean;
 }) {
   return [
     {
@@ -47,6 +50,7 @@ export function buildAttemptEvaluationPrompt({
         stage,
         input_mode: inputMode,
         assistance_used: assistanceUsed,
+        low_confidence_attempt: lowConfidenceAttempt,
         rescue_target: {
           natural_version: rescue.natural_version,
           primary_correction: rescue.primary_correction,
@@ -57,6 +61,7 @@ export function buildAttemptEvaluationPrompt({
         conversation_turn: conversationTurn ?? null,
         user_attempt: attempt,
         instructions: [
+          "If low_confidence_attempt is true, this rule takes priority over every rule below it: the CAPTURE itself is suspect (likely silence, noise, or a mis-heard fragment), not the user's Spanish. meaningResult must be insufficient_evidence, observedBlocker.type must be insufficient_evidence with confidence low, correctedAttemptEs and correctedPrimaryIssue must be null, and pronunciationTargets must be an empty array. observedBlocker.evidence and conciseFeedbackEn must say plainly that the audio wasn't clear enough to evaluate -- never describe the user's Spanish itself as unclear, broken, or incorrect when low_confidence_attempt is true. Inventing a finding from unreliable audio is worse than reporting the gap.",
           "If evidence is too short or empty, use insufficient_evidence.",
           "scenario_context is background only. Evaluate whether user_attempt communicates the target_message or changed_context_variation, not whether it repeats the scenario setup.",
           // Without this the evaluator has only target_message to measure against, and a correct
@@ -69,7 +74,7 @@ export function buildAttemptEvaluationPrompt({
           "usedTargetChunk means the user produced the reusable pattern or a clear equivalent, not necessarily exact wording.",
           "correctedPrimaryIssue should be null only when evidence is insufficient.",
           "Use observedBlocker.type pronunciation_intelligibility when the issue is whether a word landed clearly.",
-          "If pronunciation_intelligibility is the observed blocker, pronunciationTargets must list 1 to 3 specific Spanish words to sound out with syllables and stress. If pronunciation is not the blocker, pronunciationTargets must be an empty array.",
+          "pronunciationTargets is independent of observedBlocker.type: whenever this rule doesn't force it empty, list 1 to 3 specific Spanish words to sound out with syllables and stress if -- and only if -- intelligibility was genuinely affected, even when the PRIMARY issue (observedBlocker.type) is something else, such as grammar_control. If intelligibility was not affected at all, pronunciationTargets must be an empty array. observedBlocker.type still names only the single highest-impact issue; do not change it just because pronunciationTargets is populated.",
           "Never grade accent or nativeness. Only mark words whose sound affects understandability.",
           "Keep conciseFeedbackEn short and actionable.",
           // The card that renders this used to show rescue_target.natural_version instead, which is

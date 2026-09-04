@@ -7,6 +7,21 @@ export const rescueResponseSchema = z.object({
   }),
   intended_meaning_check: z.string(),
   meaning_result: z.enum(["clear", "partial", "unclear", "skipped"]),
+  /**
+   * How the observed evidence relates to what the learner said trips them up. The learner told
+   * OutLoud their problem; if nothing visibly comes back about it, the honest reaction is "what
+   * was the point of telling it my problem?" -- so this is rendered as the verdict headline.
+   */
+  stated_vs_observed: z
+    .object({
+      result: z.enum(["confirm", "correct", "both", "not_enough"]),
+      line_en: z.string(),
+    })
+    // Optional on READ only. `rescueJsonSchema` still lists it as required, so the model must
+    // emit it; this keeps every moment saved before the field existed parseable. Without it,
+    // `generateDelayedRetrievalVariation` would safeParse those rows, fail, and silently return
+    // null -- killing the retrieval email for the entire existing corpus.
+    .optional(),
   observed_blocker: z.object({
     type: z.string(),
     confidence: z.enum(["low", "medium", "high"]),

@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import { selfReportedBlockers } from "@/lib/blocker-taxonomy";
+
 /**
  * One turn of the adaptive coach. The model owns the conversation (what to ask, when to help,
  * when it has seen enough) and picks at most one UI tool per turn from a fixed catalog so the
@@ -67,6 +69,27 @@ export const coachResponseSchema = z.object({
       noteEn: z.string(),
     })
     .nullable(),
+  /**
+   * The learner's OWN hypothesis, classified from their opening answer -- not a diagnosis.
+   * Set on the framing turn (the one turn that has just read that answer) and null on every
+   * turn after it, so a later turn cannot quietly overwrite what they actually said.
+   */
+  selfReportedBlocker: z.enum(selfReportedBlockers).nullable(),
+  /**
+   * Who the learner is about to talk to (#29). Set on the scenario turn, where the coach names
+   * them out loud, and carried forward so the practice session that follows is with the same
+   * person rather than an anonymous "Spanish coach". Null on every other turn.
+   */
+  sceneCharacter: z
+    .object({
+      /** First name only. */
+      name: z.string(),
+      /** Their relation to the learner, e.g. "your girlfriend's aunt", "the barista". */
+      relation: z.string(),
+      /** The one trait that makes them hard to talk to. */
+      traitEn: z.string(),
+    })
+    .nullable(),
   done: z.boolean(),
   doneReason: z.string().nullable(),
 });
@@ -88,6 +111,8 @@ export const coachResponseJsonSchema = {
     "expectedCommunicativeFunction",
     "tool",
     "evidence",
+    "selfReportedBlocker",
+    "sceneCharacter",
     "done",
     "doneReason",
   ],
@@ -138,6 +163,24 @@ export const coachResponseJsonSchema = {
             observedBlocker: { type: "string" },
             confidence: { type: "string", enum: ["low", "medium", "high"] },
             noteEn: { type: "string" },
+          },
+        },
+        { type: "null" },
+      ],
+    },
+    selfReportedBlocker: {
+      anyOf: [{ type: "string", enum: [...selfReportedBlockers] }, { type: "null" }],
+    },
+    sceneCharacter: {
+      anyOf: [
+        {
+          type: "object",
+          additionalProperties: false,
+          required: ["name", "relation", "traitEn"],
+          properties: {
+            name: { type: "string" },
+            relation: { type: "string" },
+            traitEn: { type: "string" },
           },
         },
         { type: "null" },
