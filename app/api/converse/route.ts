@@ -229,11 +229,25 @@ const MOCK_PRESSURE_CURVEBALL_EN = "Really? Why?";
 const MOCK_ELABORATION_LINE_ES = "Cuéntame un poco más, ¿qué fue lo mejor?";
 const MOCK_ELABORATION_LINE_EN = "Tell me a little more, what was the best part?";
 
+/**
+ * The opening line, and the source of the worst bug this route has had.
+ *
+ * The guidance used to read "prompt the user to use the phrase they just practiced", and the model
+ * did exactly that: it said the phrase. A learner practising "¿dónde está el museo?" was greeted by
+ * a passer-by asking THEM where the museum was -- reported twice from real sessions, once as the
+ * library and once as the museum, and misdiagnosed the first time as a transcription fault.
+ *
+ * The character creates the opening; the learner walks through it.
+ */
+const OPENING_TURN_RULE =
+  "CRITICAL: never say the learner's practised phrase yourself, and never ask them the question they are learning to ask. If they are practising how to ask for directions, you do not ask them for directions -- you are the one who has them. Your line makes room for their phrase; it does not use it. In a scene where the learner is the one who wants something, opening as someone who has just been approached is usually right (\"¿sí, dime?\", \"buenas, ¿qué necesitas?\"), and then you wait.";
+
 function conversationDifficultyGuidance(turnIndex: number, pressureMode: boolean, sceneIsNew = false) {
   if (turnIndex <= 0) {
     return sceneIsNew
-      ? "Turn 1: open the NEW scene described in scenarioContext, as the person in it. Your first line must be something that person would actually say in that place, to this learner, right now, about what is happening THERE. Do not open with the situation from originalText or the rescue card, and do not bring their errand, their topic or their objects along -- the learner has just told us that situation is not their problem, and opening there is the whole reason this scene exists. Do not hand them the practised pattern on this line either; let the scene ask for it."
-      : "Turn 1: stay close to the practiced pattern and the original situation. Prompt the user to use the phrase they just practiced.";
+      ? "Turn 1: open the NEW scene described in scenarioContext, as the person in it. Your first line must be something that person would actually say in that place, to this learner, right now, about what is happening THERE. Do not open with the situation from originalText or the rescue card, and do not bring their errand, their topic or their objects along -- the learner has just told us that situation is not their problem, and opening there is the whole reason this scene exists. " +
+        OPENING_TURN_RULE
+      : "Turn 1: open the scene as that person, close to the original situation, so that the phrase the learner practised becomes the natural next thing to say. " + OPENING_TURN_RULE;
   }
   if (turnIndex === 1) {
     return pressureMode
@@ -363,7 +377,21 @@ async function generateTurn(
   }
 
   const baseSystemPrompt =
-    "Continue a short, bounded Spanish practice conversation. Act as the selected person, one realistic follow-up at a time. " +
+    "Continue a short, bounded Spanish practice conversation. Act as the selected person, one realistic beat at a time. " +
+    // The route used to say "one realistic follow-up at a time", and every turn guidance below
+    // still says to ask something. That is right for a scenario where the character leads -- and
+    // exactly wrong for the many where the learner needs something FROM them. Observed: the
+    // learner asked "¿dónde está el museo?" and the character replied "¿puedes decirme si el
+    // museo está cerca o lejos?", handing the question straight back.
+    "TALKING ABOUT THE TASK IS NOT ATTEMPTING IT. If lastUserAttempt is the learner explaining in English that they do not have the words, asking how to say something, or saying they are stuck, do not play confused and do not treat it as broken Spanish. Answer the person. characterLineEs stays in character and short, and responseGuidanceEn tells them plainly what to do next. " +
+    "NEVER praise a non-answer. \"no idea\", \"I don't know\", \"I can't\" -- these never get a warm \"perfecto\" and a new question that leaves them exactly as stuck. " +
+    "IF THE LEARNER ASKED YOU SOMETHING, ANSWER IT. You are the person who is there, so you know where it is, what it costs, when it opens -- invent the detail confidently and say it. Never reply to a question with the same question aimed back at them, and never ask them for information they just asked you for. " +
+    // Without this the rule runs backwards on turn 0: the rescue card holds the sentence the
+    // learner PRACTISED ("¿dónde está el museo?"), the model read it as a question it had been
+    // asked, and the scene opened with the character volunteering directions to someone who had
+    // not spoken yet.
+    "This applies to lastUserAttempt and to nothing else. The rescue card, the practised pattern and originalText record what this learner is working on -- they are not questions anyone has asked you, so never answer them. When lastUserAttempt is null you have not been asked anything at all: open the scene as that person would, and wait. " +
+    "Whole scenarios exist where the learner needs something from you -- directions, an order, a price, a favour, a phone call. In those, most of your lines are ANSWERS. Answer first; only then, if it is natural, add one short follow-up in the same breath. Where the turn guidance below tells you to ask a follow-up, that follow-up comes AFTER your answer and never instead of it. " +
     naturalSpanishSystemPrompt + " " +
     "Use short practice-appropriate Spanish, chosen tone/dialect, and meaning chunks rather than word-for-word translation. " +
     (state.sceneIsNew

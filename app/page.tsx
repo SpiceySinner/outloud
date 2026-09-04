@@ -162,6 +162,13 @@ const ignorableRealtimeErrorCodes = new Set([
 
 // How long the orb waits after the coach finishes before it stops listening on its own.
 const autoListenIdleMs = 10000;
+/**
+ * How many hesitation-only captures in a row get extra time before the room hands the turn back.
+ *
+ * Invented, like every other threshold here. Two is the point where more waiting stops reading as
+ * patience and starts reading as the app having frozen.
+ */
+const maxFillerRetries = 2;
 // How long an armed (open but not capturing) mic may sit in silence before it closes itself.
 const armedIdleCutoffMs = 120000;
 // A press longer than this is treated as classic push-to-talk (release ends the turn).
@@ -225,6 +232,39 @@ function clipForApi(value: string, max = 1500) {
 }
 
 // A spoken attempt that visibly broke: trailing off, or English leaking into the Spanish.
+/**
+ * Sounds a person makes while still deciding what to say.
+ *
+ * Deliberately narrow. "eh" and "este" are also real Spanish words and "well" and "like" are real
+ * English ones. "mm", "mmm" and "mhm" are left out for a sharper reason: as a whole utterance they
+ * usually mean YES, and a learner answering a yes/no question with one has answered it. Swallowing
+ * that as hesitation would silently discard a correct reply -- the exact failure the short-answer
+ * rule exists to prevent. "ah" is a reaction, not a stall.
+ */
+const fillerSounds = new Set([
+  "um", "umm", "uhm", "uh", "uhh", "er", "err", "erm", "ehm", "emm", "em",
+  "hm", "hmm", "hmmm", "ähm", "äh", "öhm",
+]);
+
+/**
+ * True when the capture contains nothing but hesitation.
+ *
+ * Server VAD ends a turn on silence, and a learner who says "um..." and then thinks has produced
+ * exactly that: a complete turn, by the microphone's definition, containing no answer. Sending it
+ * on gets it flagged as a broken attempt and puts a confirm box in front of someone who was still
+ * working out how to start -- asking them to correct a transcript that was perfectly accurate.
+ */
+function isFillerOnly(attempt: string) {
+  const words = attempt
+    .toLowerCase()
+    // Punctuation only: the ellipsis a hesitation transcribes as, and the commas between two of
+    // them. Letters and digits survive, so anything with real content fails this test.
+    .replace(/[.,!?¿¡…"'`\-—–]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+  return words.length > 0 && words.every((word) => fillerSounds.has(word));
+}
+
 function looksBrokenAttempt(attempt: string) {
   return (
     attempt.includes("...") ||
@@ -672,6 +712,14 @@ export default function Home() {
   const micSleepingRef = useRef(false);
   /** Consecutive captures that produced nothing usable -- the signal that a room is too noisy. */
   const noisyStrikesRef = useRef(0);
+  /**
+   * Consecutive captures on this turn that contained only hesitation. Reset by any capture with
+   * real content in it, so a learner who thinks out loud once does not spend the budget for the
+   * rest of the session.
+   */
+  const fillerRetriesRef = useRef(0);
+  /** Makes the NEXT capture wait much longer before deciding the learner has finished. */
+  const patientCaptureRef = useRef(false);
   const noisyOfferShownRef = useRef(false);
   const [mode, setMode] = useState<RoomMode>("landing");
   const [turnState, setTurnState] = useState<TurnState>("speaking");
@@ -983,13 +1031,23 @@ export default function Home() {
    * disclosure (it is the one thing that must be there on turn one) and it survives the coach
    * speaking, because "actually, hang on" most often arrives mid-sentence.
    */
+  /** Whether an aside is possible at all right now, ignoring what is currently on screen. */
+  const canStepOut =
+    !isLanding &&
+    ((flowPhase === "session" && Boolean(currentConversationTurn)) ||
+      (flowPhase === "coach" && Boolean(coachTurn))) &&
+    !asideActive;
   const showStepOut =
     !isLanding &&
-    flowPhase === "session" &&
+    // Both conversational phases, not just practice. The intake is where someone discovers this
+    // is the wrong level for them entirely -- a learner saying "I'm completely new, I can't
+    // remember any vocabulary" mid-intake had nowhere to put that, and every following turn asked
+    // them for more Spanish.
+    ((flowPhase === "session" && Boolean(currentConversationTurn)) ||
+      (flowPhase === "coach" && Boolean(coachTurn))) &&
     !asideActive &&
     !overlay &&
     !typedFallbackOpen &&
-    Boolean(currentConversationTurn) &&
     turnState !== "thinking";
   const currentPlacementPrompt: PlacementPrompt | null = coachTurn
     ? {
@@ -1311,7 +1369,7 @@ export default function Home() {
     });
   }
 
-  function applyVadProfile(profile: "capture" | "guard") {
+  function applyVadProfile(profile: "capture" | "guard" | "patient") {
     vlog("vad", "applying profile:", profile, "threshold: 0.5");
     return sendRealtimeEvent({
       type: "session.update",
@@ -1329,7 +1387,12 @@ export default function Home() {
               // speakers. Raise it again when Half B lands, not before.
               threshold: 0.5,
               prefix_padding_ms: 300,
-              silence_duration_ms: profile === "guard" ? 600 : pressureMode ? 850 : 1200,
+              // `patient` is the answer to a capture that came back as nothing but "um": the
+              // learner is mid-thought, and the fix for cutting them off is to stop cutting them
+              // off. Long enough to think in, short enough that a finished answer does not sit
+              // there feeling ignored.
+              silence_duration_ms:
+                profile === "guard" ? 600 : profile === "patient" ? 2600 : pressureMode ? 850 : 1200,
               create_response: false,
               interrupt_response: false,
             },
@@ -1405,7 +1468,7 @@ export default function Home() {
       );
     }
     if (changed && next !== "closed") {
-      applyVadProfile(next === "capturing" ? "capture" : "guard");
+      applyVadProfile(next === "capturing" ? (patientCaptureRef.current ? "patient" : "capture") : "guard");
     }
   }
 
@@ -1983,7 +2046,7 @@ export default function Home() {
       syncRealtimeMic();
       setRoomNote(micModeRef.current === "open" ? null : "tap the orb whenever you're ready.");
       if (micModeRef.current === "open") armIdleCutoff();
-    }, autoListenIdleMs);
+    }, patientCaptureRef.current ? autoListenIdleMs * 2 : autoListenIdleMs);
   }
 
   /**
@@ -2219,6 +2282,40 @@ export default function Home() {
       return;
     }
 
+    // Nothing but "um" -- they are still thinking, and the microphone mistook a pause for an
+    // ending. Give the time back instead of treating it as an answer.
+    if (isFillerOnly(transcript.trim())) {
+      fillerRetriesRef.current += 1;
+      vlog("filler", "hesitation-only capture", fillerRetriesRef.current, JSON.stringify(transcript.trim()));
+
+      if (fillerRetriesRef.current <= maxFillerRetries) {
+        patientCaptureRef.current = true;
+        setRoomNote("take your time.");
+        setTurn("ready");
+        syncRealtimeMic();
+        // Reopened rather than left armed: they were already speaking, and making them start the
+        // whole utterance again is the opposite of waiting for them.
+        void beginAutoListen();
+        return;
+      }
+
+      // Out of patience. Not a dud -- the room is not noisy and hold-to-talk would not help, so
+      // this deliberately does NOT go through registerDudCapture. Just say so and stay open.
+      vlog("filler", "patience spent; handing the turn back");
+      patientCaptureRef.current = false;
+      setRoomNote(
+        micModeRef.current === "open"
+          ? "whenever you're ready — or type it if that's easier."
+          : "tap the orb when you're ready, or type it.",
+      );
+      setTurn("ready");
+      syncRealtimeMic();
+      return;
+    }
+
+    // Real content came through: both the noise and the patience budgets start again.
+    fillerRetriesRef.current = 0;
+    patientCaptureRef.current = false;
     noisyStrikesRef.current = 0;
     setLastTranscript(transcript.trim());
     // No graded confidence tier exists on the realtime path -- VAD is the only signal, and it
@@ -2648,7 +2745,63 @@ export default function Home() {
   }
 
   /**
-   * Step out of the scene and talk to the coach about what is actually in the way.
+   * Everything the aside needs to know about where the learner just walked out of.
+   *
+   * Built in one place because `enterAside` and every following `handleAsideAttempt` must agree:
+   * the route is stateless, so this travels on every call, and a snapshot that drifted between
+   * the opening call and the replies would have the coach quietly change what it thinks it is
+   * talking about halfway through.
+   */
+  function asideSceneSnapshot() {
+    const focus = { current: focusBlocker, stated: statedFocus, observed: observedFocus };
+
+    if (flowPhaseRef.current === "coach" && coachTurn) {
+      return {
+        stage: "intake" as const,
+        focus,
+        scene: {
+          characterEn: "the OutLoud coach, still working out what this learner needs",
+          scenarioEn: openingAnswer ? `What they said at the very start: "${openingAnswer}"` : null,
+          characterLineEs: coachTurn.sayEs,
+          characterMeaningEn: coachTurn.meaningEn || null,
+        },
+        // No evaluator runs during the intake, so these carry what was said and nothing about
+        // whether it was right -- claiming a verdict we do not have would be worse than silence.
+        recentTurns: placementAttempts.slice(-3).map((attempt) => ({
+          characterLineEs: attempt.characterLineEs,
+          userAttempt: attempt.userAttempt,
+          meaning: "not evaluated -- this is still the intake",
+        })),
+      };
+    }
+
+    const turn = currentConversationTurn;
+    return {
+      stage: "session" as const,
+      focus,
+      scene: {
+        characterEn: conversationWho,
+        scenarioEn: sceneCharacter
+          ? `${sceneCharacter.name} -- ${sceneCharacter.relation}. ${sceneCharacter.traitEn}`
+          : null,
+        characterLineEs: turn?.characterLineEs ?? null,
+        characterMeaningEn: turn?.characterMeaningEn ?? null,
+      },
+      // Enough to tell one bad turn from a pattern, and no more: the coach is here to hear what
+      // the learner says is wrong, not to re-litigate the transcript.
+      recentTurns: sessionTurns
+        .filter((sessionTurn) => sessionTurn.userAttempt)
+        .slice(-3)
+        .map((sessionTurn) => ({
+          characterLineEs: sessionTurn.characterLineEs,
+          userAttempt: sessionTurn.userAttempt ?? "",
+          meaning: sessionTurn.evaluation?.meaningResult ?? "unclear",
+        })),
+    };
+  }
+
+  /**
+   * Step out and talk to the coach about what is actually in the way.
    *
    * `trigger` records who decided: "learner" when they reached for it, "offered" when the room
    * noticed two replies in a row not landing and put it in front of them. The coach opens
@@ -2657,7 +2810,10 @@ export default function Home() {
    * question, and asking the wrong one wastes the first turn.
    */
   async function enterAside(trigger: "learner" | "offered") {
-    if (asideActiveRef.current || !currentConversationTurn) return;
+    if (asideActiveRef.current) return;
+    const snapshot = asideSceneSnapshot();
+    // Nothing to step out OF yet, and nothing to come back to.
+    if (!snapshot.scene.characterLineEs) return;
 
     clearTimers();
     setAsideNudgeOpen(false);
@@ -2678,7 +2834,6 @@ export default function Home() {
     setTurn("thinking");
     syncRealtimeMic();
 
-    const turn = currentConversationTurn;
     try {
       const first = await readJson<AsideResponse>(
         await fetch("/api/aside", {
@@ -2689,39 +2844,17 @@ export default function Home() {
             // /api/aside is stateless: the whole aside travels on every call. Empty here because
             // nothing has been said yet.
             exchange: [],
-            scene: {
-              characterEn: conversationWho,
-              scenarioEn: sceneCharacter
-                ? `${sceneCharacter.name} -- ${sceneCharacter.relation}. ${sceneCharacter.traitEn}`
-                : null,
-              characterLineEs: turn.characterLineEs,
-              characterMeaningEn: turn.characterMeaningEn,
-            },
-            focus: {
-              current: focusBlocker,
-              stated: statedFocus,
-              observed: observedFocus,
-            },
-            // Enough to tell one bad turn from a pattern, and no more: the coach is here to hear
-            // what the learner says is wrong, not to re-litigate the transcript.
-            recentTurns: sessionTurns
-              .filter((sessionTurn) => sessionTurn.userAttempt)
-              .slice(-3)
-              .map((sessionTurn) => ({
-                characterLineEs: sessionTurn.characterLineEs,
-                userAttempt: sessionTurn.userAttempt ?? "",
-                meaning: sessionTurn.evaluation?.meaningResult ?? "unclear",
-              })),
+            ...snapshot,
           }),
         }),
       );
       showAsideTurn(first, []);
     } catch (error) {
-      // Never strand them outside the scene. If the coach cannot come to the phone, put them back
-      // where they were and say so, rather than leaving a dead room with no way forward.
+      // Never strand them outside. If the coach cannot come to the phone, put them back where
+      // they were and say so, rather than leaving a dead room with no way forward.
       const message = error instanceof Error ? error.message : "OutLoud could not step out just now.";
       leaveAside(null);
-      setRoomNote(`${message} the conversation is still here.`);
+      setRoomNote(`${message} we're still where you left off.`);
     }
   }
 
@@ -2740,12 +2873,12 @@ export default function Home() {
     // a verdict, and "no, that is not it either" has to be sayable without hunting for a button.
     // The aside session is kept alive on the server for exactly that reason -- it is closed by
     // `leaveAside`, never by `done`.
-    void speakCoachText(turn.sayEn, "conversation", 1600, { autoListen: true, interruptible: true });
+    void speakCoachText(turn.sayEn, currentRealtimeMode(), 1600, { autoListen: true, interruptible: true });
   }
 
   async function handleAsideAttempt(text: string) {
-    const turn = currentConversationTurn;
-    if (!turn) {
+    const snapshot = asideSceneSnapshot();
+    if (!snapshot.scene.characterLineEs) {
       leaveAside(null);
       return;
     }
@@ -2762,25 +2895,14 @@ export default function Home() {
         await fetch("/api/aside", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            exchange: sent,
-            scene: {
-              characterEn: conversationWho,
-              scenarioEn: sceneCharacter
-                ? `${sceneCharacter.name} -- ${sceneCharacter.relation}. ${sceneCharacter.traitEn}`
-                : null,
-              characterLineEs: turn.characterLineEs,
-              characterMeaningEn: turn.characterMeaningEn,
-            },
-            focus: { current: focusBlocker, stated: statedFocus, observed: observedFocus },
-          }),
+          body: JSON.stringify({ exchange: sent, ...snapshot }),
         }),
       );
       showAsideTurn(next, sent);
     } catch (error) {
       const message = error instanceof Error ? error.message : "OutLoud could not answer that yet.";
       setAsideLine(message);
-      setRoomNote("try that again, or head back to the conversation.");
+      setRoomNote("try that again, or head back.");
       setTurn("ready");
       syncRealtimeMic();
     }
@@ -2798,6 +2920,11 @@ export default function Home() {
 
     if (offer.kind === "change_scenario" && offer.newScenarioEn && offer.newCharacter) {
       await restartSceneFromAside(offer.newScenarioEn, offer.newCharacter);
+      return;
+    }
+
+    if (offer.kind === "start_over" && offer.newOpeningEn) {
+      await restartIntakeFromAside(offer.newOpeningEn);
       return;
     }
 
@@ -2823,6 +2950,27 @@ export default function Home() {
     // offer a second time on the next stumble would read as nagging.
     asideStrikesRef.current = 0;
 
+    // The intake's own turn is restored the way `showCoachTurn` renders it -- framing and
+    // scenario turns are already English and get no meaning line, which is why this cannot just
+    // reuse the session branch below.
+    if (flowPhaseRef.current === "coach" && coachTurn) {
+      setCoachLine(coachTurn.sayEs);
+      showMeaning(
+        coachTurn.phase === "framing" || coachTurn.phase === "scenario" ? null : coachTurn.meaningEn,
+        "translation",
+        { folded: false },
+      );
+      setRoomNote(null);
+      setTurn("speaking");
+      void speakCoachText(
+        spokenLeadIn ? `${spokenLeadIn} ${coachTurn.sayEs}` : coachTurn.sayEs,
+        currentRealtimeMode(),
+        1400,
+        { autoListen: true, interruptible: true },
+      );
+      return;
+    }
+
     const turn = currentConversationTurn;
     if (!turn) {
       setTurn("ready");
@@ -2836,10 +2984,31 @@ export default function Home() {
     setTurn("speaking");
     void speakCoachText(
       spokenLeadIn ? `${spokenLeadIn} ${turn.characterLineEs}` : turn.characterLineEs,
-      "conversation",
+      currentRealtimeMode(),
       1800,
       { autoListen: true, interruptible: true },
     );
+  }
+
+  /**
+   * The intake was built on a wrong premise, so it is thrown away and asked again from what the
+   * learner has just said about themselves.
+   *
+   * `handleOpeningAttempt` already resets everything an intake owns, including the coach's
+   * classification of them -- which is the point: the whole reason to be here is that the old
+   * classification was answering the wrong question. `asideFocusOverride` goes with it, since the
+   * coach is about to form a fresh opinion and a leftover override would silently outrank it.
+   */
+  async function restartIntakeFromAside(newOpeningEn: string) {
+    asideActiveRef.current = false;
+    setAsideActive(false);
+    setAsideLine(null);
+    setAsideOffer(null);
+    setAsideExchange([]);
+    setAsideNudgeOpen(false);
+    asideStrikesRef.current = 0;
+    setAsideFocusOverride(null);
+    await handleOpeningAttempt(newOpeningEn);
   }
 
   /**
@@ -2945,6 +3114,35 @@ export default function Home() {
    *
    * Once per session, and never stacked on top of the noisy-room offer.
    */
+  /**
+   * The intake's version of `noteAsideSignal`, and it has to work from much less: no evaluator has
+   * run yet, so the only evidence that a learner is not producing what is being asked of them is
+   * the suspicion router firing on a turn where Spanish was expected.
+   *
+   * Two in a row is not a bad turn, it is someone who cannot do this yet -- and the entire intake
+   * is built on the premise that they can. That premise going unchallenged is how a beginner ends
+   * up being asked for Spanish sentence after Spanish sentence, then handed a diagnosis about
+   * which of eight blockers is theirs.
+   *
+   * Deliberately gated to the intake: once a session is running, `noteAsideSignal` owns this from
+   * real verdicts, and two counters feeding one offer would fire it twice as fast as either meant.
+   */
+  function noteIntakeAsideSignal(brokeOnASpanishTurn: boolean) {
+    if (flowPhaseRef.current !== "coach" || asideActiveRef.current || asideNudgeShownRef.current) return;
+
+    if (!brokeOnASpanishTurn) {
+      asideStrikesRef.current = 0;
+      return;
+    }
+
+    asideStrikesRef.current += 1;
+    vlog("aside", "intake strike", asideStrikesRef.current);
+    if (asideStrikesRef.current < 2) return;
+
+    asideNudgeShownRef.current = true;
+    setAsideNudgeOpen(true);
+  }
+
   function noteAsideSignal(evaluation: AttemptEvaluation | null, spokenFreeze: FreezeSignals | null) {
     if (asideActiveRef.current || asideNudgeShownRef.current) return;
 
@@ -3983,6 +4181,10 @@ export default function Home() {
       ? lowConfidence || transcript.includes("...") || wordCount <= 1
       : lowConfidence || looksBrokenAttempt(transcript) || transcript.trim().length < 3;
 
+    // A Spanish turn answered in English is the intake's only usable "this is not working"
+    // signal -- there is no evaluator before the verdict, so the suspicion router is all there is.
+    noteIntakeAsideSignal(suspicious && !expectsEnglishAnswer);
+
     if (suspicious) {
       requestTranscriptConfirmation(transcript, lowConfidence);
       return;
@@ -4294,10 +4496,33 @@ export default function Home() {
               >
                 {transcriptNeedsConfirm ? "start over" : "try voice again"}
               </button>
+              {/*
+                The transcript is usually right and the answer is usually the problem. Someone who
+                has just said "I can't remember any vocabulary, I'm completely new" is being asked
+                to fix a sentence that came through perfectly -- so the way out has to be on this
+                screen, not behind it.
+              */}
+              {transcriptNeedsConfirm && canStepOut ? (
+                <button
+                  className="quiet-link"
+                  type="button"
+                  onClick={() => {
+                    setTypedFallbackOpen(false);
+                    setTranscriptNeedsConfirm(false);
+                    void enterAside("learner");
+                  }}
+                >
+                  that&apos;s not the problem — can we talk?
+                </button>
+              ) : null}
             </div>
           ) : asideActive ? (
             <div className="aside-room" aria-label="Stepped out">
-              <p className="aside-badge">stepped out — the scene is on pause</p>
+              <p className="aside-badge">
+                {/* There is no scene during the intake -- naming one would be the first thing the
+                    learner reads, and it would be wrong. */}
+                {flowPhase === "coach" ? "stepped out — we can pick this up again" : "stepped out — the scene is on pause"}
+              </p>
               {/*
                 Everything already said, oldest first, with the newest coach line pulled out below
                 as the heading. On a phone this is the only way the learner can see that they are
@@ -4414,7 +4639,11 @@ export default function Home() {
                       <button type="button" onClick={() => void enterAside("offered")}>
                         step out and talk about it
                       </button>
-                      <p className="tiny-note">the scene waits — nothing you have done is lost.</p>
+                      <p className="tiny-note">
+                        {flowPhase === "coach"
+                          ? "nothing you have done is lost — we can pick this up again."
+                          : "the scene waits — nothing you have done is lost."}
+                      </p>
                       <button
                         className="quiet-link"
                         type="button"

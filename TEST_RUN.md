@@ -129,6 +129,56 @@ offer, not a decision. The note reads "go as many times as you want."
 bug. Rows only for things actually observed; nothing saying "finding out what actually trips you up
 — seen today".
 
+### ☐ 2.9a Explain yourself instead of answering
+
+The most human thing a learner does, and the thing that used to break worst.
+
+When you are asked to say something in Spanish, **don't**. Explain in English instead — what you
+would try, and why you can't. Mention two or three real things from your day.
+
+**Expect:** the coach hands you the words for **the things you just named**. If you said programming
+and a steak, you should get *"programé"*, *"comí un bistec"* — not a generic phrase from the scene.
+
+> **Report immediately** if it answers with **"¿cómo?"** or any kind of confusion. You spoke clear
+> English; playing confused at it is the most alienating thing it can do, and it was doing exactly
+> that.
+
+Now say **"no idea honestly"**.
+
+**Expect:** it teaches. A word, a frame, or a way in — every time.
+
+> **Report immediately** if you get *"perfecto"*, *"muy bien"*, *"¡qué rico!"* or any reaction to
+> something you did not say. Reacting to content that does not exist is worse than being unhelpful.
+
+**Expect:** it never asks a fresh question that leaves you exactly as stuck as you were.
+
+Then the opposite, to check the guard: answer a Spanish question with **"no sé"** — a real, correct
+Spanish answer. **Expect** it to be taken as an answer and the conversation to continue, **not** as
+you asking for help.
+
+### ☐ 2.9b Who is asking whom
+
+Pick a scenario where **you** want something from them: asking directions, ordering, a price, a
+favour. Then ask for it — *"¿dónde está el museo?"*
+
+**Expect:** they **answer**, with a real invented detail — *"está a dos cuadras, junto al parque"* —
+and only then, maybe, a short follow-up.
+
+> **Report immediately** if they hand your question back, or ask you the thing you just asked them.
+> That was the bug behind both the library and the museum reports, and it lived in two places at
+> once, so it is the one most likely to return.
+
+**Expect** their very first line not to be your own practice sentence said at you. In a scene where
+you are the one who wants something, they should open like someone who has just been approached —
+*"¿sí, dime?"* — and wait.
+
+Then check the opposite shape: a scenario where **they** lead (telling a friend about your
+weekend). **Expect** them to still open with a real question — *"¿qué hiciste el fin de semana?"* —
+and not with "how can I help you".
+
+**Expect:** a small slip that still makes sense — *"la museo"* instead of *"el museo"* — does not
+stop the conversation. A real person answers. It should show up later as evidence, not as a drill.
+
 ### ☐ 2.10 Does the coach let you talk?
 
 Subjective, but it is the point of the product.
@@ -193,10 +243,55 @@ expect to be on the **same turn** you left, with nothing lost.
 
 **Expect:** "back to the conversation" always works, including while an offer is on screen.
 
+### ☐ 2.12b Stepping out of the getting-to-know-you
+
+**Do this one first — it is where the last test broke.** It happens before any session, so you
+reach it in about a minute.
+
+During the coach's questions, tap **"hold on — can we talk?"**. The chip is now there too.
+
+**Expect:** the badge reads "stepped out — we can pick this up again", **not** "the scene is on
+pause". There is no scene yet.
+
+Tell it you are a beginner — *"I can't remember any vocabulary, I'm completely new, I can't make a
+sentence at all."*
+
+**Expect:** an offer like **"start from zero"**. Taking it throws the conversation away and asks
+again from what you just said. The coach's next question should be built on being a beginner, not
+on whatever it had decided before.
+
+**Expect: no offer to change the scene.** There is no scene yet, and the server blocks it even if
+the model asks for one.
+
+Then say the opposite in a fresh run — *"just nervous for a second, it's fine, let's keep going."*
+**Expect:** "back to where we were", nothing changed.
+
+> **Report immediately** if a button promises a change and nothing changes — especially "focus
+> on X" where X is already the "today:" line. That was a real bug and the guard against it is
+> server-side; if it comes back, the guard is not firing.
+
+### ☐ 2.12c The way out of the confirm box
+
+**Completely untested — the confirm box only appears on a suspicious spoken transcript, so no
+automated run can reach it.**
+
+Answer a turn where Spanish is expected entirely in English — say something real, like that you
+don't know any Spanish yet. You should land in the **"here's what I heard."** box.
+
+**Expect:** underneath "start over" there is now **"that's not the problem — can we talk?"** which
+takes you straight into the aside.
+
+> Without that link the box is a trap: it asks you to correct a transcript that was perfectly
+> right, and everything else in the room is hidden behind it.
+
 ### ☐ 2.12 The room offering it first
 
 Give two replies in a row that are heard clearly but make no sense — real speech, real transcript,
 wrong Spanish. Or answer a Spanish turn in mostly English.
+
+This works in both phases now, but off different signals: during a session it reads the real
+`/api/evaluate` verdicts; during the intake there is no evaluator, so it counts Spanish-expected
+turns that came back English or broken. Two in a row, either way.
 
 **Expect:** once per session, *"step out and talk about it"* with the note that the scene waits.
 Taking it opens the aside with the coach acknowledging it wasn't going smoothly, rather than asking
@@ -221,6 +316,27 @@ Hold the orb, dead silence for ~2 seconds, release.
 **Expect:** "nothing came through." No scoring, no confirm box, **no praise**.
 
 Repeat but mumble inaudibly. **Expect:** the same, or the confirm box with a garbled transcript.
+
+### ☐ 3.1b Think out loud
+
+Reach a turn, say **"um…"** and then stop and think for a few seconds.
+
+**Expect:** *"take your time."* and the mic **reopens on its own** — no confirm box, no "here's what
+I heard", nothing asking you to fix a transcript that was right. You should be able to just carry
+on speaking when the thought arrives, and it should feel like it is waiting longer than usual.
+
+Do it three times in a row. **Expect:** after the second, the room hands the turn back with
+"whenever you're ready — or type it if that's easier" and stays open. It must **not** offer
+hold-to-talk — nothing is wrong with the room.
+
+Now the thing that would be worse than the original bug: answer a yes/no question with just
+**"mhm"** or **"mm"**.
+
+> **Report immediately** if that gets treated as hesitation. It means yes. Swallowing it discards a
+> correct answer, which is worse than the confirm box ever was.
+
+Same for a short real answer that starts with a filler — **"um, el museo"**. That must go straight
+through as an answer.
 
 ### ☐ 3.2 Say something unintelligible
 

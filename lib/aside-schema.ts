@@ -33,13 +33,32 @@ export const asideIntents = ["listen", "probe", "reframe", "offer", "close"] as 
 export type AsideIntent = (typeof asideIntents)[number];
 
 /**
- * resume          - back to the same scene, nothing changed. The honest default: most asides are
+ * resume          - back to where they were, nothing changed. The honest default: most asides are
  *                   someone thinking out loud, and inventing a change for them is worse than none.
- * change_scenario - the situation itself is wrong for them. New scene, new person.
+ * change_scenario - the situation itself is wrong for them. New scene, new person. Practice only:
+ *                   during the intake there is no scene to replace yet.
  * change_focus    - the situation is fine, the diagnosis is not. Re-points the focus line and,
  *                   through `assistanceOrderFor`, the order of the help ladder.
+ * start_over      - intake only, and the reason the aside had to reach back into it: the learner
+ *                   has said something that makes the whole getting-to-know-you wrong, most often
+ *                   that they are a beginner and cannot produce Spanish at all. Restarts the coach
+ *                   from what they actually said instead of grinding through a conversation built
+ *                   on a wrong premise.
  */
-export const asideOfferKinds = ["resume", "change_scenario", "change_focus"] as const;
+export const asideOfferKinds = ["resume", "change_scenario", "change_focus", "start_over"] as const;
+
+/**
+ * Where the learner stepped out from. It decides which offers exist at all: both
+ * `change_scenario` and `change_focus` act on a practice session that the intake has not produced
+ * yet, and `start_over` is meaningless once one exists.
+ */
+export const asideStages = ["intake", "session"] as const;
+export type AsideStage = (typeof asideStages)[number];
+
+export const offerKindsForStage: Record<AsideStage, readonly AsideOfferKind[]> = {
+  intake: ["resume", "change_focus", "start_over"],
+  session: ["resume", "change_scenario", "change_focus"],
+};
 export type AsideOfferKind = (typeof asideOfferKinds)[number];
 
 /**
@@ -84,6 +103,12 @@ export const asideResponseSchema = z.object({
           traitEn: z.string(),
         })
         .nullable(),
+      /**
+       * start_over only: what the intake should begin from, written as the learner would say it
+       * about themselves. It is fed back in as the opening answer, so it has to read like them
+       * ("I have basically no Spanish yet"), never like a note about them.
+       */
+      newOpeningEn: z.string().nullable(),
     })
     .nullable(),
   done: z.boolean(),
@@ -104,7 +129,15 @@ export const asideResponseJsonSchema = {
         {
           type: "object",
           additionalProperties: false,
-          required: ["kind", "labelEn", "reasonEn", "newFocus", "newScenarioEn", "newCharacter"],
+          required: [
+            "kind",
+            "labelEn",
+            "reasonEn",
+            "newFocus",
+            "newScenarioEn",
+            "newCharacter",
+            "newOpeningEn",
+          ],
           properties: {
             kind: { type: "string", enum: [...asideOfferKinds] },
             labelEn: { type: "string" },
@@ -128,6 +161,7 @@ export const asideResponseJsonSchema = {
                 { type: "null" },
               ],
             },
+            newOpeningEn: { type: ["string", "null"] },
           },
         },
         { type: "null" },

@@ -1,5 +1,259 @@
 # Changelog
 
+## 2026-08-31 — Explaining yourself is not a failed attempt
+
+From a session where the learner did the most human thing available: asked to order in Spanish,
+they explained in English what they would try and why they could not. *"I would start with saying
+like yo for me, but I wouldn't know, because usually my entire day was just programming and a bit
+of work and eating some steak, which was very tasty, but I know none of these words for it, so I
+don't know where the problem lies."*
+
+Replayed against the live route, the coach answered: **"¿Cómo? ¿Quieres decir 'para mí' para
+ordenar?"** — feigned confusion at a paragraph of clear English, having picked out the one
+Spanish-looking fragment and ignored the programming, the work, the steak, and the explicit "I know
+none of these words".
+
+Then, to **"no idea honestly"**: **"Perfecto, ¿qué te gustaría beber hoy?"** Praise for a
+non-answer, followed by a new question that left them exactly as stuck.
+
+### Three separate causes, all of them ours
+
+**1. The prompt told it to read English as a Spanish attempt.** *"If answering.phase is 'scenario',
+their text IS their first Spanish attempt"* — no exception for a learner explaining themselves.
+Now: talking about the task is not attempting it, it is never answered with confusion, and the help
+is built from what they actually described ("programé", "trabajé", "comí un bistec"), not a stock
+phrase from the scene.
+
+**2. The prompt handed it "¿Cómo?" as the model answer.** The retry rule carried a literal example
+— *e.g. "¿Cómo? ¿La comida está...?"* — and the model reproduced it verbatim, including after
+perfectly clear English. A concrete example outweighs any rule sitting beside it. The example now
+carries the distinction: warm non-comprehension after a garbled *Spanish* attempt, and after an
+English "I'm stuck" the invitation uses the word being handed over instead.
+
+**3. The server classified "no idea honestly" as a good attempt.** `attemptLooksFine` asks for
+three or more words and no English function words from a fixed list. "no idea honestly" is three
+words and matches none of them, so the server sent *"the last attempt looks fine on the surface:
+tool MUST be none and you ask a NEW question"*. The "¡Qué rico!" was not the model going rogue; it
+was doing what it was told.
+
+New `attemptDeclaresStuck`, which takes priority over both existing surface reads and forces a tool
+onto that turn. **English only, deliberately:** a learner who answers a Spanish question with "no
+sé" has given a real and correct Spanish answer, and treating that as a cry for help would take a
+good turn away from them. Declaring it in English is stepping out of the task — that is the signal.
+Checked against 17 cases; every Spanish "no sé" variant passes through untouched.
+
+Also added, because it is the sharper version of the same failure: **never react to what you wish
+they had said.** "¡Qué rico!" only makes sense if the steak sentence had been produced. It had not.
+
+### After
+
+| | before | after |
+|---|---|---|
+| the long English explanation | *"¿Cómo? ¿Quieres decir 'para mí'?"* | *"¿Quieres probar con estas palabras? Dime: programé, trabajé, comí un bistec."* |
+| "no idea honestly" | *"Perfecto, ¿qué te gustaría beber hoy?"* (tool: none) | *"Aquí tienes: 'comí' significa 'I ate'. Dime: comí un bistec."* (keyword_card) |
+
+Two runs each, both clean. `/api/converse` got the compact version of the same two rules.
+
+### The limit worth stating
+
+The ask behind this was *"I'd like it to be like talking to Claude normally, and it helps when I
+need help."* The second half now works. The first half does not, and not by accident: the intake is
+a four-phase machine driven by turn index (`phaseForTurn`), and that rigidity is load-bearing — it
+was put there because a mislabelled turn could drag a session back into framing forever. It will
+never be open-ended conversation.
+
+The place free conversation lives is the aside. What this change buys is that the structured part
+stops actively fighting someone who is being honest inside it.
+
+---
+
+## 2026-08-31 — "Um..." is not an answer
+
+Server VAD ends a turn on silence. A learner who says *"um..."* and then thinks has produced a
+complete turn by the microphone's definition, containing no answer — and the room put a confirm box
+in front of them: **"here's what I heard. fix anything that's wrong, then send."** The transcript
+was perfectly accurate. They were being asked to correct their own hesitation.
+
+Now a capture that contains nothing but hesitation reopens the mic with a `patient` VAD profile
+(`silence_duration_ms` 1200 → 2600, and double the idle window) and a quiet *"take your time."*
+Two of those per turn; after that the room hands the turn back with a note and stays open.
+
+Deliberately **not** routed through `registerDudCapture`: the room is not noisy and hold-to-talk
+would not help, so the "noisy room?" offer must not fire here. Different problem, different answer.
+
+### What the detector must never swallow
+
+`mm`, `mmm` and `mhm` are excluded, and the reason is not fussiness: as a whole utterance they
+usually mean **yes**. A learner answering a yes/no question with one has answered it, and treating
+that as hesitation would silently discard a correct reply — the exact failure the short-answer rule
+(2.1) exists to prevent. `ah` is a reaction, not a stall. `eh` and `este` are real Spanish words;
+`well` and `like` are real English ones. Only the unambiguous vocal stalls are in the set.
+
+Checked against 25 cases including every one of those — `"Um..."`, `"uh, um..."` and `"Ähm..."`
+detected; `"sí"`, `"mhm"`, `"para llevar"`, `"um, el museo"` and `"uh I think it's the vocabulary"`
+all passed through untouched.
+
+### Found while doing this, not fixed
+
+**`lastVoiceFreeze` is never set on the realtime path.** It is assigned in exactly one place — the
+MediaRecorder fallback that calls `/api/transcribe` — and the realtime capture path calls
+`routeCapturedTranscript` directly with no freeze signals at all.
+
+So every session that uses voice normally sends `secondsToFirstWord: null`, `hesitations: 0`,
+`englishWords: 0` to `/api/converse`. The character's reaction to *how* a reply came out, the
+aside's English-words trigger, and any diagnosis of `hesitation_pressure` from timing are all
+running on zeroes. The data exists on the client (`realtimeSpeakingStartedAtRef` and friends) — it
+is simply never assembled on this path.
+
+That is its own piece of work, and it is worth doing before trusting anything the app says about
+hesitation.
+
+---
+
+## 2026-08-31 (later still) — The character was answering the wrong half of the conversation
+
+Reported twice from real sessions and misdiagnosed the first time. Asked *"¿dónde está la
+biblioteca?"*, the character asked the learner how to get to the library. Asked *"¿dónde está el
+museo?"*, it replied *"¿puedes decirme si el museo está cerca o lejos de aquí?"* — handing the
+question straight back.
+
+The first time this was blamed on transcription: the learner's Spanish had been coming back as
+Danish, so garbage input was a sufficient explanation. It was not the explanation. This time the
+transcript was clean — `"Hola Carlos, donde está la museo?"` — and the same thing happened.
+
+### Cause
+
+Both engines are written as if the character always asks and the learner always answers.
+
+`/api/coach`: *"ask ONE real, short question in Spanish"*, *"a good answer gets tool=none and a new
+question"*, *"never ask the same thing more than twice"*, *"expectedCommunicativeFunction: what a
+good reply to sayEs would do"*. `/api/converse`: *"one realistic follow-up at a time"*, and every
+per-turn instruction says to ask something.
+
+Nowhere does either say what to do when the **learner** asks the character a question. And a large
+share of real scenarios are exactly that: directions, ordering, prices, shopping, phone calls,
+asking a favour. Told five times to ask a question, the model asked one. That it was semantically
+absurd was not something the prompt gave it any way to know.
+
+### The deeper one, in the opening line
+
+`conversationDifficultyGuidance(0)` read: *"stay close to the practiced pattern and the original
+situation. **Prompt the user to use the phrase they just practiced.**"*
+
+The model read that as an instruction to *say* the phrase. So a learner practising "¿dónde está el
+museo?" was greeted by a passer-by asking THEM where the museum was — the role reversal, on turn
+zero, before anyone had said anything. This is the better explanation for both original reports.
+
+Now: the character creates the opening, the learner walks through it. Never say the learner's
+practised phrase, never ask them the question they are learning to ask. In a scene where the
+learner wants something, opening as someone who has just been approached is usually right
+("¿sí, dime?") — and then wait.
+
+### Fixed
+
+- Both engines: if the learner asked you something, **answer it**, with real invented detail. You
+  are the person who is there. A follow-up may come after the answer, never instead of it.
+- Scoped to `lastUserAttempt` only — a first pass at this had the character reading the rescue
+  card's practised sentence as a question it had been asked, and opening the scene by volunteering
+  directions to someone who had not spoken yet.
+- `/api/coach`: a slip that does not block understanding ("la museo" for "el museo") is **not** a
+  stumble. It goes in `evidence`, where diagnosis belongs; it does not stop the conversation for a
+  repair drill.
+
+### Verified
+
+Three runs each, against the live routes.
+
+| | before | after |
+|---|---|---|
+| coach, learner asks | *"¿Puedes decirme si el museo está cerca o lejos de aquí?"* | *"El museo está a dos cuadras, junto al parque. ¿Vas caminando o en carro?"* |
+| converse, turn 0 | *"¿Me puedes decir dónde está el museo?"* | *"¡Hola! ¿En qué te puedo ayudar?"* |
+| converse, learner asks | *"Sí, y abre de nueve a cinco"* (answering a question nobody asked) | *"Claro, está a dos cuadras, a la derecha. ¿Quieres que te acompañe un tramo?"* |
+
+The coach run also now reports `tool: none, intent: advance` with `evidence: "minor article
+mistake, fully understandable"` — the conversation moves on and the slip is recorded rather than
+drilled.
+
+Regression check on the opposite shape: a scene where the character legitimately leads still opens
+*"¡Hola! Cuéntame, ¿qué hiciste el fin de semana?"*, and does not say the learner's practised
+sentence at them.
+
+---
+
+## 2026-08-31 (later) — Stepping out of the intake too
+
+Found by the first real voice test, in the first two minutes. The learner said, out loud, mid
+intake: *"I can't remember any vocabulary. The truth is I barely even learned Spanish. Like I'm
+completely new."*
+
+That is the sentence this whole feature was built for, and it arrived in the one place the feature
+did not exist. `showStepOut` required `flowPhase === "session"`, so the entire getting-to-know-you
+— exactly where someone discovers this is the wrong level for them — had no way out. Every
+following turn asked them for more Spanish.
+
+Worse, what the app said back was: **"here's what I heard. fix anything that's wrong, then send."**
+The transcript was perfect. The suspicion router had done its job (English words on a Spanish turn)
+and the product then asked a person who had just admitted they cannot do this to correct their
+own confession.
+
+### What changed
+
+The aside now covers both conversational phases, and knows which one it is in (`stage`). That
+matters because the offers are not the same:
+
+| | intake | session |
+|---|---|---|
+| `resume` | yes | yes |
+| `change_focus` | yes | yes |
+| `change_scenario` | — no scene exists yet | yes |
+| `start_over` | yes | — the intake is finished |
+
+`start_over` is new and is the answer to the case above: it throws the getting-to-know-you away and
+restarts it from `newOpeningEn` — what the learner said about themselves, in their words ("I have
+basically no Spanish yet, I want to start from nothing"). A conversation built on a wrong premise
+gets worse every turn, not better.
+
+`offerKindsForStage` is enforced server-side, not just described in the prompt: an offer the stage
+cannot act on is downgraded to `resume` rather than rendered as a button that does nothing.
+
+### Two more ways out, both from the same test
+
+The confirm box now carries **"that's not the problem — can we talk?"**. Without it the offer was
+unreachable from the screen where it is most needed: `typedFallbackOpen` renders instead of the
+whole room, so the chip and the nudge were both behind it.
+
+And the room offers the aside during the intake too, off the only signal that exists there — the
+suspicion router firing twice in a row on a turn where Spanish was expected. There is no evaluator
+before the verdict, so `noteAsideSignal`'s real verdicts are not available; `noteIntakeAsideSignal`
+is deliberately gated to the intake so the two counters never both feed the same offer.
+
+### A no-op button, caught by testing
+
+Asked "anything you want different?" and told *"no, it's fine, let's keep going"*, the coach
+offered to change the focus **to the one already set**. A button promising a change and delivering
+none. The prompt forbade it and the model did it anyway, twice, so the server now decides:
+`newFocus === focus.current` is downgraded to `resume`. It is a fact the server holds, not a
+judgment call.
+
+All five outcomes verified against the live route, and the whole intake path driven in a headless
+browser: chip visible during intake, no offer on turn 0, `stage: "intake"` on every request, and
+`/api/coach` restarted with the new opening answer — both openings visible in the request log.
+
+### What this does NOT fix
+
+The app still has **no concept of level**. Zero matches for "beginner" anywhere in the codebase.
+The aside now gets the truth into the intake; the intake still does not know what to do with it.
+In the verified run, the restarted coach answered "I have basically no Spanish yet" with *"let's
+pick a real situation — ordering food at a cafe, or telling someone about your job in two
+sentences?"* — to someone who had just said they cannot make a sentence at all.
+
+That is the next real problem, and it is bigger than an escape hatch.
+
+**Also untested:** the "that's not the problem" link inside the confirm box. That box only appears
+on a suspicious *spoken* transcript, so no typed harness can reach it.
+
+---
+
 ## 2026-08-31 — Step out of the scene
 
 Not from the build plan. It came from using the app: mid-roleplay you realise the problem you
