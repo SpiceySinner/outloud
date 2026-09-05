@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { getSupabaseBrowser } from "@/lib/supabase-browser";
 import { formatSavedDate } from "@/lib/account-links";
-import { blockerFocusLabels, normalizeObservedBlocker } from "@/lib/blocker-taxonomy";
+import { focusFromMoments, trendDirection, type FocusReading } from "@/lib/dashboard-data";
 
 type ProfileState = {
   email: string;
@@ -14,9 +14,13 @@ type ProfileState = {
   words: number;
   sessions: number;
   lastSession: string | null;
-  topBlocker: string | null;
-  /** #50 -- the top dimension's share of the most recent sessions versus the ones before them. */
-  trend: { label: string; recent: number; recentTotal: number; earlier: number; earlierTotal: number } | null;
+  /**
+   * #50 -- the dimension that shows up most, and its share of recent sessions against the ones
+   * before them. Computed by `focusFromMoments` rather than here, because the home screen makes
+   * the same claim and two copies of a claim about the learner is how an app ends up telling
+   * someone two different things about themselves.
+   */
+  focus: FocusReading | null;
 };
 
 export default function ProfilePage() {
@@ -46,37 +50,7 @@ export default function ProfilePage() {
       if (!response.ok) throw new Error(typeof json?.error === "string" ? json.error : "could not load your profile.");
 
       const sessions = (json.sessions ?? []) as Array<{ createdAt: string; blocker: string | null }>;
-      const blockerCounts = new Map<string, number>();
-      for (const item of sessions) {
-        if (!item.blocker) continue;
-        blockerCounts.set(item.blocker, (blockerCounts.get(item.blocker) ?? 0) + 1);
-      }
-      const topBlocker = [...blockerCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
-
-      /**
-       * #50 -- the dimension the learner named has to be visible *moving*, not just named. The
-       * sessions come back newest first, so the first half is the recent window. Two windows
-       * rather than a chart: with a handful of sessions a line is noise dressed as insight, and
-       * "3 of your last 5, down from 4 of 5" is a claim a person can check against their memory.
-       *
-       * Needs at least four sessions. Below that there is no before and after, and comparing two
-       * sessions to two sessions would turn one good day into a trend.
-       */
-      let trend: ProfileState["trend"] = null;
-      if (topBlocker && sessions.length >= 4) {
-        const half = Math.floor(sessions.length / 2);
-        const recentWindow = sessions.slice(0, half);
-        const earlierWindow = sessions.slice(half);
-        const hits = (window: typeof sessions) =>
-          window.filter((item) => item.blocker && normalizeObservedBlocker(item.blocker) === normalizeObservedBlocker(topBlocker)).length;
-        trend = {
-          label: blockerFocusLabels[normalizeObservedBlocker(topBlocker)],
-          recent: hits(recentWindow),
-          recentTotal: recentWindow.length,
-          earlier: hits(earlierWindow),
-          earlierTotal: earlierWindow.length,
-        };
-      }
+      const focus = focusFromMoments(sessions);
 
       setProfile({
         email: session.user.email ?? "",
@@ -85,8 +59,7 @@ export default function ProfilePage() {
         words: (json.words ?? []).length,
         sessions: sessions.length,
         lastSession: sessions[0]?.createdAt ?? null,
-        topBlocker,
-        trend,
+        focus,
       });
       setState("ready");
     } catch (error) {
@@ -163,21 +136,19 @@ export default function ProfilePage() {
           <section className="page-section" aria-label="What OutLoud is working on">
             <h2>what we&apos;re working on</h2>
             <p className="page-body">
-              {profile.topBlocker
-                ? `${blockerFocusLabels[normalizeObservedBlocker(profile.topBlocker)]} — it showed up most across your sessions.`
+              {profile.focus
+                ? `${profile.focus.label} — it showed up most across your sessions.`
                 : "not enough sessions yet to call a pattern."}
             </p>
-            {profile.trend ? (
+            {profile.focus?.trend ? (
               <p className="page-body">
                 {(() => {
-                  const { recent, recentTotal, earlier, earlierTotal } = profile.trend;
+                  const { recent, recentTotal, earlier, earlierTotal } = profile.focus.trend;
                   const before = `it was ${earlier} of ${earlierTotal} before that`;
                   const now = `${recent} of your last ${recentTotal} sessions`;
-                  // Rates, not counts: the two windows differ in size when the session count is odd.
-                  const falling = recent / recentTotal < earlier / earlierTotal;
-                  const rising = recent / recentTotal > earlier / earlierTotal;
-                  if (falling) return `${now} — ${before}. it is showing up less.`;
-                  if (rising) return `${now} — ${before}. it is showing up more, not less.`;
+                  const direction = trendDirection(profile.focus.trend);
+                  if (direction === "falling") return `${now} — ${before}. it is showing up less.`;
+                  if (direction === "rising") return `${now} — ${before}. it is showing up more, not less.`;
                   return `${now} — ${before}. holding steady so far.`;
                 })()}
               </p>

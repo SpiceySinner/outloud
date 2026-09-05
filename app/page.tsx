@@ -265,6 +265,43 @@ function isFillerOnly(attempt: string) {
   return words.length > 0 && words.every((word) => fillerSounds.has(word));
 }
 
+/**
+ * A transcript that is a decoder stuck in a loop rather than anything a person said.
+ *
+ * Whisper-family models repeat when handed a truncated or content-poor clip -- the same short
+ * phrase over and over until the token budget runs out. Observed live as "Oh god" roughly twenty
+ * times, produced after server VAD cut the learner off mid-sentence.
+ *
+ * It slipped through every existing gate: not empty, VAD had seen speech, not filler, and it
+ * contains none of the words `looksBrokenAttempt` looks for -- so it was submitted without even a
+ * confirm box, scored, stored, and then shown back on the closing card as the learner's own
+ * words. Being quoted saying something you never said is worse than any missed turn.
+ *
+ * Non-overlapping windows so a genuinely repeated unit is what triggers this, not an unlucky
+ * n-gram: a unit has to repeat at least four times AND cover most of the transcript.
+ */
+function looksLikeDecodeLoop(attempt: string) {
+  const words = attempt
+    .toLowerCase()
+    .replace(/[.,!?¿¡…"'`\-—–]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+  // Short repetition is human: "sí, sí, sí" and a stutter both live down here.
+  if (words.length < 8) return false;
+
+  for (let size = 1; size <= 4; size += 1) {
+    const counts = new Map<string, number>();
+    for (let i = 0; i + size <= words.length; i += size) {
+      const unit = words.slice(i, i + size).join(" ");
+      counts.set(unit, (counts.get(unit) ?? 0) + 1);
+    }
+    for (const seen of counts.values()) {
+      if (seen >= 4 && (seen * size) / words.length >= 0.6) return true;
+    }
+  }
+  return false;
+}
+
 function looksBrokenAttempt(attempt: string) {
   return (
     attempt.includes("...") ||
@@ -773,6 +810,24 @@ export default function Home() {
     if (typeof window === "undefined") return "open";
     return window.localStorage.getItem("outloud-mic-mode") === "push" ? "push" : "open";
   });
+  /**
+   * A way into the account pages from inside the room. On in development; on a deployed build it
+   * takes one visit to `?debug=1`, which persists -- the phone is where the room actually gets
+   * tested and there is no console on it. `?debug=0` clears it again.
+   */
+  const [debugTools] = useState(() => {
+    const onByDefault = process.env.NODE_ENV === "development";
+    if (typeof window === "undefined") return onByDefault;
+    try {
+      const flag = new URLSearchParams(window.location.search).get("debug");
+      if (flag === "1") window.localStorage.setItem("outloud-debug-tools", "1");
+      else if (flag === "0") window.localStorage.removeItem("outloud-debug-tools");
+      if (window.localStorage.getItem("outloud-debug-tools") === "1") return true;
+    } catch {
+      // Storage or URL blocked: fall back to the build-time default.
+    }
+    return onByDefault;
+  });
   /** The one-tap "noisy room?" offer, shown once per session after repeated dead captures. */
   const [noisyOfferOpen, setNoisyOfferOpen] = useState(false);
   /** An armed mic that closed itself after a long silence. Drives the copy, so it must be state. */
@@ -1058,7 +1113,14 @@ export default function Home() {
     : null;
   const coachTool = flowPhase === "coach" && coachTurn && coachTurn.tool.type !== "none" ? coachTurn.tool : null;
   const primaryEvaluation = placementEvaluations[placementEvaluations.length - 1] ?? null;
-  const spokenAttempts = placementAttempts.filter((attempt) => attempt.kind !== "setup");
+  // A decoder loop is excluded from BOTH sides, and that is the point of doing it here as well as
+  // at capture time. `momentBefore` deliberately hunts for a BROKEN attempt to show as "here is
+  // how it sounded before" -- so a loop that got in before this guard existed, or through a typed
+  // path, would be put on the closing card as the learner's own words. It is our microphone
+  // failing, not them.
+  const spokenAttempts = placementAttempts.filter(
+    (attempt) => attempt.kind !== "setup" && !looksLikeDecodeLoop(attempt.userAttempt),
+  );
   const momentBefore = spokenAttempts.find((attempt) => looksBrokenAttempt(attempt.userAttempt)) ?? null;
   const cleanAttempts = spokenAttempts.filter((attempt) => !looksBrokenAttempt(attempt.userAttempt));
   const momentAfter = cleanAttempts.length ? cleanAttempts[cleanAttempts.length - 1] : null;
@@ -2277,6 +2339,19 @@ export default function Home() {
         "| transcript:", JSON.stringify(transcript),
       );
       registerDudCapture();
+      setTurn("ready");
+      syncRealtimeMic();
+      return;
+    }
+
+    // A decoder loop, not a learner. Discarded before anything can score or store it.
+    if (looksLikeDecodeLoop(transcript.trim())) {
+      vlog("finish", "DISCARDED as decode loop:", JSON.stringify(transcript.trim().slice(0, 120)));
+      // The loop is usually what a clipped recording decodes into, so the next capture gets the
+      // patient window: cutting them off again would just reproduce it.
+      patientCaptureRef.current = true;
+      registerDudCapture();
+      setRoomNote("that came back garbled — say it once more, I'll wait longer.");
       setTurn("ready");
       syncRealtimeMic();
       return;
@@ -4386,6 +4461,15 @@ export default function Home() {
             <span>{eyesOffMode ? "eyes off" : "feedback"}</span>
             <HeartIcon />
           </button>
+          {/* Debug only. The profile pill opens the sign-in dialog when signed out, so without an
+              account there is otherwise no way into /profile or /dashboard from the room at all.
+              Unmount tears down the mic and the realtime connection, so leaving mid-session is
+              safe. */}
+          {debugTools ? (
+            <Link className="debug-pill" href="/profile" aria-label="debug: open the account page">
+              debug
+            </Link>
+          ) : null}
           {/* Signed out, the profile page has nothing to show but an empty state, so the icon
               opens the sign-in dialog directly instead of routing there first. */}
           {authedEmail ? (

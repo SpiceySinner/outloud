@@ -1,5 +1,152 @@
 # Changelog
 
+## 2026-09-04 — A home to come back to, in preview
+
+`/dashboard` was a list of words and a list of sessions. It answered "what did I collect" and
+nothing else, which is not a reason to come back and definitely not a reason to pay. This replaces
+it with a home that answers three questions in order: **what do I do right now, what did I already
+do, and where is this going.**
+
+Reachable as `/dashboard?preview=1` with an invented account, so the design can be looked at
+without living through fourteen sessions first.
+
+### The constraint that shaped it
+
+"One screen, no navigation" is section A of the build plan, and it is there because reviewers of
+every competitor complain about being in and out of lesson menus. A home screen is the exact place
+that principle gets quietly abandoned. So: **one primary action**, always the same one, and
+everything else on the page is either evidence of something that happened or a door back into the
+same room. No streaks. Nothing configurable — the focus comes from the evidence, never from the
+learner picking a topic off a list.
+
+### What is on it
+
+**Today.** The focus line — the dimension that actually shows up most — with whether it is moving,
+then `start talking`. That is the whole hero.
+
+**Another go.** The retrieval loop, visible for the first time. Every moment has *always* been
+saved with a `retrieval_due_at`; the only thing ever built to act on it emails a link to `/m/<id>`,
+a route that does not exist. The due queue reads columns that have been sitting in the database
+this whole time. Each item shows where it is on the ledger — built it together → got there with a
+nudge → said it unaided → reused it somewhere new → used it for real.
+
+**Talk it through.** English, outside the roleplay. This is the one section with no backend, and it
+says so on screen instead of faking it. It is in because it is the way #30 — build backward from
+one real dreaded event, the highest-upside bet in the plan — actually reaches a learner: they say
+"dinner at her parents on friday", and that becomes friday's session. Every coach turn in the
+preview either teaches something or ends in a door back into the room. A chatbot that only chats
+would not be worth building.
+
+**Where this goes.** #51–54. Nine conversations you could survive, not nine topics. Position comes
+from the ledger (#53) — unaided moments only, which is #27's definition of success — so it cannot
+be gamed and cannot lie. Tapping a stage explains it and launches nothing. The point of seeing it
+is that it is visibly long, which makes one bad session a step instead of a verdict.
+
+**Your words**, now with a new / used-again split, and **everything so far** with each session's
+ledger state rather than a bare date.
+
+### Honest about what is invented
+
+The stage thresholds in `journeyStages` are made up. Nothing here has been calibrated against a
+real learner and the curve will not mean anything until sessions from strangers exist. It has the
+right shape, not a measurement.
+
+The preview is walled off deliberately: `?preview=1` only, a dashed ribbon at the top saying the
+sessions and words are invented, and actions that would navigate say "preview" instead of doing it.
+A screen that quietly invents a learner's history is the same class of bug as a coach praising a
+sentence nobody said. `lib/dashboard-mock.ts` builds a `DashboardData` and nothing else, so wiring
+it to reality is deleting a file, not rewriting a page — and every mocked field is one
+`/api/library` already returns.
+
+### One duplication removed on the way
+
+The profile page computed "this is what trips you up, and it is moving" with its own inline copy of
+the two-window trend. The home needed the same claim. Two copies of a claim about the learner is
+how an app ends up telling someone two different things about themselves, so both now call
+`focusFromMoments`. That also fixes a small real bug: profile counted blockers by **raw string**
+and only normalized afterwards, so two spellings of the same blocker were counted as two different
+ones and could hide the actual top dimension.
+
+### Not done
+
+Nothing is wired to the paywall, the chat has no engine (`/api/aside` is the closest template but
+it is shaped for stepping out of a roleplay, not for open conversation), and signed-in learners
+still land on `/` rather than here — that routing change affects everyone and is a product
+decision, not a cleanup.
+
+---
+
+## 2026-08-31 — A way into the account pages from the room
+
+A `debug` pill in the room header, between `feedback` and the profile icon, linking straight to
+`/profile` (which links on to `/dashboard`).
+
+The gap it fills: the profile icon opens the **sign-in dialog** when signed out, deliberately —
+signed out, the profile page is nothing but an empty state. But that also means the account pages
+cannot be reached from the room at all without an account, which makes them awkward to look at
+while working on them.
+
+**On in development.** On a deployed build it takes one visit to `?debug=1`, which persists in
+`localStorage`; `?debug=0` clears it. That opt-in exists because the room is really tested on a
+phone, where there is no console to type a flag into. Dashed border, so it can never be mistaken
+for something a learner is meant to see.
+
+Leaving mid-session is safe: the room's unmount cleanup already stops the media stream and
+disconnects the realtime session.
+
+---
+
+## 2026-08-31 — A decoder loop was quoted back as the learner's own words
+
+Reported from a live session: server VAD cut the learner off mid-sentence, and the transcript came
+back as **"Oh god"** repeated about twenty times. Whisper-family models do this when handed a
+truncated or content-poor clip — they repeat one short phrase until the token budget runs out. It
+is a decoder in a loop, not speech.
+
+It then went through **every** existing gate untouched:
+
+- not empty, and VAD had reported speech, so the dud gate passed it
+- not hesitation, so the filler guard passed it
+- it contains none of the words `looksBrokenAttempt` looks for, so it was not even suspicious —
+  **no confirm box**, straight to `submitAttempt`
+- scored by `/api/evaluate`, stored in `sessionTurns`
+
+And then the worst part. `momentBefore` deliberately hunts for the first **broken** attempt to show
+on the closing card as *"here is how it sounded before"*. So the loop was selected and displayed as
+what the learner had said. They were quoted saying something they never said, on the one screen
+meant to show them their own progress.
+
+### Fixed
+
+`looksLikeDecodeLoop`, applied in two places on purpose:
+
+**At capture**, before anything can score or store it — discarded, and the next capture gets the
+`patient` VAD window, because a clipped recording is what produces the loop in the first place and
+cutting them off again would just reproduce it. The room says *"that came back garbled — say it
+once more, I'll wait longer."*
+
+**At the card**, filtering `placementAttempts` before `momentBefore` picks from them. Belt and
+braces on purpose: a loop stored before this guard existed would otherwise still be on someone's
+card, and it is our microphone failing rather than them.
+
+Non-overlapping windows of one to four words: a unit has to repeat at least four times **and**
+cover 60% or more of the transcript. Below eight words nothing is flagged at all, because short
+repetition is human.
+
+Checked against 14 cases. Every loop shape caught; every real utterance survived — including the
+learner's own stuttering transcript from an earlier session (*"but I I I wouldn't know because like
+usually my entire day..."*), `"sí, sí, sí"`, `"yo yo yo quiero un café"`, `"no, no, no gracias"`,
+and a repetitive but legitimate list (*"quiero pan, quiero café, quiero agua..."*).
+
+### Still true
+
+The premature cut-off that started it is not fixed, only softened. `silence_duration_ms` is 1200ms
+on a normal capture, and a learner mid-sentence can still be clipped; the patient profile only
+comes into play after something has already gone wrong. Endpointing that adapts to how this
+particular learner speaks is a separate piece of work.
+
+---
+
 ## 2026-08-31 — Explaining yourself is not a failed attempt
 
 From a session where the learner did the most human thing available: asked to order in Spanish,

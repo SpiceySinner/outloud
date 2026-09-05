@@ -338,6 +338,24 @@ Now the thing that would be worse than the original bug: answer a yes/no questio
 Same for a short real answer that starts with a filler — **"um, el museo"**. That must go straight
 through as an answer.
 
+### ☐ 3.1c The repeating transcript
+
+Hard to trigger deliberately — it comes from being cut off mid-sentence — so mostly this is a thing
+to watch for rather than to provoke. Speaking a long sentence with a pause in the middle, in a room
+with some noise, is the best way to invite it.
+
+**Expect:** if a transcript ever comes back as the same phrase over and over ("Oh god Oh god Oh
+god…"), you never see it. The room says *"that came back garbled — say it once more, I'll wait
+longer."* and gives you a longer window.
+
+> **Report immediately** if a repeated phrase like that ever reaches a coach reply, or shows up on
+> the closing card as something you said. Being quoted saying something you never said is the worst
+> thing this app can do to you.
+
+The flip side matters just as much: **stutter on purpose.** *"yo yo yo quiero un café"*, or
+*"no, no, no gracias"*. **Expect** those to go through as normal answers — they are how people
+actually talk.
+
 ### ☐ 3.2 Say something unintelligible
 
 Half English, a fragment — *"the uh how do you say the thing with and want is"*.

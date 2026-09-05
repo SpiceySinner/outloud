@@ -133,6 +133,25 @@ html:not([data-outloud-hydrated="true"]) .app-shell button {
   color: var(--sage);
 }
 
+/* Dashed on purpose: it should never be mistaken for something the app ships to a learner. */
+.debug-pill {
+  display: flex;
+  align-items: center;
+  margin-left: 8px;
+  padding: 8px 10px;
+  border-radius: 999px;
+  border: 1px dashed rgba(30, 27, 23, 0.32);
+  background: transparent;
+  color: var(--ink-soft);
+  font-family: var(--font-schibsted), system-ui, sans-serif;
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  text-decoration: none;
+  cursor: pointer;
+}
+
 .icon-heart {
   width: 12px;
   height: 11px;
@@ -2393,4 +2412,427 @@ html:not([data-outloud-hydrated="true"]) .app-shell button {
   font-weight: 600;
   text-decoration: none;
   cursor: pointer;
+}
+
+
+/* ---------------------------------------------------------------- home ---
+   The screen after the funnel. Same paper, same two typefaces as the room --
+   it has to read as the same product, not as an admin panel bolted on. */
+
+.preview-ribbon {
+  margin: 0 0 20px;
+  padding: 10px 12px;
+  border: 1px dashed rgba(196, 69, 31, 0.4);
+  border-radius: 12px;
+  color: var(--ink-soft);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.preview-ribbon strong {
+  color: var(--terracotta);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.preview-ribbon a,
+.page-note a {
+  color: var(--terracotta);
+}
+
+.preview-note {
+  margin-top: 18px;
+  color: var(--terracotta);
+}
+
+.home-hero {
+  margin-bottom: 30px;
+  padding-bottom: 26px;
+  border-bottom: 1px solid rgba(30, 27, 23, 0.1);
+}
+
+.home-hero h1 {
+  margin: 6px 0 8px;
+  color: var(--ink);
+  font-family: var(--font-newsreader), Georgia, serif;
+  font-size: 30px;
+  font-weight: 400;
+  line-height: 1.15;
+  letter-spacing: -0.01em;
+}
+
+.home-hero-note {
+  margin: 0 0 18px;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.home-hero-second {
+  margin: 12px 0 0;
+  font-size: 13.5px;
+}
+
+.home-hero-second a {
+  color: var(--terracotta);
+  text-decoration: none;
+}
+
+.home-section-note {
+  margin-bottom: 14px;
+  color: var(--muted);
+  font-size: 13.5px;
+}
+
+/* --- another go (the retrieval queue, made visible) --- */
+
+.review-list {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.review-list li {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid rgba(196, 69, 31, 0.24);
+  border-radius: 16px;
+  background: rgba(196, 69, 31, 0.04);
+}
+
+.review-body {
+  min-width: 0;
+}
+
+.review-summary {
+  margin: 0 0 4px;
+  color: var(--ink);
+  font-size: 14.5px;
+  line-height: 1.35;
+}
+
+.review-phrase {
+  margin: 0 0 8px;
+  color: var(--ink-soft);
+  font-family: var(--font-newsreader), Georgia, serif;
+  font-size: 15px;
+}
+
+.review-phrase span {
+  color: var(--muted);
+  font-family: var(--font-schibsted), system-ui, sans-serif;
+  font-size: 13px;
+}
+
+.review-meta {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+.review-list button {
+  flex: none;
+  appearance: none;
+  padding: 9px 12px;
+  border: none;
+  border-radius: 999px;
+  background: var(--terracotta);
+  color: var(--button-text);
+  font-family: var(--font-schibsted), system-ui, sans-serif;
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+/* --- the ledger, as five steps --- */
+
+.mastery {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+}
+
+.mastery-dots {
+  display: flex;
+  gap: 3px;
+}
+
+.mastery-dots span {
+  width: 14px;
+  height: 3px;
+  border-radius: 2px;
+  background: rgba(30, 27, 23, 0.14);
+}
+
+.mastery-dots span.is-reached {
+  background: var(--sage);
+}
+
+.mastery-label {
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+/* --- talk it through --- */
+
+.chat-toggle {
+  appearance: none;
+  padding: 9px 14px;
+  border: 1px solid rgba(30, 27, 23, 0.16);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink-soft);
+  font-family: var(--font-schibsted), system-ui, sans-serif;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.chat-thread {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.chat-line p {
+  margin: 0;
+  padding: 11px 14px;
+  border-radius: 16px;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.chat-line.is-coach p {
+  border: 1px solid rgba(30, 27, 23, 0.1);
+  border-bottom-left-radius: 5px;
+  background: rgba(30, 27, 23, 0.03);
+  color: var(--ink);
+}
+
+.chat-line.is-you {
+  justify-self: end;
+  max-width: 82%;
+}
+
+.chat-line.is-you p {
+  border-bottom-right-radius: 5px;
+  background: var(--ink);
+  color: var(--paper);
+}
+
+.chat-offer {
+  display: grid;
+  gap: 2px;
+  width: 100%;
+  margin-top: 8px;
+  padding: 11px 14px;
+  border: 1px solid rgba(196, 69, 31, 0.32);
+  border-radius: 14px;
+  background: rgba(196, 69, 31, 0.05);
+  text-align: left;
+  cursor: pointer;
+}
+
+.chat-offer strong {
+  color: var(--terracotta);
+  font-family: var(--font-schibsted), system-ui, sans-serif;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.chat-offer span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.chat-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.chat-chips button {
+  appearance: none;
+  padding: 8px 12px;
+  border: 1px solid rgba(30, 27, 23, 0.16);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink-soft);
+  font-family: var(--font-schibsted), system-ui, sans-serif;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.chat-input {
+  width: 100%;
+  padding: 12px 14px;
+  border: 1px solid rgba(30, 27, 23, 0.12);
+  border-radius: 14px;
+  background: rgba(30, 27, 23, 0.02);
+  color: var(--ink);
+  font-family: var(--font-schibsted), system-ui, sans-serif;
+  font-size: 13.5px;
+}
+
+.chat-input::placeholder {
+  color: var(--faint);
+}
+
+/* --- the journey --- */
+
+.journey {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.journey-stage {
+  position: relative;
+  padding-left: 22px;
+}
+
+/* The line joining the stages, drawn behind the dots and stopped at the last one. */
+.journey-stage::before {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: rgba(30, 27, 23, 0.16);
+}
+
+.journey-stage:first-child::before {
+  top: 14px;
+}
+
+.journey-stage:last-child::before {
+  bottom: auto;
+  height: 14px;
+}
+
+.journey-stage.is-done::before {
+  background: rgba(63, 107, 71, 0.5);
+}
+
+/* The segment above the current stage belongs to the ground already covered. */
+.journey-stage.is-current::before {
+  background: linear-gradient(rgba(63, 107, 71, 0.5) 0 14px, rgba(30, 27, 23, 0.16) 14px);
+}
+
+.journey-stage > button {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 0;
+  border: none;
+  background: none;
+  text-align: left;
+  cursor: pointer;
+}
+
+.journey-dot {
+  position: absolute;
+  left: -1px;
+  top: 11px;
+  width: 11px;
+  height: 11px;
+  border-radius: 999px;
+  border: 1px solid rgba(30, 27, 23, 0.22);
+  background: var(--paper);
+}
+
+.journey-stage.is-done .journey-dot {
+  border-color: var(--sage);
+  background: var(--sage);
+}
+
+.journey-stage.is-current .journey-dot {
+  border-color: var(--terracotta);
+  background: var(--terracotta);
+  box-shadow: 0 0 0 3px rgba(196, 69, 31, 0.16);
+}
+
+.journey-title {
+  flex: 1;
+  color: var(--ink-soft);
+  font-family: var(--font-schibsted), system-ui, sans-serif;
+  font-size: 14px;
+}
+
+.journey-stage.is-done .journey-title {
+  color: var(--muted);
+}
+
+.journey-stage.is-current .journey-title {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.journey-stage.is-ahead .journey-title {
+  color: var(--faint);
+}
+
+.journey-meta {
+  flex: none;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+.journey-stage.is-current .journey-meta {
+  color: var(--terracotta);
+}
+
+.journey-meaning {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.journey-meaning.is-progress {
+  color: var(--terracotta);
+}
+
+/* --- words --- */
+
+.word-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-bottom: 12px;
+}
+
+.word-filter button {
+  appearance: none;
+  padding: 6px 11px;
+  border: 1px solid rgba(30, 27, 23, 0.14);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--font-schibsted), system-ui, sans-serif;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.word-filter button.is-picked {
+  border-color: var(--ink);
+  color: var(--ink);
+}
+
+.word-grid li.is-used {
+  border-color: rgba(63, 107, 71, 0.34);
+  background: rgba(63, 107, 71, 0.05);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .journey-stage.is-current .journey-dot {
+    box-shadow: none;
+  }
 }
