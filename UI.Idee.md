@@ -1,0 +1,1 @@
+okey ich habs wir machen ein dashboard wo wir am besten ohne scrollen so schnellst wie möglich alle wichtigsten Sachen sehen und in der Mitte von dem Dashboard ist dann dieser Orb so das man einfach lossprechen kann und spobald man losspricht animiert sich das dashboard weg

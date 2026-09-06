@@ -76,6 +76,173 @@ decision, not a cleanup.
 
 ---
 
+## 2026-09-06 — /dash: one screen, no scroll, the orb in the middle
+
+From `UI.Idee.md`: see everything that matters as fast as possible without scrolling, with the orb
+in the centre so you can just start talking, and the dashboard animating away when you do.
+
+Three bands in a fixed `100dvh` column:
+
+- **the bar** — exactly **one** thing to pick up, never a list. A list here would be the lesson
+  menu the whole product refuses to be. Overdue beats recent, because an overdue item is the app
+  keeping a promise it already made and is the only thing on this screen with a deadline.
+- **the orb** — the act. Everything above and below it is context for it.
+- **the foot** — where this is going, in one line: the stage you stand on, a hairline rail, and
+  three quiet counts. The long version stays at `/dashboard`, behind "everything".
+
+**The no-scroll rule is the design.** It is what forces every candidate for this screen to beat
+something already on it. `.dash-shell` is exactly `100dvh` with `overflow: hidden`, the bar and
+foot size to content, the stage takes the remainder, and `min-height: 0` on the stage is
+load-bearing -- without it a flex child refuses to shrink below its content and the foot slides off
+a short phone. The orb is bounded by `dvh` as well as `vw`, so a small screen shrinks the orb
+instead of losing the foot. The pick-up line is a single clamped line for the same reason.
+
+Measured on four viewports (375x667, 390x844, 430x932, and a squat 412x600): `scrollY` stays 0
+after a wheel event, document height equals viewport height, the bar starts at y=54 and the foot
+ends inside the screen on all four. The orb scales 264px -> 360px across them.
+
+### The collapse, and what it hands off
+
+Tapping fades the bar up and out, the foot down and out, and switches the orb to its `listening`
+configuration while the cue becomes "listening…". Then the room takes over.
+
+**The orb on /dash cannot actually listen, and that is deliberate.** The mic, the WebRTC session
+and the whole voice state machine live in the room. A second microphone on this page would either
+duplicate that machinery or fight the room for the device, and it would prompt for permission
+twice. So the hand-off goes through `sessionStorage` -- a new `autoStartKey`, the same pattern the
+dashboard's "continue" already uses -- and the room opens **already in a session** rather than on
+the landing panel. One tap, then talk.
+
+Verified end to end: the key is written before navigation, `/` opens with room chrome and no
+landing panel, the key is consumed, and visiting `/` directly still shows the landing panel, so the
+hand-off leaves nothing behind.
+
+### Invented data by default, while it is being built
+
+`/dash` renders the preview account without being asked, so the layout can be judged without an
+account and a month of practice behind it. `?preview=0` shows the real one, and the dashed badge in
+the corner is the link to it.
+
+One switch, `previewByDefault`, is the only line to change when the page is done -- a constant
+rather than a check scattered through the component, so turning it off cannot be half-done.
+
+**The split that matters:** the orb stays **real**. Starting a fresh conversation carries nothing
+invented across, so gating it would kill the one interaction worth testing here for no honesty
+gain. The pick-up bar is the opposite and stays inert: it hands a saved rescue to the room, and an
+invented one would write practice that never happened into a real account. It plays the collapse
+and comes back.
+
+Verified: bare `/dash` shows the invented account with the badge, the bar writes no resume key and
+stays put, the orb writes the hand-off key and opens the room with no landing panel, and
+`?preview=0` reaches the real account with no badge.
+
+### What is not built
+
+Speech-triggered entry -- "as soon as you start speaking" -- is still a tap. Doing it properly
+means the mic living above both screens rather than inside the room, which is a real refactor and a
+decision worth making on purpose rather than in passing.
+
+---
+
+## 2026-09-06 — The closing card and the home screen are one thing
+
+The wedge is memory **proven** rather than claimed, and until today the surface that proves it was
+behind a login. A stranger who tries OutLoud once and never comes back is the only user we actually
+have, and they could not see it. From the handoff doc: *"items 27, 28 and 46 must land in session
+one. A Reddit tester will never see day three."*
+
+### What was actually there
+
+Five surfaces saying "here is what OutLoud gives back", four of them in the room and mostly opening
+each other:
+
+| surface | state |
+|---|---|
+| `after` (closing card) | today's line, changed today / almost there / return hook, an email box, an account nudge |
+| `profile` | "what OutLoud knows about you" |
+| `evidence` | the evidence behind one row |
+| `journey` | a **five-row session checklist** calling itself "your speaking journey" |
+| `/dashboard` | the real thing, behind an account |
+
+Two of those deserve naming. The room's "speaking journey" was not the journey — it was
+*"answer the coach's first question"*, *"retry after a hint"*, *"start a real conversation"* — of
+which **three rows were always already ticked** by the time anyone could open it. So there were two
+lists with one name, and the one that told you where you were going was the one nobody could reach.
+
+And the email box promises a link to `/m/<id>`, a route that does not exist. That part is left in
+place deliberately for now, but it is sending 404s.
+
+### Now
+
+One `HomePanel`, one `DashboardData`, two variants. At the end of a session the room builds the
+data from what it already holds — `coachLoot` plus the two rescue phrases for the words,
+`derivePracticeLedgerState` for the ladder, `nextReviewAt` for the real return date. **No request,
+no account, no waiting until day three.**
+
+**Ordering is the load-bearing part.** A dashboard is a summary by nature, and a summary at the end
+of a session reads as *done* — which would quietly kill the one retention mechanic this product has
+("endings, never conclusions"). So the first thing on screen is always what is still unfinished and
+when it comes back; what was achieved sits underneath it.
+
+Session one deliberately does **not** render: the trend line (no evidence yet), the review queue
+(the one thing just practised is not due — it is a promise with a date, not a to-do item), the
+session list (a list with one row in it is not a history, it is the claim that there is one), or
+the word filter (three chips do not need filtering). Those appear when they become true.
+
+The five-row checklist is gone and the nine-stage path took the name, in both the panel and the
+`journey` sheet.
+
+### Two things the first real run-through exposed
+
+**"almost there: insufficient evidence."** `formatBlockerLabel` only stripped underscores, so the
+enum name was being printed at the learner. `blockerFocusLabels` is the plain-language version of
+the same taxonomy and covers all eight. Then the fix needed a fix: `normalizeObservedBlocker` falls
+through to `sentence_assembly` for anything it cannot place, `undefined` included — so mapping it
+unguarded would have printed a confident diagnosis ("putting the sentence together") at a learner
+we had observed nothing about. Guarded: with nothing to go on, the next session's job is to find
+out, and that is what it now says.
+
+**`tomorrowLabel()` hardcoded +24h.** The return date now comes from the same `nextReviewAt` the
+server writes to `retrieval_due_at`, so the weekday on the card is the weekday the moment is really
+scheduled for. Pinned in a handler rather than read during render — `Date.now()` in a render body
+is impure, and a return date that drifts on re-render is exactly the kind of small lie this app
+cannot afford.
+
+### The account ask changed with it
+
+It used to be a claim about an invisible future — *"OutLoud won't know you next time without an
+account."* The panel now shows the thing itself, so the ask points at it: everything visible is
+what an account keeps. That is #32, and it is the sequencing correction the handoff doc asks for —
+the dashboard stops being a page for people who already signed up and becomes what session one ends
+with.
+
+The words on the card come from the same `sessionWordList()` that `saveWordBank` posts, so the card
+cannot show a set different from the one that gets saved.
+
+### The account pages could not scroll, and never could
+
+`overflow: hidden` sat on `body`, which is every route. It is there so the room -- a fixed
+one-screen app -- never rubber-bands, but it also meant `/dashboard` and `/profile` clipped
+everything past the first viewport. Nothing below the fold was reachable by any means.
+
+Pre-existing, and invisible until the home screen got long enough to run past the fold. Now scoped
+with `body:has(.app-shell)`, and `.app-shell` is rendered by `app/page.tsx` and nothing else. A
+browser without `:has()` falls back to a scrollable body on the room, which changes nothing there:
+`.room` is exactly `100dvh` and clips its own content anyway.
+
+Measured after the fix: the dashboard scrolls its full 3772px and reaches the bottom, the room
+still computes `overflow-y: hidden` and does not move on a wheel event.
+
+### Verified
+
+A full typed run-through against the live routes to the closing card: sections in the order
+`after-stack → speaking journey → your words`, nine stages, current stage "introduce yourself" with
+an honest *"0 sentences said with nothing on the screen so far"*, the return date rendering as the
+real weekday, both rescue phrases present, and zero review-queue / session-list / word-filter nodes.
+`/dashboard?preview=1` unchanged after the extraction. tsc and eslint clean.
+
+---
+
 ## 2026-08-31 — A way into the account pages from the room
 
 A `debug` pill in the room header, between `feedback` and the profile icon, linking straight to

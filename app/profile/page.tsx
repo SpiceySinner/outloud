@@ -149,7 +149,7 @@ export default function ProfilePage() {
                   const direction = trendDirection(profile.focus.trend);
                   if (direction === "falling") return `${now} — ${before}. it is showing up less.`;
                   if (direction === "rising") return `${now} — ${before}. it is showing up more, not less.`;
-                  return `${now} — ${before}. holding steady so far.`;
+                  return `${now} — ${before}. not enough of a change to call it either way.`;
                 })()}
               </p>
             ) : null}

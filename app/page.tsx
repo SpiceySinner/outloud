@@ -2,7 +2,9 @@
 
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { OrbCanvas } from "./components/OrbCanvas";
-import { assistanceRank, derivePracticeLedgerState } from "@/lib/learning-loop";
+import { assistanceRank, derivePracticeLedgerState, nextReviewAt } from "@/lib/learning-loop";
+import HomePanel, { JourneyPath, type ClosingRead } from "./components/HomePanel";
+import type { DashboardData, MomentCard } from "@/lib/dashboard-data";
 import { shouldTriggerRepair } from "@/lib/repair-loop";
 import {
   assistanceOrderFor,
@@ -25,7 +27,7 @@ import type { CoachResponse } from "@/lib/coach-schema";
 import type { AsideResponse } from "@/lib/aside-schema";
 import Link from "next/link";
 import { getSupabaseBrowser } from "@/lib/supabase-browser";
-import { resumeMomentKey, type ResumeMoment } from "@/lib/account-links";
+import { autoStartKey, resumeMomentKey, type ResumeMoment } from "@/lib/account-links";
 import type { TranscriptionConfidenceTier } from "@/lib/transcription-confidence";
 
 type RoomMode = "landing" | "speaks-first" | "stung";
@@ -330,14 +332,10 @@ function lastMatching<T>(items: T[], predicate: (item: T) => boolean) {
   return null;
 }
 
-function formatBlockerLabel(value: string | undefined) {
-  return (value ?? "conversation").replace(/_/g, " ");
-}
-
-function tomorrowLabel() {
-  return new Intl.DateTimeFormat("en", { weekday: "long" }).format(
-    new Date(Date.now() + 24 * 60 * 60 * 1000),
-  ).toLowerCase();
+function weekdayLabel(iso: string) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "soon";
+  return new Intl.DateTimeFormat("en", { weekday: "long" }).format(date).toLowerCase();
 }
 
 function makeId() {
@@ -770,6 +768,8 @@ export default function Home() {
   const handleRealtimeEventRef = useRef<(event: RealtimeServerEvent) => void>(() => undefined);
   // Same latest-ref pattern for the auth listener, which is also registered exactly once.
   const restoreVerdictAfterAuthRef = useRef<(email: string) => void>(() => undefined);
+  /** Same reason as the two above: /dash's hand-off effect runs before `enterRoom` is declared. */
+  const enterRoomRef = useRef<(mode: RoomMode) => void>(() => undefined);
   const [typedFallbackOpen, setTypedFallbackOpen] = useState(false);
   const [typedAttempt, setTypedAttempt] = useState("");
   // True when the typed-fallback box is open to confirm/repair a just-captured spoken transcript,
@@ -1015,6 +1015,16 @@ export default function Home() {
     return next;
   });
   const [savedMomentId, setSavedMomentId] = useState<string | null>(null);
+  /**
+   * When this session closed. Pinned in a handler rather than read during render: `Date.now()` in
+   * the render body is impure, and a return date that drifts on every re-render is exactly the
+   * kind of small lie this app cannot afford -- the weekday on the card has to be the weekday the
+   * moment is really scheduled for.
+   *
+   * Null until the session actually ends, which is also what keeps the journey honest: nothing is
+   * banked while a session is still running.
+   */
+  const [sessionClosedAt, setSessionClosedAt] = useState<string | null>(null);
   const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [lastReviewUrl, setLastReviewUrl] = useState<string | null>(null);
   const isLanding = mode === "landing";
@@ -1285,7 +1295,74 @@ export default function Home() {
       : sessionTurns.some((turn) => turn.evaluation?.meaningResult === "clear")
         ? "you got at least one real reply across clearly."
         : "we found the exact reply to practice next.";
-  const tomorrowWork = formatBlockerLabel(almostBeaten);
+  /**
+   * Plain language, never the enum: this string is read on the closing card and mailed to them.
+   *
+   * The `almostBeaten` guard is not cosmetic. `normalizeObservedBlocker` falls through to
+   * `sentence_assembly` for anything it cannot place, `undefined` included -- so mapping it
+   * unguarded would print a confident diagnosis ("putting the sentence together") at a learner we
+   * observed nothing about. "Evidence or silence": with nothing to go on, the next session's job
+   * is to find out, and that is what this says.
+   */
+  const tomorrowWork = almostBeaten
+    ? blockerFocusLabels[normalizeObservedBlocker(almostBeaten)]
+    : blockerFocusLabels.insufficient_evidence;
+  /**
+   * What the closing panel renders, built from what the room already holds -- no request, no
+   * account, no waiting until day three.
+   *
+   * This is the whole point of merging the closing card and the home screen: the wedge is memory
+   * proven rather than claimed, and until now the surface that proves it was behind a login. A
+   * stranger who tries this once and never returns is the only user we actually have, and they
+   * could not see it.
+   *
+   * The ledger state is derived exactly as `saveCurrentMoment` derives it, so the journey counts
+   * this session the same way the database will.
+   */
+  const sessionLedgerState = derivePracticeLedgerState(
+    primaryEvaluation,
+    lastMatching(sessionTurns, (turn) => Boolean(turn.evaluation))?.evaluation ?? null,
+  );
+  // `false` matches the save payload's `deepLinkMomentId: null` -- a first save comes back in a day.
+  const sessionDueAt = sessionClosedAt
+    ? nextReviewAt(new Date(sessionClosedAt).getTime(), sessionLedgerState, false)
+    : null;
+  const closingRead: ClosingRead = {
+    delta: afterDelta,
+    almostThere: tomorrowWork,
+    comesBackOn: sessionDueAt ? weekdayLabel(sessionDueAt) : "soon",
+  };
+  const closingMoment: MomentCard | null =
+    placementRescue && sessionClosedAt && sessionDueAt
+    ? {
+        id: savedMomentId ?? "this-session",
+        createdAt: sessionClosedAt,
+        summary: placementRescue.important_phrase.meaning_en || todayLine,
+        naturalVersion: placementRescue.natural_version,
+        keyPhrase: placementRescue.important_phrase.spanish,
+        keyPhraseMeaning: placementRescue.important_phrase.meaning_en,
+        pattern: placementRescue.transferableChunk.patternEs,
+        blocker: almostBeaten ?? null,
+        ledgerState: sessionLedgerState,
+        dueAt: sessionDueAt,
+        rescue: placementRescue,
+      }
+    : null;
+  const closingData: DashboardData = {
+    user: { email: authedEmail ?? "" },
+    // Exactly the phrases that get written to the word bank, so the card cannot show a different
+    // set from the one that is saved.
+    words: sessionWordList().map((word, index) => ({
+      id: `session-word-${index}`,
+      spanish: word.spanish,
+      meaning_en: word.meaningEn,
+      source: word.source,
+      times_practiced: 0,
+      created_at: sessionClosedAt ?? "",
+    })),
+    moments: closingMoment ? [closingMoment] : [],
+    chat: [],
+  };
   /**
    * #50 -- the profile has to show the dimension the learner named, moving. It used to be four
    * hardcoded rows ("finding words", "building sentences", "follow-up replies", "pronunciation"),
@@ -1346,14 +1423,6 @@ export default function Home() {
   // observed, where the old fixed four-row array always had something to index into.
   const activeEvidence: (typeof profileRows)[number] | null =
     profileRows[profileEvidenceIndex] ?? profileRows[0] ?? null;
-  const journeyRows = [
-    ["answer the coach's first question", placementAttempts.some((item) => item.kind !== "setup") ? "done" : "ahead", placementAttempts.find((item) => item.kind !== "setup")?.userAttempt ?? ""],
-    ["retry after a hint", placementAttempts.some((item) => item.kind === "retry") ? "done" : "ahead", placementAttempts.find((item) => item.kind === "retry")?.userAttempt ?? ""],
-    ["start a real conversation", sessionTurns.length ? "done" : flowPhase === "session" ? "now" : "ahead", currentConversationTurn?.characterLineEs ?? ""],
-    [`practice ${tomorrowWork}`, overlay === "after" ? "now" : "ahead", todayLine],
-    ["come back in a new situation", returnEmailStatus === "saved" ? "now" : "ahead", returnEmailStatus === "saved" ? tomorrowLabel() : ""],
-  ];
-
   function closeOverlay() {
     setOverlay(null);
     setFeedbackStep(0);
@@ -2463,6 +2532,8 @@ export default function Home() {
       interruptible: !reply.shouldClose,
       onDone: () => {
         if (reply.shouldClose) {
+          // Updater form: reopening the card later must not move the return date.
+          setSessionClosedAt((current) => current ?? new Date().toISOString());
           setOverlay("after");
         }
       },
@@ -2738,6 +2809,7 @@ export default function Home() {
     turnSubtitleRef.current = false;
     setCurrentConversationTurn(null);
     setSavedMomentId(null);
+    setSessionClosedAt(null);
     setSaveStatus("idle");
     setLastReviewUrl(null);
     setTurnState("thinking");
@@ -3558,15 +3630,12 @@ export default function Home() {
     }
   }
 
-  // Words are the thing the account exists for, so they are pushed on every save.
-  async function saveWordBank(momentId: string | null) {
-    const supabase = getSupabaseBrowser();
-    if (!supabase) return;
-    const { data } = await supabase.auth.getSession();
-    const token = data.session?.access_token;
-    if (!token) return;
-
-    const words = [
+  /**
+   * The phrases this session hands over. Shared with the closing panel on purpose: the card shows
+   * what an account would keep, so it has to be the same list the account actually keeps.
+   */
+  function sessionWordList() {
+    return [
       ...coachLoot.map((item) => ({ spanish: item.es, meaningEn: item.en, source: "coach_tool" as const })),
       ...(placementRescue
         ? [
@@ -3583,6 +3652,17 @@ export default function Home() {
           ]
         : []),
     ].filter((word) => word.spanish.trim().length > 0);
+  }
+
+  // Words are the thing the account exists for, so they are pushed on every save.
+  async function saveWordBank(momentId: string | null) {
+    const supabase = getSupabaseBrowser();
+    if (!supabase) return;
+    const { data } = await supabase.auth.getSession();
+    const token = data.session?.access_token;
+    if (!token) return;
+
+    const words = sessionWordList();
     if (!words.length) return;
 
     try {
@@ -3764,6 +3844,25 @@ export default function Home() {
     handleRealtimeEventRef.current = handleRealtimeEvent;
     restoreVerdictAfterAuthRef.current = restoreVerdictAfterAuth;
   });
+
+  // /dash hands off a plain "start talking" the same way, minus a rescue to restore. Runs before
+  // the resume effect below and defers to it: if both keys are somehow set, picking a specific
+  // conversation back up is the more specific intent.
+  useEffect(() => {
+    let wants = false;
+    try {
+      wants = window.sessionStorage.getItem(autoStartKey) === "1";
+      if (wants) window.sessionStorage.removeItem(autoStartKey);
+      if (window.sessionStorage.getItem(resumeMomentKey)) wants = false;
+    } catch {
+      return;
+    }
+    if (!wants) return;
+    // Deferred: no synchronous setState inside an effect body, and the rebind effect above has
+    // filled the ref by the time this fires.
+    const timer = window.setTimeout(() => enterRoomRef.current("speaks-first"), 0);
+    return () => window.clearTimeout(timer);
+  }, []);
 
   // The dashboard's "continue" writes a saved rescue into sessionStorage and navigates here.
   useEffect(() => {
@@ -4004,6 +4103,7 @@ export default function Home() {
     setLastTranscriptionConfidence(null);
     setProfileEvidenceIndex(0);
     setSavedMomentId(null);
+    setSessionClosedAt(null);
     setSaveStatus("idle");
     setLastReviewUrl(null);
     setCoachLine(nextMode === "stung" ? null : openingPrompt);
@@ -4018,6 +4118,13 @@ export default function Home() {
     setTurnState("speaking");
     void speakCoachText(openingPrompt, "intake", 1500);
   }
+
+  // Bound here rather than in the rebind effect near the top, which is declared above `enterRoom`
+  // and so cannot reference it. Effects run in declaration order and the hand-off's timeout fires
+  // after all of them, so the ref is filled by the time it is read.
+  useEffect(() => {
+    enterRoomRef.current = enterRoom;
+  });
 
   async function startHolding() {
     const currentTurnState = turnStateRef.current;
@@ -4443,6 +4550,7 @@ export default function Home() {
               setFeedbackSaved(false);
               setProfileEvidenceIndex(0);
               setSavedMomentId(null);
+              setSessionClosedAt(null);
               setSaveStatus("idle");
               setLastReviewUrl(null);
               stopMediaStream();
@@ -5046,20 +5154,12 @@ export default function Home() {
               <section className="room-sheet after-card" aria-label="After session">
                 <p className="verdict-kicker">today&apos;s line</p>
                 <h2>{todayLine || "you got the conversation started."}</h2>
-                <div className="after-stack">
-                  <article>
-                    <span>changed today</span>
-                    <p>{afterDelta}</p>
-                  </article>
-                  <article>
-                    <span>almost there</span>
-                    <p>{tomorrowWork}</p>
-                  </article>
-                  <article className="return-hook">
-                    <span>{tomorrowLabel()}</span>
-                    <p>we&apos;ll bring this back in a new situation, with a little less help.</p>
-                  </article>
-                </div>
+                <HomePanel
+                  variant="session-end"
+                  data={closingData}
+                  closing={closingRead}
+                  focusLabel={sessionFocusLine}
+                />
                 <p className="sheet-note sage-note">
                   if it comes up with someone tonight, try just this line.
                 </p>
@@ -5107,10 +5207,15 @@ export default function Home() {
                 </div>
                 {authedEmail ? null : (
                   <div className="account-nudge">
+                    {/*
+                      #32 -- this used to be a claim about an invisible future ("OutLoud won't
+                      know you next time"). The panel above now shows the thing itself, so the ask
+                      can point at it instead: everything they can see is what an account keeps.
+                    */}
                     <p>
-                      OutLoud won&apos;t know you next time without an account. that&apos;s the
-                      only way it keeps what trips you up and picks up where you stopped — and it
-                      takes the same email you just used.
+                      all of that is yours until you close this tab — the phrase, the return date,
+                      and what it worked out about you. an account is what keeps it, and it takes
+                      the same email you just used.
                     </p>
                     <button className="account-button" type="button" onClick={() => openAuth("signup")}>
                       create a free account
@@ -5273,17 +5378,7 @@ export default function Home() {
             {overlay === "journey" ? (
               <section className="room-sheet" aria-label="Speaking journey">
                 <h2>your speaking journey</h2>
-                <div className="journey-list">
-                  {journeyRows.map(([label, status, note]) => (
-                    <div className={`journey-row ${status}`} key={label}>
-                      <span>{status === "done" ? "✓" : ""}</span>
-                      <p>
-                        {label}
-                        {note ? <small>{note}</small> : null}
-                      </p>
-                    </div>
-                  ))}
-                </div>
+                <JourneyPath moments={closingData.moments} focusLabel={sessionFocusLine} />
               </section>
             ) : null}
 

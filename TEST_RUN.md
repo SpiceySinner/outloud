@@ -338,6 +338,62 @@ Now the thing that would be worse than the original bug: answer a yes/no questio
 Same for a short real answer that starts with a filler — **"um, el museo"**. That must go straight
 through as an answer.
 
+### ☐ 4.0 /dash on your own phone
+
+Open `/dash` on the phone you actually use. **While this screen is being built it always shows an
+invented account** -- twelve sessions that never happened -- so the layout can be judged without a
+month of practice behind it. The dashed `preview` badge in the corner says so and taps through to
+your real one.
+
+**Expect:** everything fits. One bar at the top, the orb, one line at the bottom.
+
+> **Report immediately** if you can scroll at all, or if the bottom line is cut off or missing.
+> The layout is measured on four screen sizes but yours is the one that counts.
+
+Try to scroll anyway, hard, in both directions. **Expect** nothing to move.
+
+Now tap the orb. **Expect** the bar and the bottom line to get out of the way, the orb to change
+shape, and then to land **inside** a session -- not on the "start talking." screen. **Report** if
+you see the landing screen: that is two taps for something that should be one.
+
+The orb is real even while the data is invented, because starting a fresh conversation carries
+nothing invented into it.
+
+Now tap the **bar** at the top instead. **Expect** the collapse to play and then to come back to
+`/dash`. That one is deliberately inert while the data is invented -- it would otherwise put
+practice that never happened into your real account.
+
+> **Report immediately** if tapping the bar ever lands you in a session about "me he perdido" or
+> anything else from the invented account.
+
+Rotate the phone, or open it with the keyboard up. **Expect** it to still fit or to fail
+gracefully, never to hide the bottom.
+
+### ☐ 4.1 The end of a session
+
+Play a session all the way to the closing card.
+
+**Expect,** in this order: the line you can use tonight, then what changed and what is almost
+there, then **a weekday** — the day this comes back — then the path, then your words.
+
+> **Report immediately** if any of it reads like a report card. This screen has to leave you with
+> something unfinished. If it feels like "well done, you're done", the ordering has broken.
+
+**Expect** the "almost there" line to be plain English about *your* thing. **Report immediately** if
+it says **"insufficient evidence"**, **"sentence assembly"**, or anything else that looks like a
+variable name.
+
+**Expect** the words shown to be exactly the phrases the session handed you — no extras, none
+missing.
+
+**Expect** on your **first** session: no review queue, no list of past sessions, no filter above
+the words, and no claim about a trend. Those need more than one session to be true.
+
+**Expect** the path to say something honest about you — if you needed help on everything, it should
+say **0** sentences said unaided, not flatter you.
+
+Then tap a stage. **Expect** an explanation and **nothing else** — no lesson, no session starting.
+
 ### ☐ 3.1c The repeating transcript
 
 Hard to trigger deliberately — it comes from being cut off mid-sentence — so mostly this is a thing

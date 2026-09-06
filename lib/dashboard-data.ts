@@ -128,10 +128,30 @@ export function focusFromMoments(moments: Pick<MomentCard, "blocker">[]): FocusR
   return { blocker: top, label: blockerFocusLabels[top], trend };
 }
 
-/** Rates, not counts: the two windows differ in size whenever the session count is odd. */
+/**
+ * Whether the dimension is actually moving, or just wobbling.
+ *
+ * This used to call any difference at all a direction -- `recent > earlier` -- so three of your
+ * last six against two of six, a difference of **one session**, printed "it is showing up more,
+ * not less" at the top of the home screen. The function above exists precisely to avoid "noise
+ * dressed as insight", and then this undid it.
+ *
+ * Two guards, and a claim has to clear both. Rates, because the windows differ in size whenever
+ * the session count is odd; and raw counts, because at these sample sizes a single session can
+ * swing a rate by twenty points on its own.
+ *
+ * The numbers are invented and deliberately conservative. Telling someone their problem is getting
+ * worse is the most consequential sentence on the screen, and it should stay silent until it is
+ * sure -- saying nothing costs a beat, saying it wrongly costs the trust in everything else.
+ */
+const trendMinRateGap = 0.2;
+const trendMinSessionGap = 2;
+
 export function trendDirection(trend: NonNullable<FocusReading["trend"]>): "falling" | "rising" | "steady" {
   const recent = trend.recent / trend.recentTotal;
   const earlier = trend.earlier / trend.earlierTotal;
+  if (Math.abs(trend.recent - trend.earlier) < trendMinSessionGap) return "steady";
+  if (Math.abs(recent - earlier) < trendMinRateGap) return "steady";
   if (recent < earlier) return "falling";
   if (recent > earlier) return "rising";
   return "steady";

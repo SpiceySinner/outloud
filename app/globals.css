@@ -24,13 +24,27 @@ html {
 body {
   min-height: 100dvh;
   margin: 0;
-  overflow: hidden;
   background: var(--page);
   color: var(--ink);
   font-family: var(--font-schibsted), system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
   -webkit-touch-callout: none;
+}
+
+/*
+ * The room must never scroll -- it is a fixed one-screen app and a rubber-banding body under it
+ * reads as the page coming apart. But `overflow: hidden` sat on `body`, which is every route, so
+ * /dashboard and /profile could not scroll either: anything past the first viewport was simply
+ * unreachable. It only became obvious once the home screen got long enough to run past the fold.
+ *
+ * Scoped to the room instead. `.app-shell` is rendered by app/page.tsx and nothing else.
+ * Without `:has()` support a browser falls back to a scrollable body on the room, which changes
+ * nothing there: `.room` is exactly 100dvh and clips its own content anyway.
+ */
+body:has(.app-shell),
+body:has(.dash-shell) {
+  overflow: hidden;
 }
 
 button {
@@ -1739,71 +1753,6 @@ html:not([data-outloud-hydrated="true"]) .app-shell button {
   cursor: pointer;
 }
 
-.journey-list {
-  display: flex;
-  flex-direction: column;
-  gap: 0;
-  text-align: left;
-}
-
-.journey-row {
-  display: flex;
-  gap: 14px;
-  min-height: 44px;
-}
-
-.journey-row > span {
-  width: 22px;
-  height: 22px;
-  display: grid;
-  place-items: center;
-  flex: none;
-  border-radius: 99px;
-  border: 1.5px solid rgba(30, 27, 23, 0.18);
-  background: #fdfbf7;
-  color: #fdfbf7;
-  font-family: var(--font-schibsted), system-ui, sans-serif;
-  font-size: 12px;
-  font-weight: 600;
-}
-
-.journey-row.done > span {
-  border: 0;
-  background: var(--sage);
-}
-
-.journey-row.now > span {
-  border: 0;
-  background: var(--terracotta);
-}
-
-.journey-row p {
-  margin: 0 0 12px;
-  color: var(--ink);
-  font-family: var(--font-schibsted), system-ui, sans-serif;
-  font-size: 15px;
-  line-height: 1.35;
-}
-
-.journey-row.now p {
-  color: var(--terracotta);
-  font-weight: 600;
-}
-
-.journey-row.ahead p,
-.journey-row.ahead small {
-  color: var(--faint);
-}
-
-.journey-row small {
-  display: block;
-  margin-top: 3px;
-  color: var(--muted);
-  font-size: 13px;
-  font-weight: 400;
-  line-height: 1.4;
-}
-
 .evidence-card {
   display: flex;
   flex-direction: column;
@@ -2834,5 +2783,302 @@ html:not([data-outloud-hydrated="true"]) .app-shell button {
 @media (prefers-reduced-motion: reduce) {
   .journey-stage.is-current .journey-dot {
     box-shadow: none;
+  }
+}
+
+/* The home panel inside a closing card: same sections, sheet spacing. */
+.after-card .home-panel {
+  text-align: left;
+}
+
+.after-card .home-panel .page-section {
+  margin-bottom: 22px;
+}
+
+.after-card .home-panel .page-section h2 {
+  font-size: 18px;
+}
+
+.after-card .home-panel .after-stack {
+  margin-bottom: 22px;
+}
+
+
+/* ---------------------------------------------------------------- /dash ---
+   One screen, never scrolls. The height chain is the whole trick: the shell is
+   exactly 100dvh, the bar and the foot size to content, and the stage takes what
+   is left. `min-height: 0` on the stage is load-bearing -- without it a flex
+   child refuses to shrink below its content and the foot gets pushed off a
+   short phone. */
+
+.dash-shell {
+  height: 100dvh;
+  max-width: 430px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow: hidden;
+  padding: max(14px, env(safe-area-inset-top)) 18px max(16px, env(safe-area-inset-bottom));
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-schibsted), system-ui, sans-serif;
+}
+
+.dash-chrome {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.dash-chrome-link {
+  color: var(--muted);
+  font-size: 12.5px;
+  text-decoration: none;
+}
+
+.dash-preview {
+  padding: 3px 9px;
+  text-decoration: none;
+  border: 1px dashed rgba(196, 69, 31, 0.4);
+  border-radius: 999px;
+  color: var(--terracotta);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.dash-avatar {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 999px;
+  background: var(--ink);
+  color: var(--paper);
+  font-size: 12.5px;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+/* --- the bar: one thing --- */
+
+.dash-bar {
+  flex: none;
+}
+
+.dash-pickup {
+  position: relative;
+  appearance: none;
+  display: block;
+  width: 100%;
+  padding: 12px 40px 12px 14px;
+  border: 1px solid rgba(196, 69, 31, 0.26);
+  border-radius: 16px;
+  background: rgba(196, 69, 31, 0.05);
+  text-align: left;
+  cursor: pointer;
+}
+
+.dash-pickup-kicker {
+  display: block;
+  color: var(--terracotta);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.dash-pickup-line {
+  display: block;
+  margin-top: 3px;
+  color: var(--ink);
+  font-family: var(--font-newsreader), Georgia, serif;
+  font-size: 17px;
+  line-height: 1.2;
+  /* One line, always: a bar that grows on long content is a bar that breaks the layout. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dash-pickup-meaning {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dash-pickup-go {
+  position: absolute;
+  top: 50%;
+  right: 14px;
+  transform: translateY(-50%);
+  color: var(--terracotta);
+  font-size: 16px;
+}
+
+.dash-bar-empty {
+  margin: 0;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  color: var(--faint);
+  font-size: 13px;
+}
+
+/* --- the middle --- */
+
+.dash-stage {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+}
+
+.dash-orb-wrap {
+  appearance: none;
+  display: grid;
+  place-items: center;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.dash-orb {
+  /* Bounded by the viewport height as well as the width, so a short phone shrinks
+     the orb instead of pushing the foot off the screen. Generous because OrbCanvas
+     draws the sphere well inside its own box -- the visible circle is roughly half
+     the number below, which is why this looks bigger than it reads. */
+  width: min(360px, 84vw, 44dvh);
+  height: min(360px, 84vw, 44dvh);
+  display: block;
+}
+
+.dash-orb-wrap:active .dash-orb {
+  transform: scale(0.98);
+  transition: transform 90ms var(--ease-room);
+}
+
+.dash-cue {
+  margin: 0;
+  color: var(--sage);
+  font-family: var(--font-newsreader), Georgia, serif;
+  font-size: 17px;
+}
+
+.dash-focus {
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: 12.5px;
+  text-align: center;
+}
+
+/* --- the foot --- */
+
+.dash-foot {
+  flex: none;
+}
+
+.dash-stage-line {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 0 0 6px;
+  color: var(--ink);
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.dash-stage-count {
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 400;
+}
+
+.dash-rail {
+  display: block;
+  height: 3px;
+  border-radius: 2px;
+  background: rgba(30, 27, 23, 0.1);
+  overflow: hidden;
+}
+
+.dash-rail > span {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--sage);
+}
+
+.dash-meta {
+  margin: 8px 0 0;
+  color: var(--faint);
+  font-size: 11.5px;
+  text-align: center;
+}
+
+.dash-meta a {
+  color: var(--terracotta);
+}
+
+/* --- the collapse: everything but the orb gets out of the way --- */
+
+.dash-shell.is-leaving .dash-chrome,
+.dash-shell.is-leaving .dash-bar {
+  opacity: 0;
+  transform: translateY(-14px);
+  transition: opacity 300ms var(--ease-room), transform 380ms var(--ease-room);
+}
+
+.dash-shell.is-leaving .dash-foot {
+  opacity: 0;
+  transform: translateY(14px);
+  transition: opacity 300ms var(--ease-room), transform 380ms var(--ease-room);
+}
+
+.dash-shell.is-leaving .dash-focus {
+  opacity: 0;
+  transition: opacity 220ms var(--ease-room);
+}
+
+.dash-shell.is-leaving .dash-orb {
+  transform: scale(1.06);
+  transition: transform 420ms var(--ease-room);
+}
+
+.dash-chrome,
+.dash-bar,
+.dash-foot,
+.dash-focus,
+.dash-orb {
+  transition: opacity 260ms var(--ease-room), transform 260ms var(--ease-room);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dash-shell.is-leaving .dash-chrome,
+  .dash-shell.is-leaving .dash-bar,
+  .dash-shell.is-leaving .dash-foot,
+  .dash-shell.is-leaving .dash-focus,
+  .dash-shell.is-leaving .dash-orb,
+  .dash-chrome,
+  .dash-bar,
+  .dash-foot,
+  .dash-focus,
+  .dash-orb {
+    transform: none;
+    transition: none;
   }
 }

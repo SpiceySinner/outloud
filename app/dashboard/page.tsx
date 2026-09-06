@@ -4,18 +4,13 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { getSupabaseBrowser } from "@/lib/supabase-browser";
-import { formatSavedDate, resumeMomentKey, type ResumeMoment } from "@/lib/account-links";
+import { resumeMomentKey, type ResumeMoment } from "@/lib/account-links";
+import HomePanel from "@/app/components/HomePanel";
 import {
-  daysOverdue,
   dueMoments,
   focusFromMoments,
-  journeyPosition,
-  journeyStages,
-  masteryLabels,
-  masteryRank,
   normalizeMastery,
   trendDirection,
-  wordState,
   type ChatMessage,
   type DashboardData,
   type MomentCard,
@@ -30,9 +25,8 @@ import { mockChatReplies, mockDashboard } from "@/lib/dashboard-mock";
  * being in and out of lesson lists. So there is exactly one primary action here, and everything
  * else on the page is either evidence of what happened or a door back into the same room.
  *
- * Three questions, in this order: what should I do right now, what did I already do, and where is
- * this going. Nothing on the page is a streak, and nothing here is configurable -- the focus is
- * set by the evidence, not by the learner picking a topic.
+ * The evidence itself lives in `HomePanel`, which the room renders too, at the end of a session.
+ * This page owns only its own headline, the coach chat, and the account chrome.
  */
 
 type LibrarySession = {
@@ -58,8 +52,6 @@ export default function DashboardPage() {
 
   const [chatOpen, setChatOpen] = useState(false);
   const [extraChat, setExtraChat] = useState<ChatMessage[]>([]);
-  const [openStage, setOpenStage] = useState<string | null>(null);
-  const [wordFilter, setWordFilter] = useState<"all" | "new" | "used">("all");
   const [previewNote, setPreviewNote] = useState<string | null>(null);
   const [usedChips, setUsedChips] = useState<string[]>([]);
 
@@ -123,13 +115,9 @@ export default function DashboardPage() {
   }, [load]);
 
   const moments = useMemo(() => data?.moments ?? [], [data]);
-  const words = data?.words ?? [];
   const focus = useMemo(() => focusFromMoments(moments), [moments]);
   const due = useMemo(() => dueMoments(moments), [moments]);
-  const journey = useMemo(() => journeyPosition(moments), [moments]);
   const chat = useMemo(() => [...(data?.chat ?? []), ...extraChat], [data, extraChat]);
-
-  const filteredWords = words.filter((word) => wordFilter === "all" || wordState(word) === wordFilter);
 
   function continueSession(moment: MomentCard) {
     if (preview) {
@@ -208,7 +196,7 @@ export default function DashboardPage() {
                     const direction = trendDirection(focus.trend);
                     if (direction === "falling") return `${now}, down from ${before}. it is showing up less.`;
                     if (direction === "rising") return `${now}, up from ${before}. it is showing up more, not less.`;
-                    return `${now}, ${before}. holding steady so far.`;
+                    return `${now}, ${before}. not enough of a change to call it either way.`;
                   })()
                 : moments.length
                   ? `${moments.length} ${moments.length === 1 ? "session" : "sessions"} so far — a couple more and this line can tell you whether it is moving.`
@@ -224,51 +212,6 @@ export default function DashboardPage() {
                 </a>
               </p>
             ) : null}
-          </section>
-
-          {/*
-            The retrieval loop, finally visible. Every moment has always been saved with a due
-            date; the only thing ever built to act on it emails a link to a route that 404s.
-          */}
-          <section className="page-section" id="review" aria-label="Due for another go">
-            <h2>another go</h2>
-            {due.length ? (
-              <>
-                <p className="page-body home-section-note">
-                  spaced out on purpose — these are the ones far enough back that saying them again actually
-                  proves something.
-                </p>
-                <ul className="review-list">
-                  {due.map((moment) => (
-                    <li key={moment.id}>
-                      <div className="review-body">
-                        <p className="review-summary">{moment.summary}</p>
-                        {moment.keyPhrase ? (
-                          <p className="review-phrase">
-                            <strong>{moment.keyPhrase}</strong>
-                            {moment.keyPhraseMeaning ? <span> — {moment.keyPhraseMeaning}</span> : null}
-                          </p>
-                        ) : null}
-                        <MasteryLadder state={moment.ledgerState} />
-                        <p className="review-meta">
-                          {moment.dueAt && daysOverdue(moment.dueAt) > 0
-                            ? `due ${daysOverdue(moment.dueAt)} ${daysOverdue(moment.dueAt) === 1 ? "day" : "days"} ago`
-                            : "due today"}
-                        </p>
-                      </div>
-                      <button type="button" onClick={() => continueSession(moment)}>
-                        say it again
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-              </>
-            ) : (
-              <p className="page-body">
-                nothing due. things come back here a few days after you first got them — long enough that saying
-                it again means you actually kept it.
-              </p>
-            )}
           </section>
 
           {/*
@@ -338,111 +281,7 @@ export default function DashboardPage() {
             )}
           </section>
 
-          {/*
-            #51-54. A path made of conversations you could survive, not topics. Tapping a stage
-            explains it and launches nothing -- the point is seeing that the path is long, which
-            makes one bad session a step rather than a verdict.
-          */}
-          <section className="page-section" aria-label="The speaking journey">
-            <h2>where this goes</h2>
-            <p className="page-body home-section-note">
-              you move because something got beaten, not because you turned up. {journey.unaided}{" "}
-              {journey.unaided === 1 ? "sentence" : "sentences"} said with nothing on the screen so far.
-            </p>
-            <ol className="journey">
-              {journeyStages.map((stage, index) => {
-                const status = index < journey.index ? "done" : index === journey.index ? "current" : "ahead";
-                const crossed = journey.crossedAt[stage.key];
-                return (
-                  <li key={stage.key} className={`journey-stage is-${status}`}>
-                    <button type="button" aria-expanded={openStage === stage.key} onClick={() => setOpenStage(openStage === stage.key ? null : stage.key)}>
-                      <span className="journey-dot" aria-hidden="true" />
-                      <span className="journey-title">{stage.title}</span>
-                      <span className="journey-meta">
-                        {status === "done" && crossed
-                          ? formatSavedDate(crossed)
-                          : status === "current"
-                            ? focus
-                              ? focus.label
-                              : "here"
-                            : ""}
-                      </span>
-                    </button>
-                    {openStage === stage.key ? <p className="journey-meaning">{stage.meaning}</p> : null}
-                    {status === "current" && journey.toNext > 0 ? (
-                      <p className="journey-meaning is-progress">
-                        {journey.toNext} more unaided {journey.toNext === 1 ? "sentence" : "sentences"} and this
-                        one is behind you.
-                      </p>
-                    ) : null}
-                  </li>
-                );
-              })}
-            </ol>
-          </section>
-
-          <section className="page-section" aria-label="Your words">
-            <h2>your words</h2>
-            {words.length ? (
-              <>
-                <div className="word-filter" role="group" aria-label="filter words">
-                  {(["all", "new", "used"] as const).map((key) => (
-                    <button
-                      key={key}
-                      type="button"
-                      className={wordFilter === key ? "is-picked" : ""}
-                      onClick={() => setWordFilter(key)}
-                    >
-                      {key === "all"
-                        ? `all ${words.length}`
-                        : key === "new"
-                          ? `not used yet ${words.filter((word) => wordState(word) === "new").length}`
-                          : `used again ${words.filter((word) => wordState(word) === "used").length}`}
-                    </button>
-                  ))}
-                </div>
-                <ul className="word-grid">
-                  {filteredWords.map((word) => (
-                    <li key={word.id} className={wordState(word) === "used" ? "is-used" : ""}>
-                      <strong>{word.spanish}</strong>
-                      {word.meaning_en ? <small>{word.meaning_en}</small> : null}
-                      <span className="word-meta">
-                        {word.times_practiced > 0
-                          ? `used ${word.times_practiced}×`
-                          : formatSavedDate(word.created_at)}
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              </>
-            ) : (
-              <p className="page-note">nothing yet — finish a session and keep the words it hands you.</p>
-            )}
-          </section>
-
-          <section className="page-section" aria-label="Your sessions">
-            <h2>everything so far</h2>
-            {moments.length ? (
-              <ul className="session-list">
-                {moments.map((moment) => (
-                  <li key={moment.id}>
-                    <div>
-                      <p className="session-summary">{moment.summary}</p>
-                      {moment.naturalVersion ? <p className="session-line">{moment.naturalVersion}</p> : null}
-                      <p className="session-meta">
-                        {formatSavedDate(moment.createdAt)} · {masteryLabels[moment.ledgerState]}
-                      </p>
-                    </div>
-                    <button type="button" onClick={() => continueSession(moment)}>
-                      continue &rarr;
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <p className="page-note">no saved sessions yet.</p>
-            )}
-          </section>
+          <HomePanel variant="home" data={data} focusLabel={focus?.label ?? null} onContinue={continueSession} />
 
           {previewNote ? (
             <p className="page-note preview-note" role="status">
@@ -456,20 +295,5 @@ export default function DashboardPage() {
         </>
       ) : null}
     </main>
-  );
-}
-
-/** The ledger as five steps, so a moment shows how far it has actually come. */
-function MasteryLadder({ state }: { state: MomentCard["ledgerState"] }) {
-  const reached = masteryRank[state];
-  return (
-    <p className="mastery">
-      <span className="mastery-dots" aria-hidden="true">
-        {[0, 1, 2, 3, 4].map((step) => (
-          <span key={step} className={step <= reached ? "is-reached" : ""} />
-        ))}
-      </span>
-      <span className="mastery-label">{masteryLabels[state]}</span>
-    </p>
   );
 }

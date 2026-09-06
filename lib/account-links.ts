@@ -6,6 +6,13 @@
 
 export const resumeMomentKey = "outloud-resume-moment";
 
+/**
+ * Set by /dash when the orb is tapped with nothing to pick up. The room reads it on mount and
+ * goes straight into a session instead of showing the landing panel -- otherwise "tap the orb and
+ * talk" costs two taps and a screen that says the same thing again.
+ */
+export const autoStartKey = "outloud-autostart";
+
 export type ResumeMoment = {
   momentId: string;
   summary: string;
