@@ -40,8 +40,20 @@ export type ClosingRead = {
   delta: string;
   /** The thing that nearly landed -- named, so tomorrow has a subject. */
   almostThere: string;
-  /** Weekday this comes back, from the moment's real review date. */
-  comesBackOn: string;
+  /** Weekday this comes back, from the moment's real review date. Null when nothing will. */
+  comesBackOn: string | null;
+  /**
+   * What actually happens next, decided by the room because only the room knows whether anybody
+   * is signed in.
+   *
+   * This used to be one hardcoded sentence with a weekday in front of it. Signed in that is true
+   * -- `lib/phrase-recall.ts` really does bring a saved phrase back into a later scene. Signed out
+   * there is no mechanism at all: `word_bank.user_id` is `not null`, so nothing is ever saved to
+   * come back, and 1.1 proved the practice is stranded on the device. Naming a weekday to somebody
+   * for whom no weekday will ever arrive is the worst promise in the app, because it is made at
+   * the exact moment they are deciding whether this is worth returning to.
+   */
+  returnLine: string;
 };
 
 export default function HomePanel({
@@ -83,8 +95,8 @@ export default function HomePanel({
             <p>{closing.almostThere}</p>
           </article>
           <article className="return-hook">
-            <span>{closing.comesBackOn}</span>
-            <p>we&apos;ll bring this back in a new situation, with a little less help.</p>
+            {closing.comesBackOn ? <span>{closing.comesBackOn}</span> : null}
+            <p>{closing.returnLine}</p>
           </article>
         </div>
       ) : null}

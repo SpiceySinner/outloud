@@ -15,6 +15,7 @@
   "dependencies": {
     "@supabase/supabase-js": "2.110.7",
     "openai": "6.48.0",
+    "posthog-js": "^1.429.1",
     "react": "19.2.6",
     "react-dom": "19.2.6",
     "zod": "4.4.3"

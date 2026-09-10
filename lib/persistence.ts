@@ -43,6 +43,14 @@ export type MomentPayload = {
   ledgerState: string;
   createdAt: string;
   deepLinkMomentId: string | null;
+  /**
+   * Which planned event this run was one go at (#30), and absent for everything else.
+   *
+   * Optional rather than nullable-and-required so that `SavedMoment`, which predates events,
+   * still satisfies this shape -- making it required deepens an existing break in
+   * `app/api/retrieval/route.ts` instead of leaving it exactly as it was.
+   */
+  eventId?: string | null;
 };
 
 export type MomentRow = {
@@ -308,6 +316,7 @@ export function normalizeMomentPayload(value: unknown): MomentPayload {
     ledgerState: readString(value.ledgerState, 80) || "needed_full_help",
     createdAt: readOptionalString(value.createdAt, 80) ?? new Date().toISOString(),
     deepLinkMomentId: readOptionalString(value.deepLinkMomentId, 120),
+    eventId: readOptionalString(value.eventId, 120),
   };
 }
 

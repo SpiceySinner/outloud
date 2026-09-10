@@ -1,4 +1,5 @@
 import type { ChatMessage, DashboardData, MasteryState, MomentCard, WordCard } from "@/lib/dashboard-data";
+import type { EventBeat, StoredEvent } from "@/lib/event-schema";
 
 /**
  * A preview account for the home screen, so the design can be looked at without first living
@@ -274,3 +275,103 @@ export const mockChatReplies: Record<string, ChatMessage[]> = {
     },
   ],
 };
+
+/**
+ * A planned event for the preview account, so the newest half of the entry screen can be looked
+ * at without an account and a real dinner to dread.
+ *
+ * Built from a `today` handed in rather than read here: the dates have to line up with the ones
+ * the screen is deriving from, and a mock that quietly reads its own clock drifts out of the
+ * layout it is meant to be showing.
+ */
+export function mockEvent(todayIso: string, options: { past?: boolean } = {}): StoredEvent {
+  const day = (offset: number) => {
+    const date = new Date(`${todayIso}T12:00:00Z`);
+    date.setUTCDate(date.getUTCDate() + offset);
+    return date.toISOString().slice(0, 10);
+  };
+
+  const beats: EventBeat[] = [
+    {
+      index: 0,
+      titleEn: "arriving and greeting her parents",
+      situationEn: "You arrive for dinner and her mother opens the door.",
+      characterName: "Pilar",
+      characterRelation: "your girlfriend's mother",
+      characterTraitEn: "warm, and talks faster than you can follow",
+      targetCommunicativeFunction: "greet someone and say something about yourself",
+      dueOn: day(0),
+      momentId: "mock-moment-1",
+      completedAt: `${todayIso}T09:12:00.000Z`,
+    },
+    {
+      index: 1,
+      titleEn: "her mum asks what you do",
+      situationEn: "Halfway through dinner the conversation turns to your job.",
+      characterName: "Pilar",
+      characterRelation: "your girlfriend's mother",
+      characterTraitEn: "asks a follow-up before you have finished answering",
+      targetCommunicativeFunction: "explain what your work involves",
+      dueOn: day(1),
+      momentId: null,
+      completedAt: null,
+    },
+    {
+      index: 2,
+      titleEn: "saying goodbye at the door",
+      situationEn: "You are leaving and everyone comes to the door.",
+      characterName: "Andres",
+      characterRelation: "your girlfriend's father",
+      characterTraitEn: "keeps the conversation going on the doorstep",
+      targetCommunicativeFunction: "thank someone and close a conversation",
+      dueOn: day(3),
+      momentId: null,
+      completedAt: null,
+    },
+  ];
+
+  if (options.past) {
+    // The evening has been and gone and nobody has been asked about it yet: the one state on this
+    // screen that expires, and the only evidence the app ever gets about real life.
+    return {
+      id: "mock-event-past",
+      createdAt: `${day(-9)}T08:00:00.000Z`,
+      said: "dinner at my girlfriend's parents on friday, her mum talks really fast",
+      nameEn: "the dinner at her parents",
+      situationEn: "Dinner at his girlfriend's parents' house.",
+      whoEn: "his girlfriend's parents",
+      whenSaid: "friday",
+      happensOn: day(-2),
+      status: "running",
+      beats: beats.map((beat, index) => ({
+        ...beat,
+        dueOn: day(index - 6),
+        momentId: `mock-moment-${index + 1}`,
+        completedAt: `${day(index - 6)}T09:00:00.000Z`,
+      })),
+      rescue: null,
+      focusBlocker: null,
+      outcomeSaid: null,
+      outcomeAt: null,
+      outcomeSpoke: null,
+    };
+  }
+
+  return {
+    id: "mock-event",
+    createdAt: `${todayIso}T08:00:00.000Z`,
+    said: "dinner at my girlfriend's parents on friday, her mum talks really fast",
+    nameEn: "the dinner at her parents",
+    situationEn: "Dinner at his girlfriend's parents' house.",
+    whoEn: "his girlfriend's parents",
+    whenSaid: "friday",
+    happensOn: day(4),
+    status: "running",
+    beats,
+    rescue: null,
+    focusBlocker: null,
+    outcomeSaid: null,
+    outcomeAt: null,
+    outcomeSpoke: null,
+  };
+}

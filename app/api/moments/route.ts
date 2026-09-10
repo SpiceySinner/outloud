@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+import { z } from "zod";
+
 import { getSupabaseAdmin } from "@/lib/supabase-admin";
 import { checkRateLimit } from "@/lib/rate-limit";
 import {
@@ -16,6 +18,40 @@ import {
   upsertEmailSubscription,
   upsertRetrievalVariation,
 } from "@/lib/persistence";
+
+const uuid = z.string().uuid();
+
+/**
+ * How much unclaimed practice is sitting in this browser.
+ *
+ * The account ask is only worth making if it can point at something, and until now it could not:
+ * nothing on the client knows what earlier visits left behind, because reading practice goes
+ * through `getAuthedUser` and the whole point is that there is no account yet.
+ *
+ * A count and nothing else. No auth, for the same reason `/api/events` needs none -- the session
+ * id IS the credential, it is a v4 UUID, and what comes back here is strictly less than the full
+ * event rows that route already returns for one.
+ *
+ * Every failure answers zero. A number we cannot stand behind must never end up in a sentence
+ * telling somebody what they have done.
+ */
+export async function GET(request: Request) {
+  const supabase = getSupabaseAdmin();
+  if (!supabase) return NextResponse.json({ ok: true, count: 0 });
+
+  const sessionId = new URL(request.url).searchParams.get("sessionId");
+  if (!sessionId || !uuid.safeParse(sessionId).success) return NextResponse.json({ ok: true, count: 0 });
+
+  const { count, error } = await supabase
+    .from("moments")
+    .select("id", { count: "exact", head: true })
+    .eq("session_id", sessionId)
+    .is("user_id", null)
+    .is("deleted_at", null);
+
+  if (error) return NextResponse.json({ ok: true, count: 0 });
+  return NextResponse.json({ ok: true, count: count ?? 0 });
+}
 
 export async function POST(request: Request) {
   const limited = checkRateLimit(request, "moments", Number(process.env.MAX_MOMENT_SAVES_PER_DAY ?? 200), 24 * 60 * 60 * 1000);
@@ -130,6 +166,10 @@ export async function POST(request: Request) {
     retrieval_sent_at: null,
     review_opened_at: null,
     deep_link_moment_id: moment.deepLinkMomentId,
+    // Only present when this run really was one go at a planned event. Sending the key
+    // unconditionally would make every save depend on the events migration having been applied,
+    // and a schema change for a new feature must not be able to break saving for everyone else.
+    ...(moment.eventId ? { event_id: moment.eventId } : {}),
   });
   if (momentUpsert.error) {
     return NextResponse.json({ error: supabaseErrorMessage(momentUpsert.error, "Could not save practice") }, { status: 502 });

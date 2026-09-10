@@ -1,4 +1,5 @@
 import type { AssistanceUsed, AttemptEvaluation, RescueRequest, RescueResponse, RetrievalVariation, VoiceAttempt } from "@/lib/types";
+import type { EventPlanResponse } from "@/lib/event-schema";
 import { buildFreezeSignals } from "@/lib/freeze";
 import { blockerHypothesisMap } from "@/lib/teaching-policy";
 
@@ -371,5 +372,57 @@ export function buildMockRetrievalVariation(rescue: RescueResponse): RetrievalVa
     changedElements: ["person", "object"],
     expectedMeaningPoints: ["say the food item was good", "use a natural compliment"],
     difficultyReason: "It changes the object and person while keeping the same compliment pattern.",
+  };
+}
+
+/**
+ * A fixed dinner, so the harness can exercise the whole event path without spending a request.
+ *
+ * The date is deliberately NOT resolved here. The mock has no business pretending it parsed
+ * "friday" -- and the undated path is the one worth having a free way to test, because it is the
+ * one a real learner reaches by saying something vague.
+ */
+export function buildMockEventPlan(input: { situationEn: string }): EventPlanResponse {
+  const beats = [
+    {
+      titleEn: "walking in and saying hello",
+      situationEn: `Arriving at ${input.situationEn}. Somebody opens the door and greets you.`,
+      characterName: "Elena",
+      characterRelation: "the host",
+      characterTraitEn: "warm, but talks quickly and expects an answer",
+      targetCommunicativeFunction: "greet someone and say something about yourself",
+    },
+    {
+      titleEn: "the bit at the table",
+      situationEn: `Sitting down at ${input.situationEn}. The conversation is going and it turns to you.`,
+      characterName: "Marco",
+      characterRelation: "someone at the table",
+      characterTraitEn: "asks follow-up questions without waiting",
+      targetCommunicativeFunction: "answer a question about your life and keep it going",
+    },
+    {
+      titleEn: "the question you are dreading",
+      situationEn: `The moment in ${input.situationEn} you are actually worried about.`,
+      characterName: "Elena",
+      characterRelation: "the host",
+      characterTraitEn: "friendly, and does not let a half-answer pass",
+      targetCommunicativeFunction: "explain something about yourself under a little pressure",
+    },
+    {
+      titleEn: "getting out of there",
+      situationEn: `Leaving ${input.situationEn}: saying thank you and goodbye.`,
+      characterName: "Marco",
+      characterRelation: "someone at the table",
+      characterTraitEn: "keeps the conversation going at the door",
+      targetCommunicativeFunction: "thank someone and close a conversation",
+    },
+  ];
+
+  return {
+    nameEn: "the mock dinner",
+    happensOn: null,
+    dateFromWords: null,
+    beats,
+    hardestBeat: 2,
   };
 }

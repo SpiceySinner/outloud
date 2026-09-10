@@ -341,33 +341,214 @@ through as an answer.
 ### ☐ 4.0 /dash on your own phone
 
 Open `/dash` on the phone you actually use. **While this screen is being built it always shows an
-invented account** -- twelve sessions that never happened -- so the layout can be judged without a
+invented account** — twelve sessions that never happened — so the layout can be judged without a
 month of practice behind it. The dashed `preview` badge in the corner says so and taps through to
 your real one.
 
-**Expect:** everything fits. One bar at the top, the orb, one line at the bottom.
+**Expect:** everything fits. Two lines of header, the orb, one card at the bottom, the account
+button bottom-left.
 
-> **Report immediately** if you can scroll at all, or if the bottom line is cut off or missing.
-> The layout is measured on four screen sizes but yours is the one that counts.
+> **Report immediately** if you can scroll at all, or if the card is cut off or missing. The layout
+> is measured on four screen sizes but yours is the one that counts.
 
 Try to scroll anyway, hard, in both directions. **Expect** nothing to move.
 
-Now tap the orb. **Expect** the bar and the bottom line to get out of the way, the orb to change
-shape, and then to land **inside** a session -- not on the "start talking." screen. **Report** if
-you see the landing screen: that is two taps for something that should be one.
+### ☐ 4.0b The orb is a microphone now
 
-The orb is real even while the data is invented, because starting a fresh conversation carries
-nothing invented into it.
+This is the block that matters most in this round, and none of it can be automated — the test
+harness aborts the realtime token, so everything below has only ever run by hand.
 
-Now tap the **bar** at the top instead. **Expect** the collapse to play and then to come back to
-`/dash`. That one is deliberately inert while the data is invented -- it would otherwise put
-practice that never happened into your real account.
+Tap the orb once. **Expect,** in order:
 
-> **Report immediately** if tapping the bar ever lands you in a session about "me he perdido" or
-> anything else from the invented account.
+1. *"one moment — waking the mic."* and the permission prompt, **once**.
+2. *"listening…"*
+3. You stop talking, and it ends the turn **on its own** — no second tap.
+4. A short line in **your** words, held for about a second and a half — **and said
+   out loud.**
+
+> **Report immediately** if the read-back repeats your sentence word for word. It is supposed to
+> compress: *"dinner at my girlfriend's parents on friday, her mum talks really fast"* should come
+> back as something like *"friday. her parents. her mum talks fast."* A word-for-word echo proves
+> it transcribed you, not that it understood you, and that is the whole point of the beat.
+
+> **Report immediately** if anything starts happening **before** you have read that line, or if
+> something starts that you did not ask for.
+
+**The part that can only fail on real hardware.** Say something shapeless so it lands on *"I
+didn't catch what you want to do."* It says that out loud, and **then** reopens the microphone.
+
+> **Report immediately** if the microphone opens while it is still talking, or if it answers its
+> own voice and starts a turn you did not begin. That is the echo failure, and it is the one
+> thing this change could genuinely break.
+
+Same shape for *"take your time."*: say *"uhh…"* and stop. It should say the line, **finish**
+saying it, and only then start listening again.
+
+Tap the orb **while it is talking**. **Expect** the line to stop dead and listening to start.
+
+The idle timeout (*"still there?"*) is deliberately **silent** — nobody said anything to
+answer. **Report** if that one talks.
+
+Now say each of these and check what comes back:
+
+| say | expect |
+|---|---|
+| *"let's do that one"* | it names the phrase it is resuming, then drops you into that conversation |
+| *"dinner at my girlfriend's parents on friday"* | *"…I can't build that one yet. / I've kept it — it's the first thing when I can."* |
+| *"how do I say I'll take care of it"* | the same honest refusal. `talk` is not built either. |
+| *"uhh…"* and then stop | *"take your time."* and the microphone stays open |
+| mumble something shapeless | *"I didn't catch what you want to do."* and the microphone stays open |
+
+> **Report immediately** if any sentence lands you in the normal intake ("before we start — what
+> usually trips you up…"). Being asked a question you have just answered is exactly the failure
+> this screen was built to remove.
+
+**Expect** the whole thing to ask for microphone permission **once**, not twice — including on the
+run that resumes and takes you into the room. **Report** a second prompt: the session is supposed
+to survive that hand-off.
+
+**Expect** the card at the bottom to still work by tap. In preview it is deliberately inert —
+**report immediately** if tapping it ever lands you in a session about "me he perdido" or anything
+else from the invented account.
+
+Deny microphone permission and reload. **Expect** *"I can't reach the microphone here. / the card
+below still works."* and a bottom band that still offers you something. **Report** a dead screen.
 
 Rotate the phone, or open it with the keyboard up. **Expect** it to still fit or to fail
 gracefully, never to hide the bottom.
+
+### ☐ 4.0c A real evening you are dreading (#30)
+
+**This needs `supabase/202609070001_events.sql` applied first.** Without it, creating an event
+stops at *"I couldn't save that one."* — which is the honest failure, not the feature.
+
+On `/dash?preview=0`, tap the orb and name something real with a day in it: *"dinner at my
+girlfriend's parents on friday"*, *"I have to call the landlord tomorrow"*.
+
+**Expect** the read-back, then a line naming it back to you with how many goes there are before the
+day — *"the dinner at her parents — 4 goes before friday."* **Report** any date that is not the one
+you meant. That is the failure that matters most here: a wrong date sends you to rehearse for the
+wrong night and you only find out afterwards.
+
+Now the same thing **without** a day: *"I'm meeting her parents sometime soon."*
+
+> **Expect** it to ask *"when is it?"* exactly once, out loud, with the microphone reopening after
+> the line has finished. Answer *"I don't know yet."* **Expect** it to plan anyway and say so —
+> and **report immediately** if it asks a second time. Somebody who says they don't know has
+> answered.
+
+Start it **by voice**: *"let's start with the first one"*, or name a later one, *"let's do the
+second one"*. **Expect** the read-back to name the go you actually asked for. **Report** being
+taken to a different one than you named — that is the one mistake here that costs a whole session.
+
+Tapping the card does the same thing.
+
+**Expect** the room to open straight into the scene, with the person named on the card, talking
+about the evening **in the future** — nothing that has already gone wrong, because nothing has
+happened yet. **Report** any line that treats the dinner as something you already failed at.
+
+> **Report immediately** if it asks you to choose between two situations before you can start.
+> You already told it what you are practising; offering you something else instead is the failure
+> this whole screen exists to prevent.
+
+Play that go to the end. Come back to `/dash`. **Expect** the card to have moved on to the next
+part of the evening, and the counter to read *"go 2 of 4"*. **Report** being offered the same one
+again.
+
+Start go 2. **Expect** it to go straight into the scene — no second getting-to-know-you. That is
+the whole point of the first go producing the rescue.
+
+### ☐ 4.0d How did it go?
+
+Only reachable once an event's date has passed. **Expect** the header to ask, above everything
+else on the screen: *"the dinner at her parents has been and gone. how did it go?"*
+
+Answer at the orb, however you like. **Expect** it to be taken as the answer rather than routed as
+a new request, then one closed question with two buttons: *"did you get to say any of it?"*
+
+**Report** if answering *"not really"* is treated as anything less useful than the other one. It is
+the more useful answer of the two — it is the one that says the practice never reached the room it
+was for.
+
+### ☐ 4.0e A question, at the orb
+
+Say, at the orb: *"how do I say I'll take care of it"*.
+
+**Expect** the read-back to compress it (*"how to say you'll handle it."*), then **the room** —
+not a sheet on `/dash` — showing your question at the top and **all** the options with a line each
+saying when you'd use it. Then: *"now say it."*
+
+**Report** if only one option comes back, or if any of them has no "use this when…" line. Choosing
+between them is the point; a single option is a dictionary with extra steps.
+
+Say one of them out loud. **Expect** the microphone to be listening in **Spanish** — if what comes
+back is your Spanish mangled into English words, the transcriber was pinned to the wrong language
+and that is the bug here.
+
+**Expect** then: the natural version, one line of what landed, and one offer — *use it for real* —
+plus *that's all I needed* as a real way out. **Report** if leaving is not offered. Somebody who
+wanted the words and nothing else has to be able to go.
+
+Take the offer. **Expect** a scene where you actually have to say it, with a person in it.
+**Report immediately** if the character says the phrase to you. That destroys the whole point.
+
+Then open `/dashboard`. **Expect** the phrase to be in your words. *(Signed out it will not be —
+that half needs an account, and it needs `supabase/202609070002_phrase_recall.sql` to have been
+applied.)*
+
+### ☐ 4.0f Try to confuse the router
+
+Four sentences, one at a time. What matters is which of them go where:
+
+| say this | expect |
+|---|---|
+| *"I never know what to say when someone asks how I am"* | the phrase screen — there is no "how do I say" in it and it is still a question |
+| *"the woman at the bakery asked me something and I couldn't work out how to say I was just looking"* | the **room, in the past tense** — it contains "how to say" and is a moment |
+| *"I couldn't say I'll take care of it at the pharmacy today"* | the **room** — it is both, and the moment wins |
+| *"can we just talk for a bit"* | *"open chat isn't a thing I do. give me a real situation, or something you couldn't say."* |
+
+**Report** any of the first three landing on the wrong one. And **report** if the last one says
+*"I've kept it — it's the first thing when I can"*: that is a promise we have decided never to
+keep, and it must not be on screen.
+
+### ☐ 4.0g The moment that already happened
+
+Say: *"I froze at the pharmacy today and just switched to english"*.
+
+**Expect** the room to open **straight into the scene** — a named person, the pharmacy, in the
+**past** — and to invite you to say what you couldn't.
+
+> **Report immediately** if it asks you to choose between two situations first. You just told it
+> where you froze; offering you "or telling someone about your job" instead is the failure this
+> whole screen exists to prevent.
+
+Then, separately, tap into the room from the landing panel and answer *"I just froze, I don't
+know"* to *"tell me what happened"*. **Expect** the two-way choice to appear **here**. That is the
+difference: it shows up when you have not named a situation, and stays away when you have.
+
+### ☐ 4.0h The phrase that comes back
+
+**This one needs an account and a day's gap**, and it is the point of everything above.
+
+Ask for a phrase (4.0e) and finish. Come back the next day and play any ordinary session — not an
+event go, those are deliberately excluded.
+
+**Expect,** somewhere in it, a moment where that phrase is exactly what is needed. It may take a
+couple of sessions: it deliberately does **not** fire every time.
+
+**Expect nothing to be said about it beforehand.** **Report immediately** if any screen mentions
+that you asked about it, or if the character says it, or if the help ladder offers it before you
+have tried. Any of those and the thing being built is gone.
+
+Say it, unaided. **Expect** the coach to tell you afterwards — *"that's the one you asked me about
+on tuesday — and you just reached for it."* **Report** if the day named is wrong. Being off by one
+turns the whole line into evidence that we do not actually remember.
+
+**Expect** it never to come back after that.
+
+*If you want to force it rather than wait: set that row's `due_at` to a time in the past in
+Supabase. The 20-hour gap after `created_at` is separate and deliberate — a phrase must never come
+back the same evening it was asked for.*
 
 ### ☐ 4.1 The end of a session
 

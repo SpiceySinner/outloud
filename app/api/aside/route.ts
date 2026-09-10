@@ -56,8 +56,17 @@ const requestSchema = z.object({
     )
     .max(3)
     .optional(),
-  /** Who decided to step out. Changes how the coach opens; see `asideTurnGuidance`. */
-  trigger: z.enum(["learner", "offered"]).optional().default("learner"),
+  /** Who decided to step out, and why. Changes how the coach opens; see `asideTurnGuidance`. */
+  trigger: z.enum(["learner", "offered", "stuck"]).optional().default("learner"),
+  /**
+   * Only for `trigger: "stuck"`: the English sentence they said in the scene, verbatim.
+   *
+   * This is what makes the difference between a coach and another questioner. "learner" means
+   * somebody walked out and we do not know why, so the honest opening is to ask. "stuck" means
+   * they told us on the way out -- and opening with "what's on your mind?" when they have just
+   * said what is on their mind is the exact failure this whole detour exists to fix.
+   */
+  stuckSaid: z.string().max(800).optional().nullable(),
   /**
    * Where they stepped out FROM. Decides which offers exist -- there is no scene to replace
    * during the intake, and nothing to start over once a session is running. Defaults to "session"
@@ -93,7 +102,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Stepping out needs the scene you left." }, { status: 400 });
   }
 
-  const { scene, focus, recentTurns, trigger, exchange, stage } = parsed.data;
+  const { scene, focus, recentTurns, trigger, exchange, stage, stuckSaid } = parsed.data;
   // The coach's turn number is how many times it has already spoken, so the client cannot claim a
   // later turn -- and its more decisive guidance -- than the conversation has actually reached.
   const turnIndex = Math.min(exchange.filter((entry) => entry.who === "coach").length, MAX_TURN_INDEX);
@@ -109,6 +118,7 @@ export async function POST(request: Request) {
       focus: focus ?? { current: null, stated: null, observed: null },
       recentTurns: recentTurns ?? [],
       trigger,
+      stuckSaid: stuckSaid ?? null,
       stage,
       exchange,
       turnIndex,
@@ -125,7 +135,8 @@ type AsideInput = {
   scene: z.infer<typeof requestSchema>["scene"];
   focus: { current: string | null; stated: string | null; observed: string | null };
   recentTurns: Array<{ characterLineEs: string; userAttempt: string; meaning: string }>;
-  trigger: "learner" | "offered";
+  trigger: "learner" | "offered" | "stuck";
+  stuckSaid: string | null;
   stage: AsideStage;
   exchange: Array<{ who: "coach" | "you"; text: string }>;
   turnIndex: number;
@@ -140,7 +151,37 @@ type AsideInput = {
  * therapy session, and the learner never gets back to speaking Spanish. The budget forces the
  * shape: hear it, narrow it once, say it back, offer one move.
  */
-function asideTurnGuidance(turnIndex: number, trigger: "learner" | "offered") {
+function asideTurnGuidance(
+  turnIndex: number,
+  trigger: "learner" | "offered" | "stuck",
+  stuckSaid: string | null,
+) {
+  if (turnIndex === 0 && trigger === "stuck") {
+    /*
+     * They did not wander out of the scene. They said, in English, that they did not have the
+     * words -- and the room brought them here because of that sentence. Opening with a question
+     * would repeat, one layer up, the exact thing this detour was built to stop: somebody asks for
+     * words and is handed another question.
+     *
+     * So this turn teaches first and asks second. The offer at the end is what makes it a detour
+     * rather than a lesson: they came here mid-scene and the point is to go back able to say it.
+     */
+    return (
+      "They did NOT walk out for an unknown reason -- they stepped out because they said this, in " +
+      `English, in the middle of the scene: ${JSON.stringify(stuckSaid ?? "(they said they did not know how to say it)")}. ` +
+      "You already know why you are here, so do NOT ask what is on their mind and do NOT ask them " +
+      "to explain it again. Give them the Spanish for the thing THEY named -- the thing in that " +
+      "sentence, not the topic of the scene they were in -- in one short line they could actually " +
+      "say out loud, with the English underneath it. " +
+      "IF THAT SENTENCE NAMES NOTHING -- \"I have no idea how to say that\", where \"that\" points " +
+      "at something -- the thing they could not say is THE ANSWER TO THE CHARACTER'S LAST LINE, " +
+      "which you have in sceneTheyLeft and recentPracticeTurns. Look it up and help with that. " +
+      "Find the referent; never invent one, and never ask them to repeat what they already said. " +
+      "Only if even the scene leaves it genuinely ambiguous, ask ONE narrow question about what " +
+      "they wanted to say -- never a broad one about how they are feeling. " +
+      "Then offer to go back and use it. intent=reframe, done=false."
+    );
+  }
   if (turnIndex === 0) {
     return trigger === "offered"
       ? "This is your opening line and the learner has not spoken yet -- the room offered to step out because their last couple of replies did not land, and they took it. Do NOT assume you know why. Say in one sentence that you noticed it was not going smoothly, and ask what is actually going on. intent=probe, offer=null, done=false."
@@ -267,13 +308,14 @@ async function generateAsideTurn(input: AsideInput): Promise<AsideResponse> {
         content: JSON.stringify({
           turnIndex: input.turnIndex,
           whyTheySteppedOut: input.trigger,
+          whatTheySaidOnTheWayOut: input.stuckSaid,
           stage: input.stage,
           sceneTheyLeft: input.scene,
           sessionFocus: input.focus,
           recentPracticeTurns: input.recentTurns,
           asideSoFar: input.exchange,
           lastLearnerMessage: input.lastLearnerMessage,
-          turnGuidance: asideTurnGuidance(input.turnIndex, input.trigger),
+          turnGuidance: asideTurnGuidance(input.turnIndex, input.trigger, input.stuckSaid),
         }),
       },
     ],
@@ -371,10 +413,12 @@ function mockAsideTurn(input: AsideInput): AsideResponse {
     return {
       turnIndex: 0,
       sayEn:
-        input.trigger === "offered"
-          ? "that wasn't landing, was it. what's actually going on?"
-          : "okay, we're out of the scene. what's on your mind?",
-      intent: "probe",
+        input.trigger === "stuck"
+          ? 'the phrase you wanted is "me encargo de eso" — I\'ll take care of it. want to go back and use it?'
+          : input.trigger === "offered"
+            ? "that wasn't landing, was it. what's actually going on?"
+            : "okay, we're out of the scene. what's on your mind?",
+      intent: input.trigger === "stuck" ? "reframe" : "probe",
       offer: null,
       done: false,
     };

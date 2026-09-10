@@ -14,6 +14,8 @@ import {
   teachingRationaleFor,
 } from "@/lib/teaching-policy";
 import { blockerFocusLabels, normalizeObservedBlocker } from "@/lib/blocker-taxonomy";
+import { defaultConversationContext } from "@/lib/character-voice";
+import { containsPhrase, pickForScene, type RecallPhrase } from "@/lib/phrase-recall";
 import type {
   AssistanceUsed,
   AttemptEvaluation,
@@ -23,16 +25,64 @@ import type {
   SelfReportedBlocker,
 } from "@/lib/types";
 import { openingPrompt, staticAudioForText } from "@/lib/static-lines";
+import {
+  classifyCapture,
+  looksBrokenAttempt,
+  looksLikeDecodeLoop,
+  mediaRecorderTypes,
+  micConstraints,
+} from "@/lib/voice-guards";
+import {
+  voice,
+  type RealtimeServerEvent,
+  type RealtimeSpeechMode,
+} from "@/lib/voice-session";
 import type { CoachResponse } from "@/lib/coach-schema";
 import type { AsideResponse } from "@/lib/aside-schema";
 import Link from "next/link";
 import { getSupabaseBrowser } from "@/lib/supabase-browser";
-import { autoStartKey, resumeMomentKey, type ResumeMoment } from "@/lib/account-links";
+import {
+  autoStartKey,
+  eventBeatKey,
+  resumeMomentKey,
+  askPhraseKey,
+  stungKey,
+  type AskPhraseHandoff,
+  type StungHandoff,
+  type EventBeatHandoff,
+  type ResumeMoment,
+} from "@/lib/account-links";
+import { initTracking, track } from "@/lib/track";
+import { loadEvent, patchEvent } from "@/lib/event-client";
+import type { EventBeat, StoredEvent } from "@/lib/event-schema";
 import type { TranscriptionConfidenceTier } from "@/lib/transcription-confidence";
+import { needsWordsEn, strippedAsk } from "@/lib/stuck-signal";
 
-type RoomMode = "landing" | "speaks-first" | "stung";
+/**
+ * Where the learner came into the room from.
+ *
+ * `stung` and `upcoming` both mean "a real situation of theirs", and the difference between them
+ * is TENSE. A sting already happened and they are still holding it; an upcoming event has not
+ * happened at all. Five prompts downstream describe where the learner came from, and running an
+ * event through the stung wording tells every one of them the learner has already failed at a
+ * dinner they have not been to yet.
+ */
+/**
+ * `ask` is an ENTRY mode, not a phase: it only changes the opening question, and `runAskPhrase`
+ * sets the mode back to `speaks-first` the moment the answer arrives. It exists because the
+ * landing button says "didn't know how to say something?" and used to run the `stung` engine --
+ * which asks "tell me what happened" and answers a stated sentence with a choice of scenarios,
+ * never with the sentence.
+ */
+type RoomMode = "landing" | "speaks-first" | "stung" | "upcoming" | "ask";
 type TurnState = "ready" | "listening" | "still-listening" | "thinking" | "speaking";
-type FlowPhase = "opening" | "coach" | "verdict" | "session";
+/**
+ * `ask` is a phase and not an overlay on purpose. The ask chip inside a scene renders its answer
+ * in a sheet, and sheets close the microphone -- the same fact that made the aside a room mode.
+ * The whole point of this phase is the two seconds where the learner says the phrase out loud, so
+ * it has to live where the mic can be open.
+ */
+type FlowPhase = "opening" | "ask" | "coach" | "verdict" | "session";
 type PrimaryCard = "verdict" | "after" | "profile";
 type SupportSheet =
   | "feedback"
@@ -122,46 +172,6 @@ type FeedbackQuestion = {
   placeholder: string;
 };
 
-type RealtimeSpeechMode = "intake" | "conversation";
-
-type RealtimeTokenResponse = {
-  ok: true;
-  value: string;
-  model: string;
-  /** Restated on every language switch; a partial `transcription` object would drop the model. */
-  transcribeModel?: string;
-  voice: string;
-  expiresAt: string | null;
-};
-
-type RealtimeServerEvent = {
-  type?: string;
-  delta?: string;
-  transcript?: string;
-  item?: {
-    content?: Array<{
-      transcript?: string;
-      text?: string;
-    }>;
-  };
-  response?: {
-    status?: string;
-  };
-  error?: {
-    code?: string;
-    message?: string;
-  };
-};
-
-// Realtime errors that are expected side effects of the turn choreography rather than real
-// failures: committing an already-VAD-committed (empty) buffer, or cancelling a response that
-// has already finished by the time the interrupt tap lands.
-const ignorableRealtimeErrorCodes = new Set([
-  "input_audio_buffer_commit_empty",
-  "input_audio_buffer_commit_too_small",
-  "response_cancel_not_active",
-]);
-
 // How long the orb waits after the coach finishes before it stops listening on its own.
 const autoListenIdleMs = 10000;
 /**
@@ -200,12 +210,6 @@ type RetryTarget = {
   attempts: number;
 };
 
-const defaultConversationContext = {
-  who: "an OutLoud Spanish coach",
-  dialect: "Latin America",
-  tone: "warm",
-};
-
 const emptyFreezeSignals: FreezeSignals = {
   timeToFirstWordSeconds: null,
   hesitationCount: 0,
@@ -221,9 +225,11 @@ function buildPlacementText(openingAnswer: string, attempts: PlacementAttempt[],
     .map((attempt) => `Coach: "${attempt.characterLineEs}" -> learner: "${attempt.userAttempt}"`)
     .join(" | ");
   const header =
-    mode === "stung"
-      ? `The learner's real situation, in their own words: "${openingAnswer}".`
-      : `The learner's self-described problem, in their own words: "${openingAnswer}".`;
+    mode === "upcoming"
+      ? `The situation the learner is preparing for, in their own words: "${openingAnswer}".`
+      : mode === "stung"
+        ? `The learner's real situation, in their own words: "${openingAnswer}".`
+        : `The learner's self-described problem, in their own words: "${openingAnswer}".`;
 
   return `${header}${scenario} Transcript of the first coached conversation: ${transcript}`;
 }
@@ -231,84 +237,6 @@ function buildPlacementText(openingAnswer: string, attempts: PlacementAttempt[],
 function clipForApi(value: string, max = 1500) {
   const trimmed = value.trim();
   return trimmed.length > max ? `${trimmed.slice(0, max - 1)}…` : trimmed;
-}
-
-// A spoken attempt that visibly broke: trailing off, or English leaking into the Spanish.
-/**
- * Sounds a person makes while still deciding what to say.
- *
- * Deliberately narrow. "eh" and "este" are also real Spanish words and "well" and "like" are real
- * English ones. "mm", "mmm" and "mhm" are left out for a sharper reason: as a whole utterance they
- * usually mean YES, and a learner answering a yes/no question with one has answered it. Swallowing
- * that as hesitation would silently discard a correct reply -- the exact failure the short-answer
- * rule exists to prevent. "ah" is a reaction, not a stall.
- */
-const fillerSounds = new Set([
-  "um", "umm", "uhm", "uh", "uhh", "er", "err", "erm", "ehm", "emm", "em",
-  "hm", "hmm", "hmmm", "ähm", "äh", "öhm",
-]);
-
-/**
- * True when the capture contains nothing but hesitation.
- *
- * Server VAD ends a turn on silence, and a learner who says "um..." and then thinks has produced
- * exactly that: a complete turn, by the microphone's definition, containing no answer. Sending it
- * on gets it flagged as a broken attempt and puts a confirm box in front of someone who was still
- * working out how to start -- asking them to correct a transcript that was perfectly accurate.
- */
-function isFillerOnly(attempt: string) {
-  const words = attempt
-    .toLowerCase()
-    // Punctuation only: the ellipsis a hesitation transcribes as, and the commas between two of
-    // them. Letters and digits survive, so anything with real content fails this test.
-    .replace(/[.,!?¿¡…"'`\-—–]/g, " ")
-    .split(/\s+/)
-    .filter(Boolean);
-  return words.length > 0 && words.every((word) => fillerSounds.has(word));
-}
-
-/**
- * A transcript that is a decoder stuck in a loop rather than anything a person said.
- *
- * Whisper-family models repeat when handed a truncated or content-poor clip -- the same short
- * phrase over and over until the token budget runs out. Observed live as "Oh god" roughly twenty
- * times, produced after server VAD cut the learner off mid-sentence.
- *
- * It slipped through every existing gate: not empty, VAD had seen speech, not filler, and it
- * contains none of the words `looksBrokenAttempt` looks for -- so it was submitted without even a
- * confirm box, scored, stored, and then shown back on the closing card as the learner's own
- * words. Being quoted saying something you never said is worse than any missed turn.
- *
- * Non-overlapping windows so a genuinely repeated unit is what triggers this, not an unlucky
- * n-gram: a unit has to repeat at least four times AND cover most of the transcript.
- */
-function looksLikeDecodeLoop(attempt: string) {
-  const words = attempt
-    .toLowerCase()
-    .replace(/[.,!?¿¡…"'`\-—–]/g, " ")
-    .split(/\s+/)
-    .filter(Boolean);
-  // Short repetition is human: "sí, sí, sí" and a stutter both live down here.
-  if (words.length < 8) return false;
-
-  for (let size = 1; size <= 4; size += 1) {
-    const counts = new Map<string, number>();
-    for (let i = 0; i + size <= words.length; i += size) {
-      const unit = words.slice(i, i + size).join(" ");
-      counts.set(unit, (counts.get(unit) ?? 0) + 1);
-    }
-    for (const seen of counts.values()) {
-      if (seen >= 4 && (seen * size) / words.length >= 0.6) return true;
-    }
-  }
-  return false;
-}
-
-function looksBrokenAttempt(attempt: string) {
-  return (
-    attempt.includes("...") ||
-    /\b(uh|um|ehm|how do you say|the|and|you|want|is|was|do|don't|know)\b/i.test(attempt)
-  );
 }
 
 /** Never let a logging call throw on a circular or exotic value. */
@@ -343,25 +271,6 @@ function makeId() {
     ? crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
-
-const mediaRecorderTypes = [
-  "audio/webm;codecs=opus",
-  "audio/webm",
-  "audio/mp4",
-  "audio/aac",
-];
-
-// Shared by both capture paths so they can't drift: echo cancellation is what stops an open mic
-// from hearing the coach through the speaker, and the recorder fallback needs it just as much as
-// the realtime path does.
-const micConstraints: MediaStreamConstraints = {
-  audio: {
-    echoCancellation: true,
-    noiseSuppression: true,
-    autoGainControl: true,
-    channelCount: 1,
-  },
-};
 
 const feedbackQuestions: FeedbackQuestion[] = [
   {
@@ -580,6 +489,9 @@ function AuthDialog({
         if (authError) throw authError;
         // Words are saved via email either way; a pending confirmation should not lose them.
         onAuthed(email);
+        // Before the branch, not inside it: an account exists either way, and counting only the
+        // confirmation-pending half would quietly undercount every signup that logs straight in.
+        track("account_created", { unclaimedRuns: 0 });
         if (!data.session) {
           setNotice("account created — check your inbox to confirm. your words are already saved.");
           return;
@@ -699,29 +611,13 @@ export default function Home() {
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
   const recordingStartedAtRef = useRef(0);
-  const realtimePeerRef = useRef<RTCPeerConnection | null>(null);
-  const realtimeChannelRef = useRef<RTCDataChannel | null>(null);
-  const realtimeStreamRef = useRef<MediaStream | null>(null);
-  const realtimeAudioRef = useRef<HTMLAudioElement | null>(null);
   const staticAudioRef = useRef<HTMLAudioElement | null>(null);
   const staticAudioResolveRef = useRef<((played: boolean) => void) | null>(null);
-  const realtimeConnectPromiseRef = useRef<Promise<boolean> | null>(null);
-  const realtimeModeRef = useRef<RealtimeSpeechMode | null>(null);
-  const realtimeActiveCaptureRef = useRef(false);
-  const realtimeTranscriptRef = useRef("");
-  const realtimeTranscriptFinalRef = useRef(false);
-  const realtimeCaptureResolveRef = useRef<((value: string) => void) | null>(null);
-  const realtimeCaptureTimerRef = useRef<number | null>(null);
-  const realtimeSpeakingResolveRef = useRef<(() => void) | null>(null);
-  const realtimeSpeakingTimerRef = useRef<number | null>(null);
-  const realtimeSpeakingStartedAtRef = useRef(0);
-  const realtimeFallbackRef = useRef(false);
-  const realtimeSpeechActiveRef = useRef(false);
-  const realtimeSpeechSeenRef = useRef(false);
+  // The connection, the microphone, a capture and the playback lifecycle all live in
+  // `lib/voice-session.ts`. What stays here is policy: WHICH lines the learner may talk over, and
+  // what happens when they do. The session has no opinion about that and should not.
   const realtimeInterruptibleRef = useRef(false);
   const realtimeInterruptedRef = useRef(false);
-  const realtimeResponseDoneRef = useRef(false);
-  const realtimeOutputAudioActiveRef = useRef(false);
   const overlayRef = useRef<RoomOverlay>(null);
   const typedFallbackOpenRef = useRef(false);
   // Read from realtime event handlers, which can fire inside the render the state changed in.
@@ -729,16 +625,6 @@ export default function Home() {
   const coachPhaseRef = useRef<CoachResponse["phase"] | null>(null);
   const pressStartedAtRef = useRef(0);
   const pressKindRef = useRef<"start" | "finish" | "interrupt" | null>(null);
-  /**
-   * What the microphone is doing right now. Replaces the scattered track.enabled flipping with one
-   * derived value, because full-duplex adds a third state between "off" and "recording":
-   *
-   * - `closed`    -- track disabled. Nothing reaches the server.
-   * - `armed`     -- track live but no turn is in progress. Speaking starts one. Runs the stricter
-   *                  `guard` VAD profile so room noise doesn't open a turn nobody asked for.
-   * - `capturing` -- a turn is in progress and being transcribed.
-   */
-  const micWindowRef = useRef<"closed" | "armed" | "capturing">("closed");
   const micModeRef = useRef<"open" | "push">("open");
   /**
    * Mirror of the `micAsleep` state, for the derivation and event handlers that run outside render.
@@ -770,6 +656,13 @@ export default function Home() {
   const restoreVerdictAfterAuthRef = useRef<(email: string) => void>(() => undefined);
   /** Same reason as the two above: /dash's hand-off effect runs before `enterRoom` is declared. */
   const enterRoomRef = useRef<(mode: RoomMode) => void>(() => undefined);
+  /**
+   * Same reason as `enterRoomRef`: the hand-off effect runs once on mount and must not close over
+   * the first render's version of a function that reads a dozen pieces of state.
+   */
+  const runEventBeatRef = useRef<(event: StoredEvent, beatIndex: number) => Promise<void>>(async () => undefined);
+  const runStungIntakeRef = useRef<(handoff: StungHandoff) => Promise<void>>(async () => undefined);
+  const runAskPhraseRef = useRef<(handoff: AskPhraseHandoff) => Promise<void>>(async () => undefined);
   const [typedFallbackOpen, setTypedFallbackOpen] = useState(false);
   const [typedAttempt, setTypedAttempt] = useState("");
   // True when the typed-fallback box is open to confirm/repair a just-captured spoken transcript,
@@ -838,6 +731,27 @@ export default function Home() {
   const [askDraft, setAskDraft] = useState("");
   const [askStatus, setAskStatus] = useState<"idle" | "asking" | "answered" | "error">("idle");
   const [askAnswer, setAskAnswer] = useState<LifelineResponse | null>(null);
+  /**
+   * The `ask` phase: a phrase question from /dash, answered here and then practised.
+   *
+   * Separate state from `askAnswer` above, which belongs to the in-scene ask sheet. They render
+   * differently -- the sheet shows one option because it is interrupting a conversation, and this
+   * shows all of them with when to use each, because choosing between them IS the lesson here.
+   */
+  /**
+   * Phrases this learner asked for that are due to come back, and the one this scene is carrying.
+   *
+   * Refs rather than state: nothing renders from them, they are read inside handlers that run
+   * after several awaits, and a stale copy would either inject the wrong phrase or record the
+   * wrong one as landed. Same reason `activeEventRef` is a ref.
+   */
+  const duePhrasesRef = useRef<RecallPhrase[]>([]);
+  const activePhraseRef = useRef<RecallPhrase | null>(null);
+  /** Set the moment a phrase lands, read once by the next callout, then cleared. */
+  const landedPhraseRef = useRef<RecallPhrase | null>(null);
+  const [askPhrase, setAskPhrase] = useState<AskPhraseHandoff | null>(null);
+  const [phraseAnswer, setPhraseAnswer] = useState<LifelineResponse | null>(null);
+  const [phraseStatus, setPhraseStatus] = useState<"asking" | "ready" | "scoring" | "done" | "error">("asking");
   const [retryTarget, setRetryTarget] = useState<RetryTarget | null>(null);
   const [correctionRetryResult, setCorrectionRetryResult] = useState<AttemptEvaluation | null>(null);
   const [pronunciationResult, setPronunciationResult] = useState<PronunciationCoaching | null>(null);
@@ -902,23 +816,8 @@ export default function Home() {
    * fallback. From the outside every one of them looks identical: "the mic does nothing". This
    * makes each of them say so.
    */
-  const realtimeDebugRef = useRef(false);
-  /**
-   * True from the moment a capture is closed until its transcript resolves.
-   *
-   * Transcription for a turn ALWAYS arrives after the mic window has closed -- `finishRealtimeListening`
-   * closes it and only then waits for the text. The guard on transcript accumulation therefore
-   * cannot key on "window is closed" alone; doing so discarded every real transcript on the
-   * realtime path while letting through exactly nothing. This marks the window in which a closed
-   * mic is still expecting its own result.
-   */
-  const awaitingTranscriptRef = useRef(false);
-  /** Returned by the token route so a language switch can restate it. */
-  const realtimeTranscribeModelRef = useRef("gpt-4o-mini-transcribe");
-  /** The language currently pinned on the realtime transcriber, to avoid redundant updates. */
-  const realtimeLanguageRef = useRef<"en" | "es">("en");
   function vlog(scope: string, ...rest: unknown[]) {
-    if (!realtimeDebugRef.current) return;
+    if (!voice.debug) return;
     const line = [
       `[voice:${scope}]`,
       ...rest.map((value) =>
@@ -928,7 +827,7 @@ export default function Home() {
             ? `${value.name}: ${value.message}`
             : safeJson(value),
       ),
-      `| mic:${micWindowRef.current} mode:${micModeRef.current} turn:${turnStateRef.current} capturing:${realtimeActiveCaptureRef.current}`,
+      `| mic:${voice.micWindow} mode:${micModeRef.current} turn:${turnStateRef.current} capturing:${voice.capturing}`,
     ].join(" ");
     // Written to a buffer as well as the console. Console filters (and DevTools opened after the
     // fact) silently hide console.log, which during this bug looked exactly like "no logging".
@@ -962,6 +861,7 @@ export default function Home() {
    * turns and `restoreCurrentTurn` puts the learner back on the exact line they walked out of.
    */
   const [asideActive, setAsideActive] = useState(false);
+  const asideThreadRef = useRef<HTMLDivElement | null>(null);
   // Read by deriveMicWindow, expectsEnglishAnswerNow and the realtime handlers, all of which run
   // outside render -- the state alone would lag them by one commit.
   const asideActiveRef = useRef(false);
@@ -1002,7 +902,7 @@ export default function Home() {
    */
   const conversationWho = sceneCharacter
     ? `${sceneCharacter.name}, ${sceneCharacter.relation} (${sceneCharacter.traitEn})`
-    : mode === "stung"
+    : mode === "stung" || mode === "upcoming"
       ? "a real person from the learner's situation"
       : defaultConversationContext.who;
   const [clientSessionId] = useState<string | null>(() => {
@@ -1014,6 +914,14 @@ export default function Home() {
     window.localStorage.setItem(key, next);
     return next;
   });
+  /**
+   * Set while this run is one go at a planned event (#30), and null otherwise.
+   *
+   * A ref rather than state because nothing renders from it: what it does is tell the two
+   * write-backs which event they belong to, and both of them happen inside handlers that run
+   * after several awaits, where a captured state value would be stale.
+   */
+  const activeEventRef = useRef<{ event: StoredEvent; beat: EventBeat } | null>(null);
   const [savedMomentId, setSavedMomentId] = useState<string | null>(null);
   /**
    * When this session closed. Pinned in a handler rather than read during render: `Date.now()` in
@@ -1026,9 +934,18 @@ export default function Home() {
    */
   const [sessionClosedAt, setSessionClosedAt] = useState<string | null>(null);
   const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  /**
+   * How many runs this browser has saved that no account has claimed yet.
+   *
+   * The one number the account ask is allowed to point at. Null until it is known, and the copy
+   * falls back to the promise-shaped version while it is -- a sentence about what somebody has
+   * done must never render with a placeholder in it.
+   */
+  const [unclaimedRuns, setUnclaimedRuns] = useState<number | null>(null);
   const [lastReviewUrl, setLastReviewUrl] = useState<string | null>(null);
   const isLanding = mode === "landing";
   const isStung = mode === "stung";
+  const isAskEntry = mode === "ask";
   const pressureMode = toneMode === "pressure";
   const isUserTurn = turnState === "ready" || turnState === "listening" || turnState === "still-listening";
   // Single source of truth for "the orb cannot be pressed right now", used by both the button's
@@ -1289,12 +1206,35 @@ export default function Home() {
     latestSessionEvaluation?.observedBlocker.type ??
     placementRescue?.actionable_feedback.issueType ??
     placementRescue?.observed_blocker.type;
+  /*
+   * Counted, not asserted -- and it has to say something the block above it does not.
+   *
+   * This used to be one of three canned sentences, and the common one was "you got at least one
+   * real reply across clearly". Directly under a card that now shows the sentence they arrived
+   * with and the sentence they left with, in their own words, that is a weaker restatement of
+   * what the reader has already seen. Worse, it hedges: "at least one" is what you write when you
+   * do not know the number, and the room does know it.
+   *
+   * So this reports the thing the contrast cannot -- how much of it they did unaided. Deterministic
+   * code owns the count; nothing here is inferred by a model.
+   *
+   * Worded as REPLIES IN THIS CONVERSATION on purpose. The journey block a few lines below says
+   * "N sentences said with nothing on the screen so far", and that N counts saved MOMENTS across
+   * every session -- #27's ladder. Two different units under the same phrase put "3 sentences" and
+   * "1 sentence so far" on one screen, which reads as a bug rather than as two facts.
+   */
+  const landedClear = sessionTurns.filter((turn) => turn.evaluation?.meaningResult === "clear").length;
+  const landedUnaided = sessionTurns.filter(
+    (turn) => turn.evaluation?.meaningResult === "clear" && turn.evaluation.assistanceUsed === "none",
+  ).length;
   const afterDelta =
     sessionTurns.length === 0
       ? "baseline set from your first run."
-      : sessionTurns.some((turn) => turn.evaluation?.meaningResult === "clear")
-        ? "you got at least one real reply across clearly."
-        : "we found the exact reply to practice next.";
+      : landedUnaided > 0
+        ? `${landedUnaided} ${landedUnaided === 1 ? "reply" : "replies"} in this conversation needed no help.`
+        : landedClear > 0
+          ? `${landedClear} ${landedClear === 1 ? "reply" : "replies"} got across, with a little help.`
+          : "we found the exact reply to practice next.";
   /**
    * Plain language, never the enum: this string is read on the closing card and mailed to them.
    *
@@ -1327,10 +1267,26 @@ export default function Home() {
   const sessionDueAt = sessionClosedAt
     ? nextReviewAt(new Date(sessionClosedAt).getTime(), sessionLedgerState, false)
     : null;
+  /*
+   * A weekday is only printed when something will actually honour it.
+   *
+   * Signed in, it will: the phrase goes to `word_bank` and `lib/phrase-recall.ts` brings it back
+   * into a later scene. Signed out, `word_bank.user_id` is `not null`, so nothing is saved to come
+   * back and no day ever arrives -- and 1.1 already found that the practice itself sits unclaimed
+   * on the device. Saying "Friday" to that learner is a promise made at the exact moment they are
+   * deciding whether to return.
+   *
+   * Stated as a fact, never as a second ask: 1.1 settled that there is one ask per session and it
+   * lives at the verdict, where the value is still on screen.
+   */
+  const signedInForReturn = Boolean(authedEmail);
   const closingRead: ClosingRead = {
     delta: afterDelta,
     almostThere: tomorrowWork,
-    comesBackOn: sessionDueAt ? weekdayLabel(sessionDueAt) : "soon",
+    comesBackOn: signedInForReturn && sessionDueAt ? weekdayLabel(sessionDueAt) : null,
+    returnLine: signedInForReturn
+      ? "we'll bring this back in a new situation, with a little less help."
+      : "this run is saved on this device. nothing brings it back on its own.",
   };
   const closingMoment: MomentCard | null =
     placementRescue && sessionClosedAt && sessionDueAt
@@ -1433,104 +1389,33 @@ export default function Home() {
     setAskAnswer(null);
   }
 
+  /*
+   * The thread is capped and scrollable, and it renders oldest-first -- so left alone it shows the
+   * START of the aside and clips the most recent line, usually mid-sentence. A sentence cut in
+   * half reads as a broken screen, and the half that matters is the one nearest what the coach
+   * just said. Pinned to the bottom on every new turn; older lines stay one scroll away.
+   */
+  useEffect(() => {
+    const el = asideThreadRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [asideExchange]);
+
   function clearTimers() {
     timers.current.forEach((timer) => window.clearTimeout(timer));
     timers.current = [];
   }
 
   /**
-   * Sends one event on the realtime data channel. Returns false when the channel isn't usable, so
-   * callers can fall back rather than assume delivery. A closing channel throwing here is expected
-   * -- the connection-state handler takes over.
-   */
-  function sendRealtimeEvent(payload: Record<string, unknown>) {
-    const channel = realtimeChannelRef.current;
-    if (channel?.readyState !== "open") {
-      vlog("send", "DROPPED (channel not open):", payload.type, "readyState:", channel?.readyState ?? "no channel");
-      return false;
-    }
-    try {
-      channel.send(JSON.stringify(payload));
-      vlog("send", "ok:", payload.type);
-      return true;
-    } catch (error) {
-      vlog("send", "THREW:", payload.type, error);
-      return false;
-    }
-  }
-
-  /**
-   * Server-VAD tuning, sent live over the data channel rather than baked into the token, because
-   * the token route mints once per session (and is rate limited), so mint-time values can never
-   * change mid-session.
-   *
-   * - `capture`: actively listening to the learner. Sensitive, with a long silence window so a
-   *   thinking pause doesn't end their turn.
-   * - `guard`: mic is open but it is not the learner's turn. The raised threshold is the primary
-   *   defense against room noise and coach echo tripping a false turn.
-   *
-   * create_response/interrupt_response are restated on every update: a partial turn_detection
-   * object would otherwise let them fall back to defaults, and create_response: true would let the
-   * realtime model start answering the learner directly -- it is only a voice bridge here.
-   */
-  /**
-   * Pins the transcriber to the language the learner is actually expected to answer in.
-   *
-   * Auto-detection turned short replies into Korean and a clean Spanish sentence into Danish --
-   * the right meaning, the wrong language -- and those transcripts are submitted as the learner's
-   * turn, so the conversation derails on input nobody produced. The flow genuinely switches
-   * language (English scaffolding, Spanish practice), so this has to move with it rather than be
-   * fixed at mint time.
+   * Pinned to the language the learner is actually expected to answer in. The flow genuinely
+   * switches (English scaffolding, Spanish practice), so this moves with it.
    */
   function applyTranscriptionLanguage(language: "en" | "es") {
-    if (realtimeLanguageRef.current === language) return false;
-    realtimeLanguageRef.current = language;
-    vlog("vad", "transcription language ->", language);
-    return sendRealtimeEvent({
-      type: "session.update",
-      session: {
-        type: "realtime",
-        audio: {
-          input: {
-            // The model is restated deliberately: a partial `transcription` object drops it.
-            transcription: { model: realtimeTranscribeModelRef.current, language },
-          },
-        },
-      },
-    });
+    return voice.setTranscriptionLanguage(language);
   }
 
+  /** Pressure mode shortens the silence window, so the tone toggle has to reach the VAD. */
   function applyVadProfile(profile: "capture" | "guard" | "patient") {
-    vlog("vad", "applying profile:", profile, "threshold: 0.5");
-    return sendRealtimeEvent({
-      type: "session.update",
-      session: {
-        type: "realtime",
-        audio: {
-          input: {
-            turn_detection: {
-              type: "server_vad",
-              // Both profiles sit at the API default. `guard` was 0.75, invented as a defence
-              // against the coach's own voice tripping a turn -- but the mic is only ever armed
-              // while `turnState === "ready"`, which is precisely when the coach is silent. Voice
-              // barge-in, the one case where an armed mic would hear the coach, is not built. So
-              // the raised threshold guarded nothing and only made "just start talking" miss quiet
-              // speakers. Raise it again when Half B lands, not before.
-              threshold: 0.5,
-              prefix_padding_ms: 300,
-              // `patient` is the answer to a capture that came back as nothing but "um": the
-              // learner is mid-thought, and the fix for cutting them off is to stop cutting them
-              // off. Long enough to think in, short enough that a finished answer does not sit
-              // there feeling ignored.
-              silence_duration_ms:
-                profile === "guard" ? 600 : profile === "patient" ? 2600 : pressureMode ? 850 : 1200,
-              create_response: false,
-              interrupt_response: false,
-            },
-          },
-        },
-      },
-    });
+    return voice.setVadProfile(profile, pressureMode);
   }
 
   /**
@@ -1567,7 +1452,7 @@ export default function Home() {
   }
 
   function deriveMicWindow(): "closed" | "armed" | "capturing" {
-    if (realtimeActiveCaptureRef.current) return "capturing";
+    if (voice.capturing) return "capturing";
     if (micModeRef.current === "push" || micSleepingRef.current) return "closed";
     // Never armed while the coach is talking or thinking: there is nothing to interrupt yet (voice
     // barge-in is a later step), no UI for a turn, and anything captured would only pollute the
@@ -1579,28 +1464,34 @@ export default function Home() {
     return "armed";
   }
 
-  /** Single place that decides whether the mic transmits, and under which VAD profile. */
+  /** The room derives which window is right; the session applies it. */
   function syncRealtimeMic() {
-    const next = deriveMicWindow();
-    const changed = micWindowRef.current !== next;
-    const before = micWindowRef.current;
-    micWindowRef.current = next;
-    const tracks = realtimeStreamRef.current?.getAudioTracks() ?? [];
-    tracks.forEach((track) => {
-      track.enabled = next !== "closed";
+    /*
+     * The transcriber is pinned HERE, not only when a capture opens.
+     *
+     * On the open-mic path the learner is already talking by the time `startRealtimeListening`
+     * runs -- server VAD fired first and that call is promoting an armed mic into a real turn. A
+     * language switch made at that point arrives after the audio it was supposed to describe, so
+     * the opening words of the sentence are transcribed under the previous language. The failure
+     * is not a garbled word, it is a fluent sentence in a third language: the right meaning
+     * wearing the wrong spelling, which then gets submitted as what the learner said.
+     *
+     * `syncRealtimeMic` runs on every mic-relevant transition, which is strictly earlier than the
+     * first sample of speech. `setTranscriptionLanguage` returns early when nothing changed, so
+     * this costs a comparison and never an extra `session.update`.
+     *
+     * Not while a capture is open or its transcript is still in flight: changing the language
+     * under an utterance that is already being decoded would corrupt the very turn it is meant to
+     * get right.
+     */
+    if (!voice.capturing && !voice.awaitingTranscript) {
+      applyTranscriptionLanguage(expectsEnglishAnswerNow() ? "en" : "es");
+    }
+
+    voice.setMicWindow(deriveMicWindow(), {
+      patient: patientCaptureRef.current,
+      pressureMode,
     });
-    if (changed) {
-      vlog(
-        "mic",
-        `window ${before} -> ${next}`,
-        "| tracks:", tracks.length,
-        "| enabled:", tracks.map((t) => t.enabled),
-        "| muted:", tracks.map((t) => t.muted),
-      );
-    }
-    if (changed && next !== "closed") {
-      applyVadProfile(next === "capturing" ? (patientCaptureRef.current ? "patient" : "capture") : "guard");
-    }
   }
 
   function stopMediaStream() {
@@ -1608,65 +1499,24 @@ export default function Home() {
     mediaStreamRef.current = null;
   }
 
-  function clearRealtimeTimers() {
-    if (realtimeCaptureTimerRef.current) {
-      window.clearTimeout(realtimeCaptureTimerRef.current);
-      realtimeCaptureTimerRef.current = null;
-    }
-    if (realtimeSpeakingTimerRef.current) {
-      window.clearTimeout(realtimeSpeakingTimerRef.current);
-      realtimeSpeakingTimerRef.current = null;
-    }
-  }
-
-  function resolveRealtimeCapture(transcript: string) {
-    const resolve = realtimeCaptureResolveRef.current;
-    realtimeCaptureResolveRef.current = null;
-    if (realtimeCaptureTimerRef.current) {
-      window.clearTimeout(realtimeCaptureTimerRef.current);
-      realtimeCaptureTimerRef.current = null;
-    }
-    resolve?.(transcript.trim());
-  }
-
-  function resolveRealtimeSpeaking() {
-    const resolve = realtimeSpeakingResolveRef.current;
-    realtimeSpeakingResolveRef.current = null;
-    if (realtimeSpeakingTimerRef.current) {
-      window.clearTimeout(realtimeSpeakingTimerRef.current);
-      realtimeSpeakingTimerRef.current = null;
-    }
-    resolve?.();
-  }
-
-
-  function disconnectRealtime() {
-    realtimeActiveCaptureRef.current = false;
-    awaitingTranscriptRef.current = false;
-    realtimeConnectPromiseRef.current = null;
-    realtimeModeRef.current = null;
-    realtimeFallbackRef.current = false;
-    realtimeSpeechActiveRef.current = false;
-    realtimeSpeechSeenRef.current = false;
+  /**
+   * Everything the room holds about a line being spoken, dropped -- without touching the
+   * connection. This is what starting a fresh room needs: the entry screen may have just built a
+   * session for this very act, and an intake session's instructions are static, so it is already
+   * correct for the room's intake. A wrong-mode session is still replaced, by `ensureRealtime`.
+   */
+  function resetRealtimeSpeaking() {
     realtimeInterruptibleRef.current = false;
     realtimeInterruptedRef.current = false;
-    realtimeResponseDoneRef.current = false;
-    realtimeOutputAudioActiveRef.current = false;
     setInterruptible(false);
-    resolveRealtimeCapture("");
-    resolveRealtimeSpeaking();
-    clearRealtimeTimers();
-    realtimeChannelRef.current?.close();
-    realtimeChannelRef.current = null;
-    realtimePeerRef.current?.close();
-    realtimePeerRef.current = null;
-    realtimeStreamRef.current?.getTracks().forEach((track) => track.stop());
-    realtimeStreamRef.current = null;
-    if (realtimeAudioRef.current) {
-      realtimeAudioRef.current.pause();
-      realtimeAudioRef.current.srcObject = null;
-      realtimeAudioRef.current = null;
-    }
+    voice.resetSpeaking();
+    voice.resetCapture();
+    voice.setMicWindow("closed");
+  }
+
+  function disconnectRealtime() {
+    resetRealtimeSpeaking();
+    voice.disconnect();
   }
 
   function realtimeRequestFor(nextMode: RealtimeSpeechMode) {
@@ -1685,56 +1535,30 @@ export default function Home() {
       mode: "conversation" as const,
       originalText: clipForApi(placementSummary),
       scenarioContext:
-        mode === "stung"
-          ? "The learner started from something they could not say in real life."
-          : "The learner is entering a guided first conversation from the coached intake.",
+        mode === "upcoming"
+          ? "The learner is preparing for something real that has not happened yet."
+          : mode === "stung"
+            ? "The learner started from something they could not say in real life."
+            : "The learner is entering a guided first conversation from the coached intake.",
       context: defaultConversationContext,
       rescue: placementRescue,
       pressureMode,
     };
   }
 
+  /**
+   * The room's half of the realtime stream.
+   *
+   * `lib/voice-session.ts` has already updated the capture state and swallowed the errors that are
+   * expected side effects of the turn choreography, so everything left here is a room decision:
+   * whether an armed microphone should become a turn, when one ends, and when a spoken line has
+   * actually finished playing out.
+   */
   function handleRealtimeEvent(event: RealtimeServerEvent) {
     const type = event.type ?? "";
 
-    // Opt-in trace of the realtime data channel. It is a WebRTC data channel, so none of this is
-    // visible in the network tab, which makes "the mic just does nothing" almost impossible to
-    // diagnose from the outside. Enable with:
-    //   localStorage["outloud-debug-realtime"] = "1"
-    if (realtimeDebugRef.current) {
-      console.log(
-        "[rt]",
-        type,
-        "| micWindow:", micWindowRef.current,
-        "| turn:", turnStateRef.current,
-        "| capture:", realtimeActiveCaptureRef.current,
-        "| speechSeen:", realtimeSpeechSeenRef.current,
-        "| transcript:", JSON.stringify(realtimeTranscriptRef.current),
-        type === "error" ? event.error : "",
-      );
-    }
-
-    if (type === "error") {
-      if (event.error?.code && ignorableRealtimeErrorCodes.has(event.error.code)) {
-        return;
-      }
-      // Any unhandled error silently drops the whole session to the MediaRecorder path, which is
-      // very hard to notice while developing -- a malformed session.update looks like "voice just
-      // got worse". Surface it locally; production stays quiet.
-      if (process.env.NODE_ENV === "development") {
-        console.warn("[realtime] unhandled error event", event.error?.code, event.error?.message);
-      }
-      realtimeFallbackRef.current = true;
-      resolveRealtimeCapture(realtimeTranscriptRef.current);
-      resolveRealtimeSpeaking();
-      return;
-    }
-
     if (type === "input_audio_buffer.speech_started") {
-      realtimeSpeechActiveRef.current = true;
-      realtimeSpeechSeenRef.current = true;
-
-      if (realtimeActiveCaptureRef.current) {
+      if (voice.capturing) {
         // The learner started talking, so the idle timeout no longer applies. Guarded: with an
         // armed mic this fires on room noise too, and clearTimers() wipes every pending timer --
         // including the speak fallback that hands the turn back.
@@ -1742,260 +1566,36 @@ export default function Home() {
         return;
       }
 
-      // Armed and it is their turn: talking IS the tap. This is what full-duplex buys -- nobody has
-      // to read an instruction to start.
-      if (micWindowRef.current === "armed" && turnStateRef.current === "ready") {
+      // Armed and it is their turn: talking IS the tap. This is what full-duplex buys -- nobody
+      // has to read an instruction to start.
+      if (voice.micWindow === "armed" && turnStateRef.current === "ready") {
         void startRealtimeListening(null, { resumingSpeech: true });
       }
       return;
     }
 
     if (type === "input_audio_buffer.speech_stopped") {
-      realtimeSpeechActiveRef.current = false;
       // Server VAD has already committed the buffer; the turn ends here without any tap.
-      if (realtimeActiveCaptureRef.current) {
+      if (voice.capturing) {
         void finishRealtimeListening(false);
       }
-      return;
-    }
-
-    if (type === "output_audio_buffer.started") {
-      realtimeOutputAudioActiveRef.current = true;
-      return;
-    }
-
-    if (type === "output_audio_buffer.stopped" || type === "output_audio_buffer.cleared") {
-      realtimeOutputAudioActiveRef.current = false;
-      // Playback has actually drained on the client, so the mic can open without echoing the coach.
-      if (realtimeResponseDoneRef.current) {
-        resolveRealtimeSpeaking();
-      }
-      return;
-    }
-
-    // Transcription can arrive for audio captured outside a turn -- an armed mic hears the room.
-    // The transcript ref is only cleared when a turn STARTS, so anything accepted here would
-    // otherwise be prepended to whatever the learner says next.
-    if (
-      micWindowRef.current === "closed" &&
-      !awaitingTranscriptRef.current &&
-      type.includes("input_audio_transcription")
-    ) {
-      vlog("transcript", "IGNORED (closed, no capture awaiting):", type, event.transcript ?? event.delta ?? "");
-      return;
-    }
-
-    if (typeof event.delta === "string" && type.includes("input_audio_transcription.delta")) {
-      realtimeTranscriptRef.current += event.delta;
-    }
-
-    if (typeof event.transcript === "string" && type.includes("input_audio_transcription")) {
-      vlog("transcript", type, JSON.stringify(event.transcript));
-      realtimeTranscriptRef.current = event.transcript;
-      if (type.endsWith(".completed")) {
-        realtimeTranscriptFinalRef.current = true;
-        resolveRealtimeCapture(event.transcript);
-      }
-    }
-
-    const contentTranscript = event.item?.content
-      ?.map((item) => item.transcript ?? item.text ?? "")
-      .join(" ")
-      .trim();
-    if (contentTranscript && type.includes("input_audio_transcription")) {
-      realtimeTranscriptRef.current = contentTranscript;
-      realtimeTranscriptFinalRef.current = true;
-      resolveRealtimeCapture(contentTranscript);
-    }
-
-    if (
-      type === "response.done" ||
-      type === "response.output_audio.done" ||
-      type === "response.audio.done" ||
-      event.response?.status === "completed"
-    ) {
-      realtimeResponseDoneRef.current = true;
-      if (realtimeOutputAudioActiveRef.current) {
-        // Generation is done but audio is still playing out; wait for output_audio_buffer.stopped,
-        // with a safety net in case that event never arrives.
-        if (realtimeSpeakingTimerRef.current) {
-          window.clearTimeout(realtimeSpeakingTimerRef.current);
-        }
-        realtimeSpeakingTimerRef.current = window.setTimeout(resolveRealtimeSpeaking, 8000);
-        return;
-      }
-      const minimumMs = 900;
-      const elapsed = nowMs() - realtimeSpeakingStartedAtRef.current;
-      window.setTimeout(resolveRealtimeSpeaking, Math.max(0, minimumMs - elapsed));
     }
   }
 
-  async function waitForRealtimeChannel(channel: RTCDataChannel) {
-    if (channel.readyState === "open") return true;
-
-    return new Promise<boolean>((resolve) => {
-      const timer = window.setTimeout(() => resolve(false), 5000);
-      channel.addEventListener(
-        "open",
-        () => {
-          window.clearTimeout(timer);
-          resolve(true);
-        },
-        { once: true },
-      );
-      channel.addEventListener(
-        "error",
-        () => {
-          window.clearTimeout(timer);
-          resolve(false);
-        },
-        { once: true },
-      );
-    });
-  }
-
+  /**
+   * Connects if needed, in the mode the room is currently in. The transport lives in the session
+   * module; what stays here is the only part the room owns -- the instructions the token is minted
+   * with, which depend on the rescue and the scenario.
+   */
   async function ensureRealtime(nextMode: RealtimeSpeechMode) {
-    if (
-      typeof window === "undefined" ||
-      typeof RTCPeerConnection === "undefined" ||
-      !navigator.mediaDevices?.getUserMedia
-    ) {
-      return false;
-    }
-
-    if (
-      realtimeModeRef.current === nextMode &&
-      realtimePeerRef.current?.connectionState !== "closed" &&
-      realtimeChannelRef.current?.readyState === "open"
-    ) {
-      return true;
-    }
-
-    if (realtimeConnectPromiseRef.current) {
-      vlog("connect", "already connecting, awaiting existing promise");
-      return realtimeConnectPromiseRef.current;
-    }
+    if (voice.isConnected(nextMode)) return true;
 
     const requestBody = realtimeRequestFor(nextMode);
     if (!requestBody) {
       vlog("connect", "ABORT: no request body for mode", nextMode, "(no rescue/placement yet?)");
       return false;
     }
-    vlog("connect", "starting, mode:", nextMode);
-
-    realtimeConnectPromiseRef.current = (async () => {
-      try {
-        if (
-          realtimePeerRef.current ||
-          realtimeChannelRef.current ||
-          (realtimeModeRef.current && realtimeModeRef.current !== nextMode)
-        ) {
-          disconnectRealtime();
-        }
-
-        const token = await readJson<RealtimeTokenResponse>(
-          await fetch("/api/realtime-token", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(requestBody),
-          }),
-        );
-
-        const peer = new RTCPeerConnection();
-        const audio = new Audio();
-        audio.autoplay = true;
-        audio.playsInline = true;
-        realtimeAudioRef.current = audio;
-
-        peer.ontrack = (event) => {
-          audio.srcObject = event.streams[0];
-          void audio.play().catch(() => undefined);
-        };
-        peer.onconnectionstatechange = () => {
-          vlog("connect", "peer state:", peer.connectionState);
-          if (peer.connectionState === "failed" || peer.connectionState === "closed") {
-            realtimeFallbackRef.current = true;
-          }
-        };
-
-        if (token.transcribeModel) realtimeTranscribeModelRef.current = token.transcribeModel;
-        realtimeLanguageRef.current = "en";
-        vlog("connect", "token minted, requesting microphone");
-        const stream = await navigator.mediaDevices.getUserMedia(micConstraints);
-        stream.getAudioTracks().forEach((track) => {
-          track.enabled = false;
-          peer.addTrack(track, stream);
-        });
-        vlog(
-          "connect",
-          "microphone granted:",
-          stream.getAudioTracks().map((t) => `${t.label} (muted:${t.muted}, state:${t.readyState})`),
-        );
-
-        const channel = peer.createDataChannel("oai-events");
-        channel.addEventListener("message", (message) => {
-          try {
-            handleRealtimeEventRef.current(JSON.parse(message.data) as RealtimeServerEvent);
-          } catch {
-            // Ignore malformed transport events; the app state is driven by our engine.
-          }
-        });
-        channel.addEventListener("error", (event) => {
-          vlog("connect", "DATA CHANNEL ERROR -> falling back to MediaRecorder", event);
-          realtimeFallbackRef.current = true;
-        });
-
-        realtimePeerRef.current = peer;
-        realtimeChannelRef.current = channel;
-        realtimeStreamRef.current = stream;
-        realtimeModeRef.current = nextMode;
-
-        const offer = await peer.createOffer();
-        await peer.setLocalDescription(offer);
-        const sdpResponse = await fetch("https://api.openai.com/v1/realtime/calls", {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${token.value}`,
-            "Content-Type": "application/sdp",
-          },
-          body: offer.sdp,
-        });
-
-        if (!sdpResponse.ok) {
-          vlog("connect", "SDP exchange failed:", sdpResponse.status, await sdpResponse.text().catch(() => ""));
-          throw new Error("Realtime session could not connect.");
-        }
-
-        await peer.setRemoteDescription({
-          type: "answer",
-          sdp: await sdpResponse.text(),
-        });
-
-        const opened = await waitForRealtimeChannel(channel);
-        if (!opened) {
-          throw new Error("Realtime channel did not open.");
-        }
-
-        // State the VAD profile explicitly rather than inheriting whatever the token was minted
-        // with -- the token is minted once per session, so its values can never change again.
-        applyVadProfile("capture");
-        vlog("connect", "CONNECTED — data channel open");
-
-        return true;
-      } catch (error) {
-        // This used to be a bare `catch {}`. Every connection failure -- a 429 on the token, a
-        // denied microphone, a rejected SDP -- became an identical silent drop to the
-        // MediaRecorder path, which is indistinguishable from "the mic just does nothing".
-        vlog("connect", "FAILED -> MediaRecorder fallback:", error);
-        realtimeFallbackRef.current = true;
-        disconnectRealtime();
-        return false;
-      } finally {
-        realtimeConnectPromiseRef.current = null;
-      }
-    })();
-
-    return realtimeConnectPromiseRef.current;
+    return voice.connect(nextMode, requestBody, { pressureMode });
   }
 
   async function speakCoachText(
@@ -2057,9 +1657,8 @@ export default function Home() {
     }
 
     const connected = await ensureRealtime(speechMode);
-    const channel = realtimeChannelRef.current;
 
-    if (!connected || !channel || channel.readyState !== "open") {
+    if (!connected || !voice.isConnected()) {
       later(() => {
         if (handBackTurn) setTurnState("ready");
         onDone?.();
@@ -2067,41 +1666,13 @@ export default function Home() {
       return;
     }
 
-    // If a previous line is still being generated or played out, cut it before starting the
-    // next one -- otherwise the new text shows while the old audio keeps talking.
-    if (realtimeSpeakingResolveRef.current || realtimeOutputAudioActiveRef.current) {
-      sendRealtimeEvent({ type: "response.cancel" });
-      sendRealtimeEvent({ type: "output_audio_buffer.clear" });
-      resolveRealtimeSpeaking();
-    }
-
-    realtimeSpeakingStartedAtRef.current = nowMs();
-    realtimeResponseDoneRef.current = false;
-    realtimeOutputAudioActiveRef.current = false;
     realtimeInterruptedRef.current = false;
     realtimeInterruptibleRef.current = canInterrupt;
     setInterruptible(canInterrupt);
 
-    const finishedSpeaking = new Promise<void>((resolve) => {
-      realtimeSpeakingResolveRef.current = resolve;
-      realtimeSpeakingTimerRef.current = window.setTimeout(resolveRealtimeSpeaking, Math.max(2400, fallbackDelay + 5000));
-    });
-
-    sendRealtimeEvent({
-      type: "response.create",
-      response: {
-        // Out-of-band: this response must not see (or join) the session's conversation history.
-        // The realtime model is a voice bridge here; with history it sometimes "answers" the
-        // learner's last utterance or repeats an earlier line instead of reading this one.
-        conversation: "none",
-        output_modalities: ["audio"],
-        instructions: slow
-          ? `Say this exact line and nothing else, noticeably slower and very clearly, without changing a word: ${text}`
-          : `Say this exact line and nothing else: ${text}`,
-      },
-    });
-
-    await finishedSpeaking;
+    // Resolves when the sound has actually stopped, not when generation finished -- which is what
+    // lets the mic open straight afterwards without hearing the coach through the speaker.
+    await voice.speak(text, { slow, timeoutMs: Math.max(2400, fallbackDelay + 5000) });
     realtimeInterruptibleRef.current = false;
     setInterruptible(false);
 
@@ -2158,7 +1729,7 @@ export default function Home() {
     if (
       overlayRef.current ||
       typedFallbackOpenRef.current ||
-      realtimeChannelRef.current?.readyState !== "open"
+      !voice.isConnected()
     ) {
       return;
     }
@@ -2170,8 +1741,8 @@ export default function Home() {
     // turn still ends, but the mic only steps down to `armed` -- closing it would break the
     // promise that they can just start talking whenever they're ready.
     later(() => {
-      if (!realtimeActiveCaptureRef.current || realtimeSpeechSeenRef.current) return;
-      realtimeActiveCaptureRef.current = false;
+      if (!voice.capturing || voice.speechSeen) return;
+      voice.abortCapture();
       holdingRef.current = false;
       setTurn("ready");
       syncRealtimeMic();
@@ -2186,7 +1757,7 @@ export default function Home() {
    */
   function armIdleCutoff() {
     later(() => {
-      if (micWindowRef.current !== "armed") return;
+      if (voice.micWindow !== "armed") return;
       setMicSleeping(true);
       syncRealtimeMic();
       setRoomNote("mic went to sleep. tap the orb when you're back.");
@@ -2203,9 +1774,7 @@ export default function Home() {
       stopStaticAudio(true);
       return;
     }
-    sendRealtimeEvent({ type: "response.cancel" });
-    sendRealtimeEvent({ type: "output_audio_buffer.clear" });
-    resolveRealtimeSpeaking();
+    voice.cancelSpeech();
   }
 
   function interruptSpeaking() {
@@ -2213,9 +1782,8 @@ export default function Home() {
       return;
     }
 
-    const channel = realtimeChannelRef.current;
     const staticPlaying = staticAudioRef.current !== null;
-    if (!staticPlaying && (!channel || channel.readyState !== "open")) {
+    if (!staticPlaying && !voice.isConnected()) {
       return;
     }
 
@@ -2226,9 +1794,7 @@ export default function Home() {
     if (staticPlaying) {
       stopStaticAudio(true);
     } else {
-      sendRealtimeEvent({ type: "response.cancel" });
-      sendRealtimeEvent({ type: "output_audio_buffer.clear" });
-      resolveRealtimeSpeaking();
+      voice.cancelSpeech();
     }
 
     void startRealtimeListening(null).then((listening) => {
@@ -2269,9 +1835,44 @@ export default function Home() {
       !turnSubtitleRef.current &&
       evaluation?.meaningResult === "clear";
     unaidedRunRef.current = unaided ? unaidedRunRef.current + 1 : 0;
+
+    /*
+     * The phrase they asked for, produced alone, days later, in a scene built for something else.
+     *
+     * Nothing is said about it on the way IN -- the moment the screen announces "you asked about
+     * this on tuesday" before they try, they are looking at a system instead of feeling a memory.
+     * Afterwards is the exact opposite, and this line is the one most likely to be the thing
+     * somebody tells a friend about. It outranks the unaided-run callout because it is rarer, and
+     * because it is theirs.
+     */
+    const landedPhrase = landedPhraseRef.current;
+    if (landedPhrase) {
+      landedPhraseRef.current = null;
+      calloutSpokenRef.current = true;
+      const asked = askedOnLabel(landedPhrase.createdAt);
+      return `that's the one you asked me about${asked ? ` ${asked}` : ""} — and you just reached for it.`;
+    }
+
     if (!unaided || closing || calloutSpokenRef.current || unaidedRunRef.current < 2) return null;
     calloutSpokenRef.current = true;
     return "twice in a row now — and you didn't reach for help once.";
+  }
+
+  /**
+   * "yesterday", "on tuesday", "last week" -- or nothing at all.
+   *
+   * Nothing rather than a wrong day. The whole force of the line is that we remembered, and a date
+   * that is off by one turns the payoff into evidence that we did not.
+   */
+  function askedOnLabel(createdAt: string) {
+    const then = new Date(createdAt).getTime();
+    if (Number.isNaN(then)) return "";
+    const days = Math.round((Date.now() - then) / 86_400_000);
+    if (days < 1) return "";
+    if (days === 1) return "yesterday";
+    if (days <= 6) return `on ${new Date(then).toLocaleDateString(undefined, { weekday: "long" }).toLowerCase()}`;
+    if (days <= 13) return "last week";
+    return "";
   }
 
   function replayCoachLine(slow: boolean) {
@@ -2303,22 +1904,18 @@ export default function Home() {
     options: { resumingSpeech?: boolean } = {},
   ) {
     const connected = await ensureRealtime(currentRealtimeMode());
-    const channel = realtimeChannelRef.current;
 
-    if (!connected || !channel || channel.readyState !== "open") {
-      vlog("listen", "REFUSED: connected:", connected, "channel:", channel?.readyState ?? "none");
+    if (!connected || !voice.isConnected()) {
+      vlog("listen", "REFUSED: connected:", connected);
       return false;
     }
 
     // A newer press superseded this one, or the mic is already open: nothing to do.
-    if (
-      (pressSession !== null && pressSessionRef.current !== pressSession) ||
-      realtimeActiveCaptureRef.current
-    ) {
+    if ((pressSession !== null && pressSessionRef.current !== pressSession) || voice.capturing) {
       vlog(
         "listen",
         "SKIPPED:",
-        realtimeActiveCaptureRef.current ? "already capturing" : "press superseded",
+        voice.capturing ? "already capturing" : "press superseded",
         "| press:", pressSession,
         "| current:", pressSessionRef.current,
       );
@@ -2327,19 +1924,10 @@ export default function Home() {
     vlog("listen", "OPENING capture, resumingSpeech:", options.resumingSpeech === true);
     applyTranscriptionLanguage(expectsEnglishAnswerNow() ? "en" : "es");
 
-    const { resumingSpeech = false } = options;
     clearTimers();
     setRoomNote(null);
     setLastTranscript(null);
-    realtimeTranscriptFinalRef.current = false;
-    // A new capture supersedes any transcript the previous one was still waiting on.
-    awaitingTranscriptRef.current = false;
-    if (!resumingSpeech) {
-      realtimeTranscriptRef.current = "";
-    }
-    realtimeSpeechActiveRef.current = resumingSpeech;
-    realtimeSpeechSeenRef.current = resumingSpeech;
-    realtimeActiveCaptureRef.current = true;
+    voice.openCapture(options);
     holdingRef.current = true;
     setMicSleeping(false);
     setTurn("listening");
@@ -2355,56 +1943,41 @@ export default function Home() {
   // manual = the learner tapped/released to end the turn. Otherwise server VAD ended it and the
   // buffer is already committed.
   async function finishRealtimeListening(manual: boolean) {
-    if (!realtimeActiveCaptureRef.current) {
+    if (!voice.capturing) {
       vlog("finish", "IGNORED: no active capture (manual:", manual, ")");
       return;
     }
-    vlog("finish", "closing capture, manual:", manual, "| speechSeen:", realtimeSpeechSeenRef.current);
-    // Set BEFORE the mic window closes below: the transcript for this capture is still to come,
-    // and the accumulation guard must not mistake it for stray room noise.
-    awaitingTranscriptRef.current = true;
-    realtimeActiveCaptureRef.current = false;
+    vlog("finish", "closing capture, manual:", manual, "| speechSeen:", voice.speechSeen);
+    // Closed, then the mic, then the commit -- in that order. The window has to be shut before
+    // `deriveMicWindow` runs, and the buffer commit has to be the last thing that happens while
+    // the track is still live.
+    const { speechSeen } = voice.closeCapture();
     holdingRef.current = false;
     clearTimers();
     setTurn("thinking");
     // Closes the mic: "thinking" never derives to armed, so this also covers open mode.
     syncRealtimeMic();
 
-    const speechSeen = realtimeSpeechSeenRef.current;
-    if (manual && realtimeSpeechActiveRef.current) {
-      // May already have been committed by VAD; either way we wait for the transcript in flight.
-      sendRealtimeEvent({ type: "input_audio_buffer.commit" });
-    }
-    realtimeSpeechActiveRef.current = false;
-
-    const transcript = await new Promise<string>((resolve) => {
-      if (realtimeTranscriptFinalRef.current) {
-        resolve(realtimeTranscriptRef.current.trim());
-        return;
-      }
-
-      vlog("finish", "waiting for transcript, timeout:", speechSeen ? 6000 : 2000, "ms");
-      realtimeCaptureResolveRef.current = resolve;
-      realtimeCaptureTimerRef.current = window.setTimeout(
-        () => {
-          vlog("finish", "TIMED OUT waiting for transcript; using:", JSON.stringify(realtimeTranscriptRef.current));
-          resolveRealtimeCapture(realtimeTranscriptRef.current);
-        },
-        speechSeen ? 6000 : 2000,
-      );
-    });
+    const transcript = await voice.awaitTranscript({ commit: manual });
 
     vlog("finish", "transcript:", JSON.stringify(transcript), "| speechSeen:", speechSeen);
-    awaitingTranscriptRef.current = false;
+
+    const said = transcript.trim();
+    // Shared with the entry screen, which captures speech too now. Only the VERDICT is shared:
+    // what to do about it stays here, because a room mid-session and a learner arriving at the
+    // door want different things from the same "that was only um".
+    const verdict = classifyCapture(said, speechSeen);
 
     // Voice activity was never detected during this capture, yet a transcript came back --
     // almost certainly a hallucination from background noise, not a real reply. There's no
     // graded confidence signal on the realtime path, so VAD is the only gate available.
-    if (!transcript.trim() || !speechSeen) {
+    if (verdict === "no-speech" || verdict === "empty") {
       vlog(
         "finish",
         "DISCARDED as dud —",
-        !speechSeen ? "server VAD never reported speech (threshold too high?)" : "transcript came back empty",
+        verdict === "no-speech"
+          ? "server VAD never reported speech (threshold too high?)"
+          : "transcript came back empty",
         "| transcript:", JSON.stringify(transcript),
       );
       registerDudCapture();
@@ -2414,8 +1987,8 @@ export default function Home() {
     }
 
     // A decoder loop, not a learner. Discarded before anything can score or store it.
-    if (looksLikeDecodeLoop(transcript.trim())) {
-      vlog("finish", "DISCARDED as decode loop:", JSON.stringify(transcript.trim().slice(0, 120)));
+    if (verdict === "decode-loop") {
+      vlog("finish", "DISCARDED as decode loop:", JSON.stringify(said.slice(0, 120)));
       // The loop is usually what a clipped recording decodes into, so the next capture gets the
       // patient window: cutting them off again would just reproduce it.
       patientCaptureRef.current = true;
@@ -2428,9 +2001,9 @@ export default function Home() {
 
     // Nothing but "um" -- they are still thinking, and the microphone mistook a pause for an
     // ending. Give the time back instead of treating it as an answer.
-    if (isFillerOnly(transcript.trim())) {
+    if (verdict === "filler") {
       fillerRetriesRef.current += 1;
-      vlog("filler", "hesitation-only capture", fillerRetriesRef.current, JSON.stringify(transcript.trim()));
+      vlog("filler", "hesitation-only capture", fillerRetriesRef.current, JSON.stringify(said));
 
       if (fillerRetriesRef.current <= maxFillerRetries) {
         patientCaptureRef.current = true;
@@ -2461,10 +2034,10 @@ export default function Home() {
     fillerRetriesRef.current = 0;
     patientCaptureRef.current = false;
     noisyStrikesRef.current = 0;
-    setLastTranscript(transcript.trim());
+    setLastTranscript(said);
     // No graded confidence tier exists on the realtime path -- VAD is the only signal, and it
     // already passed the gate above.
-    routeCapturedTranscript(transcript.trim(), false);
+    routeCapturedTranscript(said, false);
   }
 
   /**
@@ -2534,6 +2107,9 @@ export default function Home() {
         if (reply.shouldClose) {
           // Updater form: reopening the card later must not move the return date.
           setSessionClosedAt((current) => current ?? new Date().toISOString());
+          // Q4's far end. Everybody who reaches this saw the session through; the gap between
+          // this count and `session_started` is the drop-off, and the replay says why.
+          track("session_closed", { turns: sessionTurns.length, saved: Boolean(savedMomentId) });
           setOverlay("after");
         }
       },
@@ -2565,9 +2141,11 @@ export default function Home() {
       originalText,
       scenarioContext: clipForApi(
         `${
-          mode === "stung"
-            ? "The learner started from a real situation where they did not know what to say. Use their story and their replies to the coach as the source of truth."
-            : "The learner just had a short coached voice conversation. Anchor everything on their self-described problem and what actually happened in the transcript."
+          mode === "upcoming"
+            ? "The learner is preparing for a real situation that is coming up and has not happened yet. Use their description of it and their replies to the coach as the source of truth, and never describe it as something that already went wrong."
+            : mode === "stung"
+              ? "The learner started from a real situation where they did not know what to say. Use their story and their replies to the coach as the source of truth."
+              : "The learner just had a short coached voice conversation. Anchor everything on their self-described problem and what actually happened in the transcript."
         } Coach observations during the session: ${coachEvidence.length ? coachEvidence.join("; ") : "none recorded"}.`,
       ),
       context: {
@@ -2638,6 +2216,34 @@ export default function Home() {
       setPlacementSummary(placementRequest.originalText);
       setPlacementRescue(rescue);
       setPlacementEvaluations(evaluations);
+
+      /*
+       * Q4's first real milestone: the app has given something back. Everything before this is
+       * the learner working; this is the first moment they get anything for it.
+       *
+       * The gap between `session_started` and here is the intake, which is the longest stretch
+       * of the whole product without a payoff and therefore the likeliest place to lose somebody.
+       * The blocker travels because it comes from a fixed list of eight; nothing else here does.
+       */
+      track("rescue_reached", {
+        turns: sessionTurns.length,
+        blocker: reportedBlocker ?? "not_sure",
+      });
+
+      /*
+       * The first go at an event is the only thing that produces its rescue, and every go after
+       * it starts its scene from that same rescue. So it has to outlive the session that made it
+       * -- otherwise go two is another placement, and a four-session run-up is four placements.
+       */
+      const active = activeEventRef.current;
+      if (active && !active.event.rescue) {
+        void patchEvent(active.event.id, {
+          rescue,
+          focusBlocker: rescue.observed_blocker?.type ?? null,
+        }).then((updated) => {
+          if (updated && activeEventRef.current) activeEventRef.current = { ...activeEventRef.current, event: updated };
+        });
+      }
       setFlowPhase("verdict");
       setTurnState("speaking");
       setOverlay("verdict");
@@ -2751,7 +2357,17 @@ export default function Home() {
     }
   }
 
-  async function handleOpeningAttempt(attempt: string) {
+  /**
+   * `coachMode` is explicit rather than read from `mode` because an event beat sets both at once
+   * and the state has not landed by the time this runs -- and because getting it wrong is the
+   * tense bug: the coach would talk about a dinner they have not been to as though it had already
+   * gone badly.
+   */
+  async function handleOpeningAttempt(
+    attempt: string,
+    coachMode?: "speaks-first" | "stung" | "upcoming",
+    namedScenario?: string | null,
+  ) {
     setOpeningAnswer(attempt);
     setPlacementAttempts([]);
     setPlacementEvaluations([]);
@@ -2772,8 +2388,12 @@ export default function Home() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             action: "start",
-            mode: mode === "stung" ? "stung" : "speaks-first",
+            mode: coachMode ?? (mode === "stung" ? "stung" : mode === "upcoming" ? "upcoming" : "speaks-first"),
             openingAnswer: attempt,
+            // Only when the situation was settled before the session started. Sending the opening
+            // answer here regardless would remove the framing turn from the learner who most
+            // needs it: the one whose whole answer was "I just froze, I don't know".
+            namedScenario: namedScenario ?? null,
             context: defaultConversationContext,
           }),
         }),
@@ -2788,14 +2408,20 @@ export default function Home() {
     }
   }
 
-  async function startFirstSession() {
-    if (!placementRescue || !placementSummary) {
-      closeOverlay();
-      setRoomNote("the verdict needs one more answer first.");
-      setTurnState("ready");
-      return;
-    }
-
+  /**
+   * Everything a scene needs cleared before it starts. Lifted out of `startFirstSession` when
+   * event beats got a second way in: two copies of this list would drift, and the half that
+   * drifts is always the counters -- an unaided run carried across two conversations is the app
+   * telling somebody they did something twice in a row that they did once.
+   */
+  function beginSession() {
+    // Q4's denominator, and the point every drop-off is measured against. `entry` matters as much
+    // as the count: somebody arriving from a planned event has already committed to a real date,
+    // and should behave nothing like somebody who tapped the fallback offer.
+    track("session_started", {
+      entry: activeEventRef.current ? "event_beat" : "intake",
+      signedIn: Boolean(authedEmail),
+    });
     clearTimers();
     setOverlay(null);
     setFlowPhase("session");
@@ -2814,6 +2440,17 @@ export default function Home() {
     setLastReviewUrl(null);
     setTurnState("thinking");
     setRoomNote(null);
+  }
+
+  async function startFirstSession() {
+    if (!placementRescue || !placementSummary) {
+      closeOverlay();
+      setRoomNote("the verdict needs one more answer first.");
+      setTurnState("ready");
+      return;
+    }
+
+    beginSession();
 
     try {
       const first = await readJson<ConverseReply>(
@@ -2822,11 +2459,14 @@ export default function Home() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             action: "start",
-            originalText: placementSummary,
+            // Not during an event run-up: in `upcoming` mode this IS a go at a dated evening.
+            originalText: attachDuePhrase(placementSummary, mode !== "upcoming"),
             scenarioContext:
-              mode === "stung"
-                ? "Start from the learner's real situation and the coached-conversation evidence."
-                : "Start from the learner's coached-conversation evidence.",
+              mode === "upcoming"
+                ? "Start from the situation the learner is preparing for and the coached-conversation evidence."
+                : mode === "stung"
+                  ? "Start from the learner's real situation and the coached-conversation evidence."
+                  : "Start from the learner's coached-conversation evidence.",
             context: {
               ...defaultConversationContext,
               who: conversationWho,
@@ -2855,9 +2495,11 @@ export default function Home() {
         body: JSON.stringify({
           originalText: placementSummary,
           scenarioContext:
-            mode === "stung"
-              ? "Evaluate this reply inside the learner's real situation."
-              : "Evaluate this reply inside the learner's first OutLoud session.",
+            mode === "upcoming"
+              ? "Evaluate this reply inside the situation the learner is preparing for."
+              : mode === "stung"
+                ? "Evaluate this reply inside the learner's real situation."
+                : "Evaluate this reply inside the learner's first OutLoud session.",
           context: {
             ...defaultConversationContext,
             who: conversationWho,
@@ -2956,7 +2598,13 @@ export default function Home() {
    * walked out, what is up" and "that was not working, what is going on" are not the same
    * question, and asking the wrong one wastes the first turn.
    */
-  async function enterAside(trigger: "learner" | "offered") {
+  /**
+   * `stuckSaid` is only set for `trigger: "stuck"` -- the sentence they said in the scene, passed
+   * through verbatim so the coach opens with the words instead of asking why they are here. A
+   * coach that has to ask what you meant, when you just said it, is the thing this detour exists
+   * to stop happening.
+   */
+  async function enterAside(trigger: "learner" | "offered" | "stuck", stuckSaid?: string) {
     if (asideActiveRef.current) return;
     const snapshot = asideSceneSnapshot();
     // Nothing to step out OF yet, and nothing to come back to.
@@ -2988,6 +2636,7 @@ export default function Home() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             trigger,
+            stuckSaid: stuckSaid ?? null,
             // /api/aside is stateless: the whole aside travels on every call. Empty here because
             // nothing has been said yet.
             exchange: [],
@@ -3216,6 +2865,44 @@ export default function Home() {
       .filter(Boolean)
       .join(" ");
 
+    const started = await startSceneFor({
+      scenarioEn,
+      who,
+      carriedOver,
+      // An ordinary scene, moved because the last one was wrong for them. Eligible.
+      recallEligible: true,
+      rescue: placementRescue,
+      previousConversationId,
+      arrivalNote: `okay, you are with ${character.name} now.`,
+    });
+
+    if (!started.ok) {
+      // The old scene is still live on the server, so falling back into it is a real recovery.
+      leaveAside(null);
+      setRoomNote(`${started.message} we stayed where we were.`);
+    }
+  }
+
+  /**
+   * Starts a scene that is not the first one of a session: a different situation, the same
+   * learner and the same diagnosis.
+   *
+   * Two callers now -- the aside moving somebody who said the situation was wrong for them, and a
+   * go at a planned event. They need identical mechanics and they must NOT share the reason they
+   * are here, which is why `carriedOver` is built by the caller: it is the one string that
+   * decides what the character knows, and the aside's version deliberately withholds the earlier
+   * situation while an event's deliberately supplies it.
+   */
+  async function startSceneFor(options: {
+    scenarioEn: string;
+    who: string;
+    carriedOver: string;
+    rescue: RescueResponse;
+    previousConversationId: string | null;
+    arrivalNote: string | null;
+    /** Whether a phrase they asked for days ago may be built into this scene. See `attachDuePhrase`. */
+    recallEligible: boolean;
+  }): Promise<{ ok: true } | { ok: false; message: string }> {
     try {
       const first = await readJson<ConverseReply>(
         await fetch("/api/converse", {
@@ -3223,31 +2910,448 @@ export default function Home() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             action: "start",
-            originalText: carriedOver,
-            scenarioContext: scenarioEn,
+            originalText: attachDuePhrase(options.carriedOver, options.recallEligible),
+            scenarioContext: options.scenarioEn,
             // Without this the new scene inherits the old situation: the route treats
             // scenarioContext as background and anchors turn 0 in originalText, which still
             // describes the place the learner just told us is not their problem.
             sceneIsNew: true,
-            context: { ...defaultConversationContext, who },
-            rescue: placementRescue,
+            context: { ...defaultConversationContext, who: options.who },
+            rescue: options.rescue,
             pressureMode,
           }),
         }),
       );
-      if (previousConversationId) {
+      if (options.previousConversationId) {
         void fetch("/api/converse", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "close", conversationId: previousConversationId }),
+          body: JSON.stringify({ action: "close", conversationId: options.previousConversationId }),
         }).catch(() => undefined);
       }
-      showCoachReply(first, `okay, you are with ${character.name} now.`);
+      showCoachReply(first, options.arrivalNote ?? undefined);
+      return { ok: true };
     } catch (error) {
-      const message = error instanceof Error ? error.message : "OutLoud could not set up that scene.";
-      // The old scene is still live on the server, so falling back into it is a real recovery.
-      leaveAside(null);
-      setRoomNote(`${message} we stayed where we were.`);
+      return { ok: false, message: error instanceof Error ? error.message : "OutLoud could not set up that scene." };
+    }
+  }
+
+  /**
+   * A phrase question from /dash: the answer, and then the part that matters.
+   *
+   * `/api/lifeline` runs with no `currentLine` and no `rescue` -- both are optional and always
+   * have been, which is the only reason this chain is cheap. It is a dictionary, not a
+   * conversation: one question, one answer, no history.
+   */
+  async function runAskPhrase(handoff: AskPhraseHandoff) {
+    setMode("speaks-first");
+    setRoomNote(null);
+    setAskPhrase(handoff);
+    setPhraseAnswer(null);
+    setPhraseStatus("asking");
+    setFlowPhase("ask");
+    setTurnState("thinking");
+
+    try {
+      const answer = await readJson<LifelineResponse>(
+        await fetch("/api/lifeline", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query: handoff.askEn, context: defaultConversationContext }),
+        }),
+      );
+      setPhraseAnswer(answer);
+      setPhraseStatus("ready");
+      // Ready, so the mic arms. `expectsEnglishAnswerNow` does not list this phase, which is
+      // exactly right: what they say next is Spanish.
+      setTurnState("ready");
+    } catch {
+      setPhraseStatus("error");
+      setTurnState("ready");
+    }
+  }
+
+  /**
+   * What they said back, turned into a real rescue.
+   *
+   * This is the load-bearing turn. `/api/converse` refuses to start without a rescue and a rescue
+   * needs an attempt, which is the wall the event engine had to climb too — and here it is cheap,
+   * because the thing normally missing is already present: `originalText` is literally what they
+   * asked for.
+   *
+   * Deliberately no moment is saved. A thirty-second lookup is not a session, and putting one in
+   * the list next to a real one would make the list lie about what somebody has done.
+   */
+  async function handlePhraseAttempt(attempt: string) {
+    if (!askPhrase) return;
+    setPhraseStatus("scoring");
+    setTurnState("thinking");
+
+    try {
+      const rescue = await readJson<RescueResponse>(
+        await fetch("/api/rescue", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            entryMode: "wanted_to_say",
+            originalText: askPhrase.askEn,
+            scenarioContext: "The learner asked how to say this and is saying it back for the first time. There is no scene yet.",
+            context: defaultConversationContext,
+            selfReportedBlocker: "not_sure",
+            attempt,
+            skippedAttempt: false,
+          }),
+        }),
+      );
+      setPlacementRescue(rescue);
+      setPhraseStatus("done");
+      setTurnState("ready");
+      void keepAskedPhrase(rescue);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "that did not go through.";
+      setRoomNote(`${message} you can say it again.`);
+      setPhraseStatus("ready");
+      setTurnState("ready");
+    }
+  }
+
+  /**
+   * The phrase, kept against their account with a date to come back.
+   *
+   * Signed out this does nothing, and that is a real hole rather than an oversight: `word_bank`
+   * is scoped to `auth.users`. Failing quietly is right for the same reason the moment save does
+   * — the learner has the phrase either way, and an error about storage in the middle of
+   * practising is noise about our problem.
+   */
+  async function keepAskedPhrase(rescue: RescueResponse) {
+    const supabase = getSupabaseBrowser();
+    if (!supabase) return;
+    const { data } = await supabase.auth.getSession();
+    const token = data.session?.access_token;
+    if (!token) return;
+
+    const words = [
+      { spanish: rescue.natural_version, meaningEn: askPhrase?.askEn ?? null, source: "asked" as const },
+      {
+        spanish: rescue.transferableChunk.patternEs,
+        meaningEn: rescue.transferableChunk.meaningEn,
+        source: "asked" as const,
+      },
+    ].filter((word) => word.spanish.trim().length > 0);
+    if (!words.length) return;
+
+    try {
+      await fetch("/api/word-bank", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ momentId: null, words }),
+      });
+      // Q7's denominator. Everything the phrase feature claims is measured against how many
+      // phrases somebody went looking for in the first place.
+      track("phrase_asked", {});
+    } catch {
+      // Nothing to tell them. The phrase is on their screen; the schedule is our problem.
+    }
+  }
+
+  /**
+   * What this learner asked for and has not produced yet.
+   *
+   * Signed out this is empty and the whole half is simply off: `word_bank.user_id` is not null
+   * against `auth.users`. Loaded once per visit to the room rather than per scene -- a scene start
+   * is already three requests deep and this one must never be what makes it feel slow.
+   */
+  async function loadDuePhrases() {
+    const supabase = getSupabaseBrowser();
+    if (!supabase) return;
+    const { data } = await supabase.auth.getSession();
+    const token = data.session?.access_token;
+    if (!token) return;
+
+    try {
+      const answer = await readJson<{
+        words: Array<{
+          id: string;
+          spanish: string;
+          meaning_en: string | null;
+          source: string;
+          due_at: string | null;
+          resurfaced_count: number | null;
+          landed_at: string | null;
+          created_at: string;
+        }>;
+      }>(await fetch("/api/word-bank", { headers: { Authorization: `Bearer ${token}` } }));
+
+      duePhrasesRef.current = (answer.words ?? [])
+        .filter((word) => word.source === "asked")
+        .map((word) => ({
+          id: word.id,
+          spanish: word.spanish,
+          meaningEn: word.meaning_en,
+          source: word.source,
+          dueAt: word.due_at,
+          resurfacedCount: Number(word.resurfaced_count ?? 0),
+          landedAt: word.landed_at,
+          createdAt: word.created_at,
+        }));
+    } catch {
+      // No phrase comes back this session. Nothing else about the room depends on it.
+    }
+  }
+
+  /**
+   * The single injection point: one due phrase, appended to what the scene is built from.
+   *
+   * Every scene start goes through here and nothing else does, but not every scene is eligible --
+   * `eligible` is passed explicitly by each caller rather than defaulted, because a default is how
+   * "it fires every time" arrives later without anybody choosing it. A go at a planned event is
+   * out: it is a run-up to a real dated evening, and an unrelated phrase in it is the same failure
+   * as offering somebody a rotation topic next to their own dreaded call. The scene straight after
+   * a phrase question is out too, because it already has a phrase in it.
+   *
+   * On top of that, `pickForScene` returns nothing about two scenes in three even when something
+   * is due. A scene built around a saved phrase every single time is a vocabulary quiz in a
+   * costume, and learners find that pattern fast.
+   *
+   * The instruction is written to create the NEED, never the words. A character that says the
+   * phrase has handed it back, and the learner recognises instead of retrieving.
+   */
+  function attachDuePhrase(carriedOver: string, eligible: boolean) {
+    if (!eligible) {
+      activePhraseRef.current = null;
+      return carriedOver;
+    }
+    const pick = pickForScene(duePhrasesRef.current);
+    activePhraseRef.current = pick;
+    if (!pick) return carriedOver;
+
+    // Counted the moment it is used, not when the scene ends: a learner who walks out halfway has
+    // still had it put in front of them, and pretending otherwise would keep it due forever.
+    void recordPhraseOutcome(pick, "resurfaced");
+    duePhrasesRef.current = duePhrasesRef.current.filter((phrase) => phrase.id !== pick.id);
+
+    return [
+      carriedOver,
+      `Build ONE moment into this scene where the learner needs to say "${pick.spanish}"`,
+      pick.meaningEn ? `(${pick.meaningEn}).` : ".",
+      "Create the NEED for it: ask them something, or put them in a spot, where that is the natural thing to say.",
+      "You must NEVER say it, hint at it, translate it, or offer it as an option. They asked for this phrase days ago and the whole point is that they reach for it on their own. If you produce it first, you have taken that away from them.",
+      "Say nothing about them having asked for it. Not before, not during.",
+    ].join(" ");
+  }
+
+  /**
+   * Did the phrase this scene was carrying actually come out, and come out alone?
+   *
+   * Deterministic containment plus `assistanceUsed === "none"` -- both halves, neither negotiable.
+   * The evaluator's own `usedTargetChunk` judges the rescue's chunk, which here is a different
+   * string entirely, so it cannot be used for this.
+   */
+  function notePhraseAttempt(said: string, evaluation: AttemptEvaluation | null) {
+    const phrase = activePhraseRef.current;
+    if (!phrase) return;
+    const assistance = evaluation?.assistanceUsed ?? turnAssistanceRef.current;
+    if (assistance !== "none") return;
+    if (!containsPhrase(said, phrase.spanish)) return;
+
+    activePhraseRef.current = null;
+    // Read by the next callout, which is the only place this is ever mentioned to the learner.
+    landedPhraseRef.current = phrase;
+    void recordPhraseOutcome(phrase, "landed");
+  }
+
+  async function recordPhraseOutcome(phrase: RecallPhrase, outcome: "resurfaced" | "landed") {
+    /*
+     * Q7, both halves, from the one place both outcomes pass through.
+     *
+     * `phrase_landed / phrase_asked` is the number the whole `talk` build exists for. The gap
+     * between `resurfaced` and `landed` is the diagnosis when it is bad: many resurfaces and no
+     * landings means the phrases come back and do not stick, which is a different problem from
+     * them never coming back at all.
+     *
+     * Tracked before the request, not after: whether our own PATCH succeeded says nothing about
+     * whether the learner produced the phrase, and losing an aha to a network blip would make the
+     * one metric that matters quietly pessimistic.
+     */
+    const daysSinceAsked = Math.max(
+      0,
+      Math.round((Date.now() - new Date(phrase.createdAt).getTime()) / 86_400_000),
+    );
+    track(outcome === "landed" ? "phrase_landed" : "phrase_resurfaced", {
+      resurfacedCount: phrase.resurfacedCount,
+      daysSinceAsked,
+    });
+
+    const supabase = getSupabaseBrowser();
+    if (!supabase) return;
+    const { data } = await supabase.auth.getSession();
+    const token = data.session?.access_token;
+    if (!token) return;
+    try {
+      await fetch("/api/word-bank", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ id: phrase.id, outcome }),
+      });
+    } catch {
+      // The schedule slips by one scene. Not worth telling anybody about mid-conversation.
+    }
+  }
+
+  /**
+   * One offer, once they have said it: a scene where they have to use it for real.
+   *
+   * The situation comes from `/api/variation`, which is the machinery for exactly this — it
+   * builds a nearby situation that REQUIRES a pattern without stating it. Handing the scene a
+   * situation we invented here would produce a character that says the phrase first, which is the
+   * one thing that destroys the point of practising it.
+   */
+  async function startSceneFromAskedPhrase() {
+    if (!placementRescue || !askPhrase) return;
+    setTurnState("thinking");
+    setRoomNote(null);
+
+    let situationEn = "";
+    let who = defaultConversationContext.who;
+    try {
+      const variation = await readJson<{ situationEn: string; roleEs: string }>(
+        await fetch("/api/variation", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            originalText: askPhrase.askEn,
+            scenarioContext: null,
+            context: defaultConversationContext,
+            rescue: placementRescue,
+          }),
+        }),
+      );
+      situationEn = variation.situationEn;
+      who = variation.roleEs || who;
+    } catch {
+      // A scene is still better than no scene. The pattern in `carriedOver` below is what makes
+      // the character need it either way; the variation only makes the setting sharper.
+      situationEn = `A short everyday situation where the learner has to say: ${askPhrase.askEn}`;
+    }
+
+    const carriedOver = [
+      `The learner is practising this pattern: "${placementRescue.transferableChunk.patternEs}"`,
+      `(${placementRescue.transferableChunk.communicativeFunction}).`,
+      `They asked how to say "${askPhrase.askEn}" and have said it once, out of any situation.`,
+      "This scene exists so they have to reach for it themselves. Never say the phrase or the pattern yourself.",
+    ].join(" ");
+
+    setPlacementSummary(carriedOver);
+    beginSession();
+
+    const started = await startSceneFor({
+      scenarioEn: situationEn,
+      who,
+      carriedOver,
+      // This scene already has a phrase in it: the one they asked about thirty seconds ago.
+      recallEligible: false,
+      rescue: placementRescue,
+      previousConversationId: null,
+      arrivalNote: null,
+    });
+
+    if (!started.ok) {
+      setFlowPhase("ask");
+      setPhraseStatus("done");
+      setRoomNote(`${started.message} typing works too.`);
+      setTurnState("ready");
+    }
+  }
+
+  /**
+   * A moment that already went wrong, described on /dash and handed over.
+   *
+   * There is no new engine here and deliberately so: `stung` is one of the room's original modes,
+   * and everything downstream of the intake — the past-tense wording in five prompts, the scene
+   * built from the rescue — already reads it. All that was missing was a door.
+   *
+   * `mode` and the coach's mode are set in the same breath for the reason `handleOpeningAttempt`
+   * takes the mode explicitly: the state has not landed by the time the request goes out, and
+   * getting it wrong is the tense bug in reverse.
+   */
+  async function runStungIntake(handoff: StungHandoff) {
+    setMode("stung");
+    setRoomNote(null);
+    await handleOpeningAttempt(handoff.said, "stung", handoff.situationEn);
+  }
+
+  /**
+   * One go at a planned event (#30).
+   *
+   * The FIRST go is the intake, seeded with what they said and which part of the evening this is.
+   * It is the only thing in the app that produces a rescue, and every go after it starts its
+   * scene from that same rescue -- which is what makes a four-session run-up possible at all
+   * without four placements.
+   */
+  async function runEventBeat(event: StoredEvent, beatIndex: number) {
+    const beat = event.beats.find((item) => item.index === beatIndex) ?? event.beats[0];
+    if (!beat) return;
+
+    activeEventRef.current = { event, beat };
+    setMode("upcoming");
+    setRoomNote(null);
+
+    const rescue = (event.rescue ?? null) as RescueResponse | null;
+
+    if (!rescue) {
+      // Their own words first: the coach's prompt says the opening answer describes the event, and
+      // a paraphrase of what somebody said is a worse description of their life than what they
+      // said. The beat is appended so the intake starts in the right part of the evening.
+      await handleOpeningAttempt(
+        `${event.said} The part I need to practise: ${beat.titleEn}. ${beat.situationEn}`,
+        "upcoming",
+      );
+      return;
+    }
+
+    /*
+     * Deliberately NOT `placementSummary`. That string carries the whole transcript of the intake,
+     * and dragging one evening's conversation into the next go at it is the same bug the aside had
+     * -- the character reads the transcript, not the instruction, and answers the wrong scene.
+     */
+    const carriedOver = [
+      `The learner is practising this pattern: "${rescue.transferableChunk.patternEs}"`,
+      `(${rescue.transferableChunk.communicativeFunction}).`,
+      event.focusBlocker && event.focusBlocker in blockerFocusLabels
+        ? `What breaks for them: ${blockerFocusLabels[event.focusBlocker as BlockerType]}.`
+        : "",
+      `They are preparing for ${event.nameEn}, which has not happened yet.`,
+      `This go is one part of it: ${beat.targetCommunicativeFunction}.`,
+    ]
+      .filter(Boolean)
+      .join(" ");
+
+    const character = {
+      name: beat.characterName,
+      relation: beat.characterRelation,
+      traitEn: beat.characterTraitEn,
+    };
+    setSceneCharacter(character);
+    setPlacementRescue(rescue);
+    setPlacementSummary(carriedOver);
+    beginSession();
+
+    const started = await startSceneFor({
+      scenarioEn: beat.situationEn,
+      who: `${character.name}, ${character.relation} (${character.traitEn})`,
+      carriedOver,
+      // A run-up to a real dated evening. An unrelated phrase dropped into it is the same failure
+      // as offering somebody a rotation topic beside their own dreaded call.
+      recallEligible: false,
+      rescue,
+      previousConversationId: null,
+      arrivalNote: `${beat.titleEn}. you are with ${character.name}.`,
+    });
+
+    if (!started.ok) {
+      setFlowPhase("opening");
+      setRoomNote(`${started.message} typing works too.`);
+      setTurnState("ready");
     }
   }
 
@@ -3501,6 +3605,41 @@ export default function Home() {
     }
   }
 
+  /**
+   * Counts what is already here, once, when there is somebody to say it to.
+   *
+   * Gated on being signed out and having a verdict: signed in there is nothing to claim, and
+   * before the verdict there is no ask on screen to put the number in. Failure leaves it null,
+   * which renders the older wording rather than a wrong count.
+   */
+  // The room is its own entry point -- plenty of people never see `/dash` at all -- so it starts
+  // tracking itself rather than assuming the other screen already did.
+  useEffect(() => {
+    initTracking();
+  }, []);
+
+  useEffect(() => {
+    if (authedEmail || !placementRescue || !clientSessionId || unclaimedRuns !== null) return;
+    let alive = true;
+    void (async () => {
+      try {
+        const response = await fetch(`/api/moments?sessionId=${encodeURIComponent(clientSessionId)}`);
+        const json = await response.json();
+        if (alive && response.ok && typeof json.count === "number") {
+          setUnclaimedRuns(json.count);
+          // Q5's denominator. The ask is on screen and this is what it can point at -- the same
+          // number the copy uses, so a conversion rate can be read against what was actually said.
+          track("account_ask_seen", { unclaimedRuns: json.count });
+        }
+      } catch {
+        // Offline, or the route fell over. The ask keeps its older wording.
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [authedEmail, placementRescue, clientSessionId, unclaimedRuns]);
+
   async function saveCurrentMoment(
     turnsOverride: SessionTurn[] = sessionTurns,
     currentTurnOverride: ConverseReply | null = currentConversationTurn,
@@ -3617,10 +3756,30 @@ export default function Home() {
             ledgerState,
             createdAt: new Date().toISOString(),
             deepLinkMomentId: null,
+            // Which evening this run was a go at, so the library can say so and the event can
+            // find its way back to the transcript.
+            eventId: activeEventRef.current?.event.id ?? null,
           }),
         }),
       );
       setSavedMomentId(response.momentId);
+
+      // The go is done. Written back so the entry screen counts it, and so the run-up moves on to
+      // the next part of the evening instead of offering the same one again.
+      const activeEvent = activeEventRef.current;
+      if (activeEvent && !activeEvent.beat.completedAt) {
+        void patchEvent(activeEvent.event.id, {
+          beat: {
+            index: activeEvent.beat.index,
+            momentId: response.momentId,
+            completedAt: new Date().toISOString(),
+          },
+        }).then((updated) => {
+          if (!updated || !activeEventRef.current) return;
+          const beat = updated.beats.find((item) => item.index === activeEvent.beat.index);
+          activeEventRef.current = { event: updated, beat: beat ?? activeEventRef.current.beat };
+        });
+      }
       setLastReviewUrl(response.reviewUrl);
       setSaveStatus("saved");
       return response.momentId;
@@ -3775,6 +3934,9 @@ export default function Home() {
   }
 
   function openAuth(intent: "signup" | "signin") {
+    // Q5. Opening the dialog is intent; finishing it is conversion. Keeping them apart is what
+    // says whether the ask is unconvincing or the signup itself is where people give up.
+    track("account_dialog_opened", { mode: intent });
     setAuthIntent(intent);
     setAuthOpen(true);
   }
@@ -3845,6 +4007,125 @@ export default function Home() {
     restoreVerdictAfterAuthRef.current = restoreVerdictAfterAuth;
   });
 
+  // One subscription for the life of the room, dispatching through the ref above.
+  useEffect(() => voice.onEvent((event) => handleRealtimeEventRef.current(event)), []);
+
+  /*
+   * What this learner asked for and never produced, fetched once on arrival.
+   *
+   * Deliberately not per scene: a scene start is already several requests deep and nothing here is
+   * allowed to make it feel slower. Signed out it returns nothing and the whole half stays off.
+   */
+  useEffect(() => {
+    void loadDuePhrases();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- runs once, on arrival
+  }, []);
+
+  /**
+   * One go at a planned event, handed over from /dash. Only the ids travel; the event itself is
+   * loaded here, because running the beat needs the rescue and the character too and a copy of
+   * all that in sessionStorage would be a second source of truth for something the learner is in
+   * the middle of.
+   *
+   * Sits between the two effects around it in specificity: resuming a named conversation beats
+   * it, and it beats a bare "start talking".
+   */
+  useEffect(() => {
+    let raw: string | null = null;
+    try {
+      raw = window.sessionStorage.getItem(eventBeatKey);
+      if (raw) window.sessionStorage.removeItem(eventBeatKey);
+      if (window.sessionStorage.getItem(resumeMomentKey)) raw = null;
+    } catch {
+      return;
+    }
+    if (!raw) return;
+
+    let cancelled = false;
+    void (async () => {
+      let handoff: EventBeatHandoff;
+      try {
+        handoff = JSON.parse(raw) as EventBeatHandoff;
+      } catch {
+        return;
+      }
+      const event = await loadEvent(handoff.eventId);
+      if (cancelled) return;
+      if (!event) {
+        // The plan is gone, or unreachable. The landing panel is the honest screen for that --
+        // silently starting the default intake is the failure this whole entry path exists to
+        // prevent.
+        setRoomNote("I couldn't find that one. we can start fresh instead.");
+        return;
+      }
+      await runEventBeatRef.current(event, handoff.beatIndex);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /**
+   * A phrase question, handed over from /dash. Same ladder as the effects around it: anything
+   * that points at a particular conversation or a particular go beats a question about words.
+   */
+  useEffect(() => {
+    let raw: string | null = null;
+    try {
+      raw = window.sessionStorage.getItem(askPhraseKey);
+      if (raw) window.sessionStorage.removeItem(askPhraseKey);
+      if (window.sessionStorage.getItem(resumeMomentKey)) raw = null;
+      if (window.sessionStorage.getItem(eventBeatKey)) raw = null;
+    } catch {
+      return;
+    }
+    if (!raw) return;
+    let handoff: AskPhraseHandoff;
+    try {
+      handoff = JSON.parse(raw) as AskPhraseHandoff;
+    } catch {
+      return;
+    }
+    if (!handoff?.askEn?.trim()) return;
+    const timer = window.setTimeout(() => void runAskPhraseRef.current(handoff), 0);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  /**
+   * A moment that already went wrong, handed over from /dash as the learner's own sentence.
+   *
+   * Same specificity ladder as the effect above: a named conversation and a named go at a planned
+   * event both beat this, because both point at something particular and this only describes one.
+   * /dash writes exactly one of these keys per departure, so the cross-checks here and below are
+   * belt-and-braces rather than load-bearing — and note that each effect clears its own key as
+   * it reads it, so a later effect can only see a key an earlier one did not reach.
+   */
+  useEffect(() => {
+    let said: string | null = null;
+    try {
+      said = window.sessionStorage.getItem(stungKey);
+      if (said) window.sessionStorage.removeItem(stungKey);
+      if (window.sessionStorage.getItem(resumeMomentKey)) said = null;
+      if (window.sessionStorage.getItem(eventBeatKey)) said = null;
+      if (window.sessionStorage.getItem(askPhraseKey)) said = null;
+    } catch {
+      return;
+    }
+    if (!said) return;
+    let handoff: StungHandoff;
+    try {
+      handoff = JSON.parse(said) as StungHandoff;
+    } catch {
+      return;
+    }
+    if (!handoff?.said?.trim()) return;
+    // Deferred for the same reason as the two below: no synchronous setState in an effect body,
+    // and the rebind effect above has filled the ref by the time this fires.
+    const timer = window.setTimeout(() => void runStungIntakeRef.current(handoff), 0);
+    return () => window.clearTimeout(timer);
+  }, []);
+
   // /dash hands off a plain "start talking" the same way, minus a rescue to restore. Runs before
   // the resume effect below and defers to it: if both keys are somehow set, picking a specific
   // conversation back up is the more specific intent.
@@ -3854,6 +4135,9 @@ export default function Home() {
       wants = window.sessionStorage.getItem(autoStartKey) === "1";
       if (wants) window.sessionStorage.removeItem(autoStartKey);
       if (window.sessionStorage.getItem(resumeMomentKey)) wants = false;
+      if (window.sessionStorage.getItem(eventBeatKey)) wants = false;
+      if (window.sessionStorage.getItem(stungKey)) wants = false;
+      if (window.sessionStorage.getItem(askPhraseKey)) wants = false;
     } catch {
       return;
     }
@@ -3944,7 +4228,7 @@ export default function Home() {
   // frozen into the token at mint time, so switching tone mid-session changed nothing; pushing it
   // over the open channel is what actually makes the toggle real.
   useEffect(() => {
-    if (realtimeActiveCaptureRef.current) applyVadProfile("capture");
+    if (voice.capturing) applyVadProfile("capture");
     // eslint-disable-next-line react-hooks/exhaustive-deps -- only the tone change should re-send.
   }, [pressureMode]);
 
@@ -3971,14 +4255,19 @@ export default function Home() {
     overlayRef.current = overlay;
     typedFallbackOpenRef.current = typedFallbackOpen;
     // Opening a card or the typing sheet while the mic is open ends the listen quietly.
-    if ((overlay || typedFallbackOpen) && realtimeActiveCaptureRef.current) {
-      realtimeActiveCaptureRef.current = false;
+    const endedALiveCapture = Boolean((overlay || typedFallbackOpen) && voice.capturing);
+    if (endedALiveCapture) {
+      voice.abortCapture();
       holdingRef.current = false;
       turnStateRef.current = "ready";
-      setTurnState("ready");
     }
     // Re-derived rather than force-closed: an overlay closing in open mode should re-arm the mic.
     syncRealtimeMic();
+    if (!endedALiveCapture) return;
+    // Deferred: a synchronous setState in an effect body is a cascading render. The ref above is
+    // the copy the mic derivation reads, and it is already correct -- this only catches the UI up.
+    const timer = window.setTimeout(() => setTurnState("ready"), 0);
+    return () => window.clearTimeout(timer);
     // syncRealtimeMic reads refs only; re-creating this effect for it would just churn.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [overlay, typedFallbackOpen]);
@@ -4000,14 +4289,14 @@ export default function Home() {
       __outloudVoiceDump?: () => string;
     };
     try {
-      realtimeDebugRef.current = window.localStorage.getItem("outloud-debug-realtime") === "1";
+      voice.debug = window.localStorage.getItem("outloud-debug-realtime") === "1";
     } catch {
       // Storage blocked: tracing simply stays off.
     }
     // Toggling without a reload, and a dump that does not depend on the console being open or
     // unfiltered when the events happened.
     store.__outloudVoiceDebug = (on = true) => {
-      realtimeDebugRef.current = on;
+      voice.debug = on;
       try {
         window.localStorage.setItem("outloud-debug-realtime", on ? "1" : "0");
       } catch {
@@ -4016,7 +4305,7 @@ export default function Home() {
       return `voice tracing ${on ? "ON" : "off"}`;
     };
     store.__outloudVoiceDump = () => (store.__outloudVoiceLog ?? []).join(String.fromCharCode(10)) || "(nothing recorded)";
-    if (realtimeDebugRef.current) {
+    if (voice.debug) {
       console.log("%c[voice] tracing ON — run __outloudVoiceDump() to copy the log", "color:#c1440e");
     }
   }, []);
@@ -4029,15 +4318,29 @@ export default function Home() {
     };
   }, []);
 
+  /**
+   * The room holds the shared voice session while it is mounted, and lets go on unmount.
+   *
+   * `release` is deliberately not `disconnect`: leaving the entry screen unmounts it a moment
+   * before the room mounts, and tearing the connection down in that gap would cost a second
+   * microphone prompt and a second token mint for one continuous act. The session waits out the
+   * gap and only really closes if nobody comes back.
+   */
+  useEffect(() => {
+    voice.acquire();
+    return () => {
+      voice.release();
+    };
+  }, []);
+
   useEffect(
     () => () => {
       clearTimers();
       stopMediaStream();
       stopStaticAudio(false);
-      disconnectRealtime();
+      resetRealtimeSpeaking();
     },
     // Run once on unmount; cleanup reads refs, not render-time values.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
   );
 
@@ -4060,7 +4363,7 @@ export default function Home() {
   function enterRoom(nextMode: RoomMode) {
     clearTimers();
     stopStaticAudio(false);
-    disconnectRealtime();
+    resetRealtimeSpeaking();
     holdingRef.current = false;
     pressingRef.current = false;
     pressSessionRef.current += 1;
@@ -4073,6 +4376,13 @@ export default function Home() {
     setLastTranscript(null);
     setFlowPhase("opening");
     setOpeningAnswer("");
+    setAskPhrase(null);
+    setPhraseAnswer(null);
+    setPhraseStatus("asking");
+    // Not the loaded list -- only what THIS scene was carrying. A phrase already counted as
+    // resurfaced must not be counted again by the next scene in the same visit.
+    activePhraseRef.current = null;
+    landedPhraseRef.current = null;
     setCoachId(null);
     setCoachTurn(null);
     setCoachLoot([]);
@@ -4124,6 +4434,9 @@ export default function Home() {
   // after all of them, so the ref is filled by the time it is read.
   useEffect(() => {
     enterRoomRef.current = enterRoom;
+    runEventBeatRef.current = runEventBeat;
+    runStungIntakeRef.current = runStungIntake;
+    runAskPhraseRef.current = runAskPhrase;
   });
 
   async function startHolding() {
@@ -4228,13 +4541,13 @@ export default function Home() {
       vlog("hold", "stop IGNORED: not holding");
       return;
     }
-    vlog("hold", "stopping | realtime capture:", realtimeActiveCaptureRef.current, "| recorder:", mediaRecorderRef.current?.state ?? "none");
+    vlog("hold", "stopping | realtime capture:", voice.capturing, "| recorder:", mediaRecorderRef.current?.state ?? "none");
 
     clearTimers();
     holdingRef.current = false;
     setTurnState("thinking");
 
-    if (realtimeActiveCaptureRef.current) {
+    if (voice.capturing) {
       void finishRealtimeListening(true);
       return;
     }
@@ -4347,6 +4660,31 @@ export default function Home() {
   }
 
   /**
+   * Somebody in the middle of a scene who says, in English, that they do not know how to say it
+   * has not produced a bad transcript and has not produced a Spanish attempt. They have asked for
+   * the coach.
+   *
+   * Without this the sentence goes to `looksBrokenAttempt` -- which keys on English filler words
+   * as evidence that English leaked into Spanish, so a clear English sentence trips it every time
+   * -- and the learner is shown "here's what I heard. fix anything that's wrong, then send." The
+   * transcription was perfect. Telling somebody who just asked for help that the problem is their
+   * pronunciation is worse than saying nothing, and it repeats for as long as they keep asking.
+   *
+   * The way out already exists and is already built: the aside is a room mode, the mic stays
+   * open, `/api/aside` carries the scene snapshot, and leaving it puts them back where they were.
+   * It was only ever reachable by pressing a chip. Now the asking reaches it, which is the point:
+   * a partner who becomes a coach the moment you ask is the thing this app is supposed to be.
+   */
+  function stuckAskShouldStepOut(text: string) {
+    if (asideActiveRef.current || !canStepOut) return false;
+    // Not during the intake. English is the expected answer there, and /api/coach already answers
+    // a stuck admission by handing over the words -- stepping out would replace working help with
+    // a detour.
+    if (expectsEnglishAnswerNow()) return false;
+    return needsWordsEn(text);
+  }
+
+  /**
    * Decides whether a captured transcript needs the confirm step or can go straight to scoring.
    * Confirming EVERY spoken turn is the wrong trade once the mic is open -- it re-adds exactly the
    * tap that full-duplex removes -- so the box is reserved for transcripts that look wrong.
@@ -4362,6 +4700,44 @@ export default function Home() {
     const suspicious = expectsEnglishAnswer
       ? lowConfidence || transcript.includes("...") || wordCount <= 1
       : lowConfidence || looksBrokenAttempt(transcript) || transcript.trim().length < 3;
+
+    // Asked for, not mis-heard. Checked before `suspicious` is acted on, because this sentence
+    // trips every one of those checks and the confirm box is the wrong answer to all of them.
+    if (stuckAskShouldStepOut(transcript)) {
+      void enterAside("stuck", transcript);
+      return;
+    }
+
+    /*
+     * Classified before anything is called suspicious, and with the SAME function the realtime
+     * path uses -- these two capture routes kept disagreeing about what counts as an answer.
+     *
+     * The confirm box means "I heard words and they might be wrong, check them". A capture of
+     * "ah..." is not that. The transcription was perfect; there was nothing in it. Showing that
+     * screen tells somebody who was still thinking that the microphone misheard them, which is
+     * both untrue and the opposite of the reassurance the moment needs.
+     *
+     * `speechSeen` is true here because this path only runs on audio that was actually recorded;
+     * the no-speech verdict belongs to the realtime path, where VAD can report silence.
+     */
+    const captureVerdict = classifyCapture(transcript, true);
+
+    if (captureVerdict === "filler" || captureVerdict === "empty") {
+      patientCaptureRef.current = true;
+      setRoomNote("take your time.");
+      setTurnState("ready");
+      return;
+    }
+
+    if (captureVerdict === "decode-loop") {
+      // A decoder stuck in a loop, not a learner. It reads as well-formed, so nothing downstream
+      // would have caught it -- and a clipped recording is what usually produces it, so the next
+      // capture gets the patient window rather than the same cut-off.
+      patientCaptureRef.current = true;
+      setRoomNote("that came back garbled — say it once more, I'll wait longer.");
+      setTurnState("ready");
+      return;
+    }
 
     // A Spanish turn answered in English is the intake's only usable "this is not working"
     // signal -- there is no evaluator before the verdict, so the suspicion router is all there is.
@@ -4397,13 +4773,35 @@ export default function Home() {
       return;
     }
 
+    // Typing it, or confirming it after the transcript box, has to mean the same thing as saying
+    // it. Otherwise the help you get depends on which input you happened to use.
+    if (stuckAskShouldStepOut(trimmed)) {
+      await enterAside("stuck", trimmed);
+      return;
+    }
+
     if (retryTarget) {
       await submitRetryAttempt(trimmed, inputMode, lowConfidence);
       return;
     }
 
     if (flowPhase === "opening") {
+      // The ask entry answers its own question: what they just said is the sentence they want, so
+      // it goes straight to the lifeline rather than into a coach intake that would spend three
+      // turns working out what they had already told it.
+      if (isAskEntry) {
+        await runAskPhrase({ said: trimmed, askEn: strippedAsk(trimmed) });
+        return;
+      }
       await handleOpeningAttempt(trimmed);
+      return;
+    }
+
+    // The say-it-back. Only while the answer is on screen: anything spoken after the rescue lands
+    // has nowhere to go, and scoring it a second time would tell them their phrase got worse.
+    if (flowPhase === "ask") {
+      if (phraseStatus === "ready") await handlePhraseAttempt(trimmed);
+      else setTurnState("ready");
       return;
     }
 
@@ -4503,6 +4901,8 @@ export default function Home() {
       if (repliedTo) {
         setSessionTurns(nextTurns);
       }
+      // Before the callout is built, because the callout is where a landed phrase is announced.
+      notePhraseAttempt(trimmed, evaluation);
       showCoachReply(next, calloutForTurn(evaluation, Boolean(next.shouldClose)));
       if (next.shouldClose) {
         void saveCurrentMoment(nextTurns, next);
@@ -4622,7 +5022,7 @@ export default function Home() {
         ) : null}
 
         <button
-          className={`room-orb-wrap ${turnState}`}
+          className={`room-orb-wrap ${turnState}${flowPhase === "ask" ? " is-compact" : ""}`}
           type="button"
           aria-label={holdLabel}
           disabled={orbDisabled}
@@ -4647,11 +5047,30 @@ export default function Home() {
           <OrbCanvas state={orbState} className="room-orb" />
         </button>
 
-        <section className="room-copy" aria-label="Current room prompt">
-          <p className={isUserTurn ? "turn-label is-user" : "turn-label"}>
-            {roomLabel}
-          </p>
-          {roomSubcopy ? <p className="turn-subcopy">{roomSubcopy}</p> : null}
+        <section
+          className={flowPhase === "ask" ? "room-copy is-compact" : "room-copy"}
+          aria-label="Current room prompt"
+        >
+          {/*
+            Dropped while the ask phase is waiting for them to speak. Everywhere else this line is
+            the mic state sitting above a coach line; here it would sit above the question and
+            read as the heading for the screen -- and "now say it." two lines down already says it
+            better. The live states (listening, thinking) still show, because those ARE worth
+            knowing while the mic is open.
+          */}
+          {(flowPhase === "ask" && turnState === "ready") || asideActive ? null : (
+            <p className={isUserTurn ? "turn-label is-user" : "turn-label"}>
+              {roomLabel}
+            </p>
+          )}
+          {/*
+            Both dropped while stepped out. The aside carries its own status line ("stepped out --
+            we can pick this up again") and its own heading, so the room's label stacked three
+            pieces of state on top of each other: "speaking", "tap the orb to interrupt", "stepped
+            out". None of the three was the thing the learner was actually reading, and "interrupt"
+            is wrong here anyway -- there is no scene running to interrupt.
+          */}
+          {roomSubcopy && !asideActive ? <p className="turn-subcopy">{roomSubcopy}</p> : null}
           {typedFallbackOpen ? (
             <div className="type-fallback" aria-label="Typed fallback">
               <h2>{transcriptNeedsConfirm ? "here's what I heard." : "I can't hear you yet."}</h2>
@@ -4699,9 +5118,13 @@ export default function Home() {
                   className="quiet-link"
                   type="button"
                   onClick={() => {
+                    const said = typedAttempt.trim();
                     setTypedFallbackOpen(false);
                     setTranscriptNeedsConfirm(false);
-                    void enterAside("learner");
+                    // If what is in the box is itself an admission, the coach can open with the
+                    // words rather than asking. Otherwise this stays the old open-ended step-out.
+                    if (said && needsWordsEn(said)) void enterAside("stuck", said);
+                    else void enterAside("learner");
                   }}
                 >
                   that&apos;s not the problem — can we talk?
@@ -4721,7 +5144,7 @@ export default function Home() {
                 in a conversation rather than being asked a series of unrelated questions.
               */}
               {asideExchange.length > 1 ? (
-                <div className="aside-thread">
+                <div className="aside-thread" ref={asideThreadRef}>
                   {asideExchange.slice(0, -1).map((entry, index) => (
                     <p key={`${entry.who}-${index}`} className={entry.who === "you" ? "aside-said-you" : "aside-said-coach"}>
                       {entry.text}
@@ -4753,6 +5176,99 @@ export default function Home() {
                 </button>
               ) : null}
             </div>
+          ) : flowPhase === "ask" && askPhrase ? (
+            <div className="ask-room" aria-label="How to say it">
+              {/*
+                What they asked for, at the top and unchanged, so a misheard question is obvious
+                before they spend a breath on it. The read-back on /dash is the first safety net;
+                this is the second.
+              */}
+              <p className="ask-question">how to say: {askPhrase.askEn}</p>
+
+              {phraseStatus === "asking" ? <h2>one second — looking that up.</h2> : null}
+
+              {phraseStatus === "error" ? (
+                <>
+                  <h2>I couldn&apos;t look that one up.</h2>
+                  <button className="quiet-link" type="button" onClick={() => void runAskPhrase(askPhrase)}>
+                    try again
+                  </button>
+                </>
+              ) : null}
+
+              {phraseAnswer && phraseStatus !== "error" ? (
+                <>
+                  {/*
+                    ALL of them, each with when to use it. The in-scene sheet shows one because it
+                    is interrupting a conversation and there is no time; here, choosing between
+                    them is the lesson -- "which of these would you actually say" is most of what
+                    knowing a phrase means.
+                  */}
+                  <ul className="ask-options">
+                    {phraseAnswer.options.map((option) => (
+                      <li key={option.spanish} className="ask-option">
+                        <p className="ask-option-es">{option.spanish}</p>
+                        <p className="ask-option-en">{option.meaningEn}</p>
+                        <p className="ask-option-when">{option.useWhenEn}</p>
+                      </li>
+                    ))}
+                  </ul>
+                  {phraseAnswer.noteEn ? <p className="ask-note">{phraseAnswer.noteEn}</p> : null}
+                </>
+              ) : null}
+
+              {phraseStatus === "ready" ? (
+                <>
+                  {/*
+                    The beat this whole feature exists for. Knowing the phrase and producing it
+                    under pressure are different things, and a screen that stops here is a
+                    dictionary -- which already exists, and is free.
+                  */}
+                  <h2>now say it.</h2>
+                  <p className="room-translation">whichever one you&apos;d actually use.</p>
+                </>
+              ) : null}
+
+              {phraseStatus === "scoring" ? <h2>one second.</h2> : null}
+
+              {phraseStatus === "done" && placementRescue ? (
+                <div className="ask-verdict">
+                  <p className="ask-natural">{placementRescue.natural_version}</p>
+                  <p className="ask-feedback">{placementRescue.actionable_feedback.explanationEn}</p>
+                  <button className="sheet-primary" type="button" onClick={() => void startSceneFromAskedPhrase()}>
+                    use it for real
+                  </button>
+                  {/*
+                    Leaving is a first-class answer here. Somebody who wanted the words and nothing
+                    else got them, and holding the door shut until they perform for us is the wrong
+                    trade -- the same reason `/api/rescue` supports a skipped attempt.
+                  */}
+                  <button className="quiet-link" type="button" onClick={() => setMode("landing")}>
+                    that&apos;s all I needed
+                  </button>
+                </div>
+              ) : null}
+
+              {roomNote ? <p className="room-note">{roomNote}</p> : null}
+              {phraseStatus === "ready" ? (
+                <button className="quiet-link" type="button" onClick={() => setTypedFallbackOpen(true)}>
+                  rather type?
+                </button>
+              ) : null}
+            </div>
+          ) : isAskEntry && flowPhase === "opening" ? (
+            <>
+              {/*
+                One direct question, so the answer IS the thing -- no router needed to work out
+                what they meant. `strippedAsk` takes the asking off the front for people who
+                answer a question with a question, which most people do.
+              */}
+              <h2>what do you want to be able to say?</h2>
+              <p className="room-translation">english is fine — just the sentence.</p>
+              <button className="quiet-link" type="button" onClick={() => setTypedFallbackOpen(true)}>
+                rather type?
+              </button>
+            </>
           ) : isStung && flowPhase === "opening" ? (
             <>
               <h2>tell me what happened — english is fine.</h2>
@@ -4818,7 +5334,7 @@ export default function Home() {
                       onPick={(label) => {
                         // Tapping a direction is the answer: stop talking/listening and send it.
                         cancelSpeaking();
-                        realtimeActiveCaptureRef.current = false;
+                        voice.abortCapture();
                         holdingRef.current = false;
                         syncRealtimeMic();
                         void submitAttempt(label, "written");
@@ -4972,10 +5488,16 @@ export default function Home() {
             >
               start talking.
             </button>
+            {/*
+              This ran `enterRoom("stung")` -- the engine for "a moment that went badly" -- so
+              somebody who stated the exact sentence they wanted got "tell me what happened" and
+              then a choice of two scenarios, and never the sentence. The engine that answers it
+              already existed and was reachable only from `/dash`, which nothing links to.
+            */}
             <button
               className="secondary-action"
               type="button"
-              onClick={() => enterRoom("stung")}
+              onClick={() => enterRoom("ask")}
             >
               didn&apos;t know how to say something? &rarr;
             </button>
@@ -5092,17 +5614,27 @@ export default function Home() {
                     and that signing up on the same address claims what is already there (which
                     /api/library really does, on first load).
                   */}
+                  {/*
+                    #32, and the half of it that took longest to be true. The ask used to
+                    promise a future the learner had no way to check. It points at what is
+                    already sitting in this browser instead, which is only honest because
+                    `/api/library` now claims on session id as well as email -- before that,
+                    these runs came with nobody. Under two there is nothing worth pointing
+                    at, so it says the other thing.
+                  */}
                   <p className="capture-sub">
-                    nothing here comes back on its own. an account is what lets OutLoud remember
-                    you — what trips you up, every session, all of it.
+                    {unclaimedRuns && unclaimedRuns > 1
+                      ? `${unclaimedRuns} sessions are saved on this device and nothing is holding on to them. an account is what keeps them — and what lets OutLoud remember what trips you up.`
+                      : "nothing here comes back on its own. an account is what lets OutLoud remember you — what trips you up, every session, all of it."}
                   </p>
                   <button className="account-button" type="button" onClick={() => openAuth("signup")}>
                     create a free account
                   </button>
                   <p className="capture-fineprint">
                     your practice is tied to a login, not to a typed-in address — otherwise anyone
-                    who guessed your email could read it. sign up with the same address and
-                    everything you already saved comes with you.
+                    who guessed your email could read it. signing up on this device brings
+                    everything you already practised with you, whether or not you ever gave us
+                    an address.
                   </p>
                   <button
                     className="quiet-link"
@@ -5152,7 +5684,27 @@ export default function Home() {
 
               {overlay === "after" ? (
               <section className="room-sheet after-card" aria-label="After session">
-                <p className="verdict-kicker">today&apos;s line</p>
+                {/*
+                  The change, not just the result.
+
+                  The card led with the learner's Spanish sentence -- right instinct, and it is
+                  still the headline. What it never did was put it next to the sentence they
+                  arrived with, so the strongest thing on the screen was reported underneath as
+                  "you got at least one real reply across clearly": a participation note for
+                  somebody who had just said fourteen words of Spanish after opening with "the
+                  words disappear".
+
+                  Both halves are their own words, which is what makes this the one argument for
+                  an account that cannot be read as marketing. Shown only when there really are
+                  two different things to compare.
+                */}
+                {openingAnswer.trim() && todayLine && openingAnswer.trim() !== todayLine ? (
+                  <div className="then-now">
+                    <p className="verdict-kicker">you came in saying</p>
+                    <p className="then-line">{openingAnswer.trim()}</p>
+                  </div>
+                ) : null}
+                <p className="verdict-kicker">{openingAnswer.trim() && todayLine ? "you left saying" : "today's line"}</p>
                 <h2>{todayLine || "you got the conversation started."}</h2>
                 <HomePanel
                   variant="session-end"
@@ -5205,23 +5757,20 @@ export default function Home() {
                   {returnEmailStatus === "saved" ? <small>sent — that link opens this session.</small> : null}
                   {returnEmailStatus === "error" ? <small>couldn&apos;t save yet. try once more.</small> : null}
                 </div>
-                {authedEmail ? null : (
-                  <div className="account-nudge">
-                    {/*
-                      #32 -- this used to be a claim about an invisible future ("OutLoud won't
-                      know you next time"). The panel above now shows the thing itself, so the ask
-                      can point at it instead: everything they can see is what an account keeps.
-                    */}
-                    <p>
-                      all of that is yours until you close this tab — the phrase, the return date,
-                      and what it worked out about you. an account is what keeps it, and it takes
-                      the same email you just used.
-                    </p>
-                    <button className="account-button" type="button" onClick={() => openAuth("signup")}>
-                      create a free account
-                    </button>
-                  </div>
-                )}
+                {/*
+                  The account ask used to be repeated here.
+
+                  It was gated on `authedEmail` being null, exactly like the one on the
+                  verdict -- which meant it could only ever appear to somebody who had just
+                  been asked and said no. Asking a second time is what every other app does
+                  and what this one bans elsewhere: no streaks, no praise for silence, no
+                  nagging. One ask, at the verdict, where the rescue and the diagnosis are
+                  still on screen to justify it.
+
+                  If the numbers ever say people leave before the verdict converts, this is
+                  where it comes back -- but that is a question for real instrumentation
+                  (docs/TODO.md 1.2), not for a guess.
+                */}
                 <div className="sheet-split-actions">
                   <button type="button" onClick={() => setOverlay("transcript")}>
                     review transcript

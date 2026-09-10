@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { coachResponseJsonSchema, coachResponseSchema, type CoachPhase, type CoachResponse } from "@/lib/coach-schema";
 import { isMockAiEnabled } from "@/lib/mock-ai";
+import { needsWordsEn } from "@/lib/stuck-signal";
 import { naturalSpanishSystemPrompt } from "@/lib/natural-spanish";
 import { checkRateLimit, openAiRequestsPerDay } from "@/lib/rate-limit";
 import { createSession, deleteSession, loadSession, saveSession } from "@/lib/session-store";
@@ -16,15 +17,21 @@ import { createSession, deleteSession, loadSession, saveSession } from "@/lib/se
  */
 
 type CoachState = {
-  mode: "speaks-first" | "stung";
+  mode: "speaks-first" | "stung" | "upcoming";
   openingAnswer: string;
   context: { who: string; dialect: string; tone: string };
   /** Where the conversation is: framing -> scenario -> coaching -> closing. */
   phase: CoachPhase;
   /** One rotation topic drawn at start so option B is not always the same. */
   rotationTopic: string;
-  /** Set once the learner picked a direction. */
+  /** Set once the learner picked a direction -- or before the first turn, if they already had. */
   chosenScenario: string | null;
+  /**
+   * Whether this session has a framing turn at all. Fixed at start and never recomputed, which is
+   * the point: `chosenScenario` becomes non-null for EVERY session the moment framing is answered,
+   * so it cannot double as "we skipped framing" once the session is under way.
+   */
+  skipsFraming: boolean;
   turns: Array<{
     turnIndex: number;
     sayEs: string;
@@ -65,8 +72,14 @@ const contextSchema = z.object({
 const requestSchema = z.discriminatedUnion("action", [
   z.object({
     action: z.literal("start"),
-    mode: z.enum(["speaks-first", "stung"]).default("speaks-first"),
+    mode: z.enum(["speaks-first", "stung", "upcoming"]).default("speaks-first"),
     openingAnswer: z.string().min(1).max(1600),
+    /**
+     * The situation, already named and verified before the session started -- the entry router
+     * only returns `stung` when it carries one. When this is set there is nothing left for a
+     * framing turn to ask, so there is no framing turn.
+     */
+    namedScenario: z.string().max(400).nullable().optional().default(null),
     context: contextSchema,
   }),
   z.object({
@@ -100,13 +113,23 @@ export async function POST(request: Request) {
   try {
     if (parsed.data.action === "start") {
       const coachId = crypto.randomUUID();
+      /*
+       * Settled before the first turn when we already know what they are practising: `upcoming`
+       * always does (they named the event and the app named the part of it), and `stung` does
+       * whenever the entry router handed one over. Everything else earns it on turn 0.
+       */
+      const settledScenario =
+        parsed.data.mode === "upcoming"
+          ? parsed.data.openingAnswer.trim()
+          : parsed.data.namedScenario?.trim() || null;
       const state: CoachState = {
         mode: parsed.data.mode,
         openingAnswer: parsed.data.openingAnswer.trim(),
         context: parsed.data.context,
-        phase: "framing",
+        phase: settledScenario ? "scenario" : "framing",
         rotationTopic: rotationTopics[Math.floor(Math.random() * rotationTopics.length)],
-        chosenScenario: null,
+        chosenScenario: settledScenario,
+        skipsFraming: settledScenario !== null,
         turns: [],
         evidence: [],
         currentTurnIndex: 0,
@@ -153,14 +176,38 @@ export async function POST(request: Request) {
   }
 }
 
-// The phase is a function of where we are, never of what the model labelled. Turn 0 frames,
-// turn 1 sets the scene, everything after is coaching until done. Trusting the model's own
-// `phase` once let a mislabelled scenario turn drag the session back into framing forever.
-function phaseForTurn(turnIndex: number, done: boolean): CoachPhase {
+/**
+ * The phase is a function of where we are, never of what the model labelled. Trusting the model's
+ * own `phase` once let a mislabelled scenario turn drag the session back into framing forever.
+ *
+ * **A session whose situation is already settled has no framing turn.** Framing exists to ask
+ * which of two situations to practise in, and somebody who has just named their landlord call, or
+ * the pharmacy they froze in, has already answered that question. Asking it anyway is the "what
+ * was the point of telling it my problem?" failure rebuilt one screen later -- and offering them a
+ * rotation topic next to their own dreaded call is worse than not asking at all. So turn 0 sets
+ * the scene and turn 1 is already coaching.
+ *
+ * The test is the settled scenario, not the mode. `mode` was only ever standing in for it, and it
+ * stood in badly: `stung` reaches this the same way `upcoming` does whenever the entry router
+ * hands over a situation, and asked the question anyway. Somebody whose whole answer is "I just
+ * froze, I don't know" still gets framing, which is right -- for them the two concrete options
+ * are the help, not the insult.
+ */
+function phaseForTurn(turnIndex: number, done: boolean, skipsFraming: boolean): CoachPhase {
   if (done) return "closing";
+  if (skipsFraming) return turnIndex === 0 ? "scenario" : "coaching";
   if (turnIndex === 0) return "framing";
   if (turnIndex === 1) return "scenario";
   return "coaching";
+}
+
+/**
+ * Rows written before `skipsFraming` existed do not have it. Falling back to the old rule keeps a
+ * session that is already in flight on the pacing it started with, instead of shifting every
+ * remaining turn by one under a learner mid-sentence.
+ */
+function skipsFramingFor(state: CoachState) {
+  return state.skipsFraming ?? state.mode === "upcoming";
 }
 
 function recordTurn(state: CoachState, turn: CoachResponse) {
@@ -204,6 +251,27 @@ function pickScenario(state: CoachState, answer: string) {
   const scoreA = hits(optionA.labelEn) + hits(optionA.scenarioEn);
   const scoreB = hits(optionB.labelEn) + hits(optionB.scenarioEn) + hits(state.rotationTopic);
   if (scoreB > scoreA) return optionB.scenarioEn;
+
+  /*
+   * They did not pick either option and described something instead.
+   *
+   * Falling through to option A here is what produced the worst thing this route does: somebody
+   * answered "I froze at my girlfriend's parents last friday" and was put in a cafe, because
+   * option A had been built from the word "vocabulary" one turn earlier. They named a person, a
+   * place and a moment, and the app practised ordering coffee.
+   *
+   * Option A IS their own context when the answer restates the opening problem -- "the words go
+   * missing" -- and that is the case the old comment here was written for. It stops being true the
+   * moment they say something new and concrete, and a sentence that overlaps NEITHER option is the
+   * signal for exactly that.
+   *
+   * Six words, because that is about the shortest a real situation gets ("dinner at her parents on
+   * friday"). Below it lives "yes", "vocabulary", "the second one, I guess" -- answers that point
+   * back at what was already on offer rather than naming anything new.
+   */
+  const wordsInAnswer = answer.trim().split(/\s+/).filter(Boolean).length;
+  if (scoreA === 0 && scoreB === 0 && wordsInAnswer >= 6) return answer.trim();
+
   // Anything else -- including the learner restating their own problem -- means their own
   // context, which is what option A was built from. Never leave this unresolved: an unclear
   // pick used to make the model re-ask the framing question in a loop.
@@ -292,7 +360,7 @@ async function generateTurn(
   });
 
   const generated = coachResponseSchema.parse(JSON.parse(response.output_text));
-  return normalizeTurn(generated, coachId, turnIndex, mustFinish, userAttempt === null);
+  return normalizeTurn(generated, coachId, turnIndex, mustFinish, userAttempt === null, skipsFramingFor(state));
 }
 
 function normalizeTurn(
@@ -301,12 +369,13 @@ function normalizeTurn(
   turnIndex: number,
   mustFinish: boolean,
   isOpening: boolean,
+  skipsFraming: boolean,
 ): CoachResponse {
   const noTool = { type: "none" as const, primaryEs: null, primaryEn: null, exampleEs: null, noteEn: null, options: null };
   // Framing (and the choice chips) happen exactly once, on turn 0. Never let the model finish
   // early during setup either -- the learner has not spoken Spanish yet.
   const done = mustFinish || (turn.done && turnIndex >= 2);
-  const phase = phaseForTurn(turnIndex, done);
+  const phase = phaseForTurn(turnIndex, done, skipsFraming);
   const reoffered = phase !== "framing" && turn.tool.type === "path_choice";
   const tool = turn.tool.type === "none" || reoffered ? noTool : turn.tool;
   return {
@@ -359,11 +428,18 @@ function attemptLooksFine(attempt: string) {
  * real and correct Spanish answer; treating that as a cry for help would take a good turn away
  * from them. Declaring it in English is stepping out of the task, and that is the signal.
  */
-const declaredStuckEn =
-  /\b(no idea|no clue|not a clue|i don'?t know|i dont know|i do not know|i can'?t|i cant|i cannot|dunno|i'?m lost|im lost)\b/i;
-
+/*
+ * The detector now lives in `lib/stuck-signal.ts` and is imported by the room as well.
+ *
+ * It was inlined here, and the harness that verified it carried a copy. When the pattern turned
+ * out to be broken -- it only ever matched a straight apostrophe, so nothing typed on a phone
+ * matched at all -- the copy was broken identically and the test agreed with the bug. One home,
+ * so a fix reaches every caller and a check cannot quietly share the fault it is checking for.
+ */
 function attemptDeclaresStuck(attempt: string) {
-  return declaredStuckEn.test(attempt);
+  // Both shapes: "I don't know how to say it" and "how do I say it". Somebody who half speaks the
+  // language mostly does the second, mid-sentence, and only the first was ever recognised.
+  return needsWordsEn(attempt);
 }
 
 function pacingGuidance(
@@ -380,21 +456,73 @@ function pacingGuidance(
   }
   // Checked before everything else: a learner who has just said they do not know must not be
   // handled by any branch that assumes they attempted something.
+  /*
+   * The second half of this note is not a flourish. With only the first half, the coach reliably
+   * handed over a phrase -- for the wrong thing. Somebody who had said they could not say "I'll
+   * take care of it" was given "Quisiera un café y un sándwich", because `chosenScenario` was a
+   * cafe and "the SAME thing" read as "the same as the scene".
+   *
+   * Helping confidently with something nobody asked about is the "what was the point of telling it
+   * my problem?" failure with a tool attached, and it is worse than not helping: it looks like
+   * listening.
+   */
   const stuckNote = lastDeclaresStuck
-    ? " THEY HAVE JUST TOLD YOU, IN ENGLISH, THAT THEY DO NOT KNOW. Never react as though they said the thing you were hoping for -- no \"¡qué rico!\", no \"perfecto\", no reacting to content that does not exist. This turn MUST carry a tool (keyword_card, sentence_frame, say_it_back or preparation_time) that hands them something concrete for the SAME thing, intent=retry or teach, and your line invites them to use it. Asking a new question here leaves them exactly where they are."
+    ? " THEY HAVE JUST TOLD YOU, IN ENGLISH, THAT THEY DO NOT KNOW. Never react as though they said the thing you were hoping for -- no \"¡qué rico!\", no \"perfecto\", no reacting to content that does not exist. This turn MUST carry a tool (keyword_card, sentence_frame, say_it_back or preparation_time), intent=retry or teach, and your line invites them to use it. Asking a new question here leaves them exactly where they are." +
+      " WHAT the tool carries is decided by THEM, not by the scene: it is the thing they said they could not say. If this turn is vague (\"I still don't know how to say it\"), the \"it\" is whatever they named earlier in this conversation -- look back and find it. Do NOT substitute the topic of chosenScenario. Handing somebody a phrase about ordering coffee when they told you they were stuck on telling their girlfriend's mother they would take care of something is worse than saying nothing: it looks like listening and it is not."
     : "";
   const fineNote = lastLooksFine
     ? " The last attempt looks fine on the surface: if it really answered you, tool MUST be none and you ask a NEW question about a different detail or a related situation (never one from alreadyAsked)."
     : lastLooksMixed && turnIndex >= 2
       ? " The last attempt contains English or a freeze: this is a stumble. You MUST repair now -- pick keyword_card, sentence_frame or say_it_back with the Spanish they were missing, intent=retry, and in character invite them to say the same thing again. Do NOT ask a new question."
       : "";
-  if (turnIndex === 0) {
+  /*
+   * A session that skips framing is one turn ahead of one that does not, so every branch below
+   * shifts. Shifting the index here rather than duplicating the branches keeps the pacing rules --
+   * when to repair, when to raise pressure, when it may finish -- identical either way, which is
+   * the whole reason they are written once.
+   */
+  const step = skipsFramingFor(state) ? turnIndex + 1 : turnIndex;
+
+  if (step === 0) {
     return `Framing turn, IN ENGLISH. phase=framing, intent=probe, tool=path_choice with exactly two options. Structure of sayEs: (1) one short sentence that shows you heard them -- name the problem naturally, in your own words, like a coach would ("Words going missing mid-sentence -- that is the most common one."). NEVER start with "You said" and never quote their answer back; that phrasing is reserved for quoting their Spanish later. (2) one sentence that makes it normal and workable; (3) end with ONE question offering two concrete SITUATIONS to try it in, e.g. "Where do you want to try it first -- ordering at a cafe, or telling a friend about your weekend?". Both options MUST be situations (a place + a person + something to get done), phrased in the same grammatical form, never the skill itself (never "talking about vocabulary", "sentence structure practice", "grammar"). Option A: the situation from THEIR opening answer if they mentioned a place/person/moment; if they only named a skill, pick the everyday situation where exactly that skill bites hardest. Option B: a concrete situation built from rotationTopic: "${state.rotationTopic}". Each option: labelEn = 3-6 words naming the situation (shown as a button, e.g. "Ordering at a cafe"), scenarioEn = one sentence describing the scene: who they talk to and what they want. sayEs stays under 32 words total -- it is spoken AND shown on a phone screen. No Spanish yet.`;
   }
-  if (turnIndex === 1) {
-    return `Scenario turn, IN ENGLISH. phase=scenario, intent=probe, tool=none (or preparation_time if their opening answer suggests they freeze). chosenScenario is "${state.chosenScenario ?? "their own context from the opening answer"}" (already resolved from what they said; if their answer named something else entirely, adopt that instead). NEVER offer the two directions again and never use path_choice from now on. YOU set the scene in one concrete sentence that NAMES the person and says what they are like -- a first name, their relation to the learner, and the one trait that makes them hard (e.g. "This is Carmen, your girlfriend's aunt -- warm, but she talks fast and won't slow down for you." or "This is Marco behind the counter -- friendly, but it is lunchtime and there are five people behind you."). A named stranger with a temperament is the whole point: the learner freezes in front of people, not in front of an exercise. Never a role alone ("the waiter"), never a name alone. Also fill sceneCharacter with exactly that person: name (first name only), relation (how they relate to the learner), traitEn (the one thing that makes them hard). It must match the sentence you just said, because the practice session that follows is with this same person. Then invite them: show me what you would say -- in Spanish, however it comes out. Do NOT ask them to describe the scene; you describe it, they speak in it. End on that invitation. sayEs under 40 words and ENTIRELY IN ENGLISH (the learner speaks Spanish next, you do not). No Spanish sentence to repeat; the point is that THEY produce it.`;
+  /*
+   * They answered the framing question by telling us, in English, that they have no words.
+   *
+   * The scenario turn below is hardcoded to `intent=probe, tool=none` and ends by demanding
+   * Spanish -- so running it here sets a scene in front of somebody who has just said they cannot
+   * enter one, and asks them for the very thing they said they do not have. Every later turn is
+   * already protected by `stuckNote`; this one was not, because its instruction says the opposite
+   * and a note appended to it would just contradict itself.
+   *
+   * So the turn changes shape instead of gaining a footnote. The scene still gets set and
+   * `sceneCharacter` still gets filled -- naming the person is the valuable half and everything
+   * downstream needs it -- but the turn ends by handing over words rather than asking for them.
+   *
+   * Structural for the same reason the framing turn was in #30: the turn machine is what produces
+   * the turn, and a prompt cannot argue a turn out of the instruction that defines it.
+   */
+  if (step === 1 && lastDeclaresStuck) {
+    return `Scenario turn, IN ENGLISH, and they have just told you IN ENGLISH that they do not know how to say it. Do NOT ask them for Spanish this turn. phase=scenario, intent=teach.
+
+chosenScenario is "${state.chosenScenario ?? "their own context from the opening answer"}" -- but if what they just said named a different person, place or thing they wanted to say, THAT is the scene. What they just told you outranks anything chosen earlier.
+
+Still set the scene in one concrete sentence naming the person and what they are like -- a first name, their relation to the learner, and the one trait that makes them hard -- and still fill sceneCharacter with exactly that person (name, relation, traitEn). The practice that follows is with them.
+
+Then, instead of inviting them to speak: hand them the words. Pick ONE tool (keyword_card, sentence_frame or say_it_back) carrying the Spanish for THE THING THEY JUST SAID THEY COULD NOT SAY -- not a general phrase, not a greeting, the actual thing. Your line ends by inviting them to use it. Never end this turn on a question that leaves them exactly as stuck as they were: they told you what they needed, and the only useful next move is to give it to them.
+
+sayEs under 40 words and entirely in English; the Spanish belongs in the tool.`;
   }
-  if (turnIndex === 2) {
+  if (step === 1) {
+    return `Scenario turn, IN ENGLISH. phase=scenario, intent=probe, tool=none (or preparation_time if their opening answer suggests they freeze). chosenScenario is "${state.chosenScenario ?? "their own context from the opening answer"}" (already resolved from what they said; if their answer named something else entirely, adopt that instead). NEVER offer the two directions again and never use path_choice from now on.${
+      skipsFramingFor(state)
+        ? state.mode === "upcoming"
+          ? " This is the FIRST turn of the session and they have not spoken to you yet, so open with one short sentence acknowledging the thing they are preparing for -- in the future, as something that has not happened -- before you set the scene. Do NOT ask them where they want to practise or offer them anything to choose between: they already told you, and chosenScenario is it."
+          : " This is the FIRST turn of the session and they have not spoken to you yet, so open with one short sentence acknowledging what happened to them -- as something that ALREADY went wrong, never as something coming up -- before you set the scene. Do NOT ask them where they want to practise or offer them anything to choose between: they already told you, and chosenScenario is it. The scene you set is that same situation, run again, so they get to say this time what they could not say then."
+        : ""
+    } YOU set the scene in one concrete sentence that NAMES the person and says what they are like -- a first name, their relation to the learner, and the one trait that makes them hard (e.g. "This is Carmen, your girlfriend's aunt -- warm, but she talks fast and won't slow down for you." or "This is Marco behind the counter -- friendly, but it is lunchtime and there are five people behind you."). A named stranger with a temperament is the whole point: the learner freezes in front of people, not in front of an exercise. Never a role alone ("the waiter"), never a name alone. Also fill sceneCharacter with exactly that person: name (first name only), relation (how they relate to the learner), traitEn (the one thing that makes them hard). It must match the sentence you just said, because the practice session that follows is with this same person. Then invite them: show me what you would say -- in Spanish, however it comes out. Do NOT ask them to describe the scene; you describe it, they speak in it. End on that invitation. sayEs under 40 words and ENTIRELY IN ENGLISH (the learner speaks Spanish next, you do not). No Spanish sentence to repeat; the point is that THEY produce it.`;
+  }
+  if (step === 2) {
     return `First coaching turn, phase=coaching. If instead of Spanish they told you in English that they do not have the words, do not know where to start, or do not know what their problem is, do NOT open the scene and wait for them: hand them the words for the things THEY just described, with one tool, and invite them to use those. Someone who has just said they cannot enter this scene will not be helped by being dropped into it. If the learner only agreed ("yes", "ok", "sure") or hesitated instead of speaking Spanish, become the other person in chosenScenario and open the scene with ONE short natural Spanish line they now have to answer (e.g. the waiter greeting them). If they already produced Spanish, react as the other person in the scene and continue -- and if what they produced was a QUESTION to you, your line is the ANSWER to it, with real invented detail, never the same question aimed back at them. If what they produced is broken or half English (e.g. "do you wanna fiesta"), that IS the first stumble: repair now with one tool (keyword_card / sentence_frame / say_it_back), intent=retry, and let them say it again -- do not restart, do not re-explain the setup.${fineNote}${stuckNote}`;
   }
   if (realAttempts < 2) {
@@ -407,10 +535,20 @@ function pacingGuidance(
 }
 
 function systemPrompt(state: CoachState) {
+  /*
+   * Three ways in, and the tense is the difference that matters.
+   *
+   * `stung` is the past: something already went wrong and they are still holding it. `upcoming`
+   * is the future -- a real thing on a real date that has not happened yet -- and running that
+   * through the stung wording produces a coach that talks about their dinner as though they had
+   * already failed at it. Nothing has happened. That is the entire point of the mode.
+   */
   const situation =
     state.mode === "stung"
       ? "The learner arrived from a real moment where they could not say something. Their opening answer describes that moment; treat it as the situation to practice in."
-      : "The learner just told you, in their own words, what usually trips them up when they speak Spanish.";
+      : state.mode === "upcoming"
+        ? "The learner has something REAL COMING UP that they are dreading, and their opening answer describes it. It has not happened yet: never speak about it in the past tense and never imply they have already struggled with it. Treat it as the situation to practice in, and make the framing turn about what specifically worries them about it rather than about their Spanish in general."
+        : "The learner just told you, in their own words, what usually trips them up when they speak Spanish.";
 
   return `
 # Role
@@ -418,11 +556,18 @@ You are OutLoud's spoken Spanish coach in a live voice session with one nervous 
 ${naturalSpanishSystemPrompt}
 
 # Shape of the session
-1. framing (turn 0 ONLY, English): mirror what trips them up, offer two directions (path_choice). This happens exactly once; from turn 1 on the directions are settled and you never re-ask.
+${
+  state.mode === "upcoming"
+    ? `1. scenario (turn 0, English): they have ALREADY told you what they are preparing for and which part of it this is, so there is nothing to choose. Set the scene and invite them to speak.
+2. coaching (Spanish, from turn 1): you play the other person in that scene; cold water with a lifeline.
+3. closing: one warm line, done=true.
+There is NO framing turn and you never use path_choice. Always set "phase" to the phase you are in. Only the scenario turn is in English.`
+    : `1. framing (turn 0 ONLY, English): mirror what trips them up, offer two directions (path_choice). This happens exactly once; from turn 1 on the directions are settled and you never re-ask.
 2. scenario (turn 1, English): invite them to show what they would say in the direction they picked.
 3. coaching (Spanish): you play the other person in that scenario; cold water with a lifeline.
 4. closing: one warm line, done=true.
-Always set "phase" to the phase you are in. Only framing and scenario are in English.
+Always set "phase" to the phase you are in. Only framing and scenario are in English.`
+}
 
 # How you work (coaching phase)
 - Cold water with a lifeline: ask ONE real, short question in Spanish that makes the learner actually speak — but the moment they stumble (empty, half-English, freeze, garbled), help immediately with exactly one tool and let them try the same thing again. Teaching is always allowed; diagnosis happens on the side.

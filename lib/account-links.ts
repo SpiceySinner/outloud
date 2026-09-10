@@ -13,6 +13,61 @@ export const resumeMomentKey = "outloud-resume-moment";
  */
 export const autoStartKey = "outloud-autostart";
 
+/**
+ * Set by /dash when a go at a planned event is picked up. The room reads it on mount and runs
+ * that beat: the first one is the intake seeded with the event, every one after it is a scene
+ * started from the rescue the first produced.
+ *
+ * More specific than `autoStartKey` and less specific than `resumeMomentKey`, which is the order
+ * the room checks them in.
+ */
+export const eventBeatKey = "outloud-event-beat";
+
+export type EventBeatHandoff = {
+  eventId: string;
+  beatIndex: number;
+};
+
+/**
+ * Set by /dash when somebody describes a moment that already went wrong. The room reads it on
+ * mount and runs its `stung` intake seeded with the sentence, which is what that intake was built
+ * for — it simply never had a way in from the entry screen.
+ *
+ * Both halves travel. `said` is what the learner actually put into the microphone and is what
+ * the intake is seeded with, for the same reason `runEventBeat` sends `event.said`: a paraphrase
+ * of somebody's life is a worse description of it than what they said. `situationEn` is the
+ * router's one-line reading of it, and it does a different job — it tells the coach that the
+ * situation is already settled, which is what removes the framing turn that would otherwise ask
+ * somebody who just named their pharmacy whether they would rather talk about their job.
+ *
+ * Less specific than `eventBeatKey` (no target yet, only a description) and more specific than
+ * `autoStartKey`, which is the order the room checks them in.
+ */
+export const stungKey = "outloud-stung-said";
+
+export type StungHandoff = {
+  said: string;
+  situationEn: string;
+};
+
+/**
+ * Set by /dash when somebody asks how to say something. The room reads it on mount and opens on
+ * the answer — not in an overlay, because overlays close the microphone and the whole point of
+ * this phase is that they have to say the thing out loud.
+ *
+ * `askEn` is the sentence with the asking stripped off, which is what makes the rest of the chain
+ * possible: it becomes `originalText` in the rescue, and `originalText` is the thing normally
+ * missing when there is no scene to have failed in.
+ */
+export const askPhraseKey = "outloud-ask-phrase";
+
+export type AskPhraseHandoff = {
+  /** What they actually said into the microphone. Shown back, never sent to the lifeline. */
+  said: string;
+  /** The sentence they want to be able to say, in English. This is what gets answered. */
+  askEn: string;
+};
+
 export type ResumeMoment = {
   momentId: string;
   summary: string;

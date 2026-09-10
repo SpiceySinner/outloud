@@ -1,21 +1,19 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { getSupabaseBrowser } from "@/lib/supabase-browser";
 import { resumeMomentKey, type ResumeMoment } from "@/lib/account-links";
 import HomePanel from "@/app/components/HomePanel";
 import {
   dueMoments,
   focusFromMoments,
-  normalizeMastery,
   trendDirection,
   type ChatMessage,
-  type DashboardData,
   type MomentCard,
 } from "@/lib/dashboard-data";
-import { mockChatReplies, mockDashboard } from "@/lib/dashboard-mock";
+import { mockChatReplies } from "@/lib/dashboard-mock";
+import { useLibraryData } from "@/lib/use-library-data";
 
 /**
  * Home. What a learner lands on once the funnel is behind them.
@@ -29,90 +27,14 @@ import { mockChatReplies, mockDashboard } from "@/lib/dashboard-mock";
  * This page owns only its own headline, the coach chat, and the account chrome.
  */
 
-type LibrarySession = {
-  id: string;
-  createdAt: string;
-  summary: string;
-  naturalVersion: string | null;
-  keyPhrase: string | null;
-  keyPhraseMeaning: string | null;
-  pattern: string | null;
-  blocker: string | null;
-  ledgerState: string | null;
-  dueAt: string | null;
-  rescue: unknown;
-};
-
 export default function DashboardPage() {
   const router = useRouter();
-  const [state, setState] = useState<"loading" | "signed-out" | "ready" | "error">("loading");
-  const [data, setData] = useState<DashboardData | null>(null);
-  const [message, setMessage] = useState<string | null>(null);
-  const [preview, setPreview] = useState(false);
+  const { state, data, message, preview } = useLibraryData();
 
   const [chatOpen, setChatOpen] = useState(false);
   const [extraChat, setExtraChat] = useState<ChatMessage[]>([]);
   const [previewNote, setPreviewNote] = useState<string | null>(null);
   const [usedChips, setUsedChips] = useState<string[]>([]);
-
-  const load = useCallback(async () => {
-    // The preview is checked before anything else: it is the only way to look at this screen
-    // without an account and a month of sessions behind it.
-    let wantsPreview = false;
-    try {
-      wantsPreview = new URLSearchParams(window.location.search).get("preview") === "1";
-    } catch {
-      // No URL to read: fall through to the real path.
-    }
-    if (wantsPreview) {
-      setPreview(true);
-      setData(mockDashboard);
-      setState("ready");
-      return;
-    }
-
-    const supabase = getSupabaseBrowser();
-    if (!supabase) {
-      setState("error");
-      setMessage("accounts aren't configured yet.");
-      return;
-    }
-
-    const { data: sessionData } = await supabase.auth.getSession();
-    const token = sessionData.session?.access_token;
-    if (!token) {
-      setState("signed-out");
-      return;
-    }
-
-    try {
-      const response = await fetch("/api/library", { headers: { Authorization: `Bearer ${token}` } });
-      const json = await response.json();
-      if (!response.ok) throw new Error(typeof json?.error === "string" ? json.error : "could not load your work.");
-      const sessions = (json.sessions ?? []) as LibrarySession[];
-      setData({
-        user: json.user,
-        words: json.words ?? [],
-        moments: sessions.map(
-          (session): MomentCard => ({ ...session, ledgerState: normalizeMastery(session.ledgerState) }),
-        ),
-        // No engine behind the home chat yet. An empty thread renders the honest version of the
-        // section rather than a fabricated conversation.
-        chat: [],
-      });
-      setState("ready");
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "could not load your work.");
-      setState("error");
-    }
-  }, []);
-
-  useEffect(() => {
-    // Deferred: load() can settle synchronously (missing config, or the preview), and setting
-    // state inside the effect body triggers a cascading render.
-    const timer = window.setTimeout(() => void load(), 0);
-    return () => window.clearTimeout(timer);
-  }, [load]);
 
   const moments = useMemo(() => data?.moments ?? [], [data]);
   const focus = useMemo(() => focusFromMoments(moments), [moments]);

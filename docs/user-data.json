@@ -1,0 +1,415 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "_about": {
+    "what": "Every piece of data OutLoud stores about a person, where it lives, and what it is used for.",
+    "generatedOn": "2026-09-07",
+    "generatedFrom": [
+      "supabase/schema.sql",
+      "supabase/202608200001_word_bank_and_accounts.sql",
+      "supabase/202608200002_engine_sessions.sql",
+      "supabase/202609070001_events.sql",
+      "supabase/202609070002_phrase_recall.sql",
+      "the localStorage/sessionStorage keys in app/ and lib/",
+      "the outbound calls in app/api/*/route.ts and lib/persistence.ts"
+    ],
+    "howToRead": {
+      "use": "what the field is for, in plain language",
+      "personal": "true if the value is about an identifiable person, or can identify them when combined with the rest of the row. This is the field that matters for a privacy policy",
+      "note": "anything non-obvious — a gotcha, a lie the column name tells, or a decision behind it"
+    },
+    "keepThisTrue": "This file is written by hand from the schema. A migration that adds a column and does not add a line here makes it wrong, and a data inventory nobody trusts is worse than none."
+  },
+
+  "whereItLives": {
+    "_use": "The short answer to 'is this on the device or on the server?'. Every item here is detailed further down.",
+
+    "deviceOnly": {
+      "_use": "Never leaves the browser. Not sent to us, not sent to anyone, gone when site data is cleared.",
+      "items": [
+        "outloud-mic-mode — the full-duplex rollback switch",
+        "outloud-debug-tools and outloud-debug-realtime — developer toggles",
+        "outloud-autostart — a flag meaning 'skip the landing panel'",
+        "outloud-event-beat — which event and which go, ids only"
+      ]
+    },
+
+    "bothPlaces": {
+      "_use": "The same data exists on the device AND in Supabase. This is the list worth reading twice, because deleting one side does not delete the other.",
+      "outloud-session-id": {
+        "alsoIn": ["sessions.id", "sessions.anonymous_identifier", "moments.session_id", "events.session_id", "analytics_events.session_id"],
+        "authoritative": "the browser",
+        "note": "The server rows are keyed on a value only the browser holds. Clear it and the rows survive with nothing pointing at them — they are not deleted, they are orphaned, and nobody can ever reach them again."
+      },
+      "outloud-kept-scenarios": {
+        "alsoIn": ["analytics_events.metadata_json, for kept_scenario events"],
+        "authoritative": "the server copy is the research; the local copy exists so the promise on screen is true with no network",
+        "note": "Preview sentences are the exception and stay local only — test data is not research."
+      },
+      "outloud-pending-verdict": {
+        "alsoIn": ["becomes a moments row, if they go on to save"],
+        "authoritative": "the browser, until it is saved",
+        "note": "Held only across a sign-in redirect, then deleted locally."
+      },
+      "outloud-resume-moment": {
+        "alsoIn": ["moments.rescue_json"],
+        "authoritative": "Supabase",
+        "note": "A copy carried one screen, read once on arrival and deleted."
+      },
+      "outloud-stung-said / outloud-ask-phrase": {
+        "alsoIn": ["moments.original_text, and events.said, if the run is saved"],
+        "authoritative": "the browser, until the run is saved",
+        "note": "Deleted the moment the room reads them. Nothing is sent to us unless the learner goes on to finish and save."
+      },
+      "sb-<project-ref>-auth-token": {
+        "alsoIn": ["auth.users"],
+        "authoritative": "Supabase",
+        "note": "The token is a copy of the identity, not the identity itself. Signing out clears it locally; the account row stays."
+      }
+    },
+
+    "supabaseOnly": {
+      "_use": "Exists only on the server. The browser never holds a copy.",
+      "items": [
+        "everything in moments — the transcripts, the conversation, the rescue, the derived teaching model",
+        "attempts, word_bank, events, person_profiles, email_subscriptions",
+        "moment_access_tokens, retrieval_deliveries, retrieval_variations",
+        "engine_sessions — in-flight conversation state, deleted when the session closes",
+        "feedback and analytics_events"
+      ]
+    },
+
+    "neitherPlace": {
+      "_use": "Things people assume are stored and are not.",
+      "items": [
+        "audio — recordings are passed to OpenAI and never persisted by us. Only the transcript and the derived freeze signals are kept",
+        "passwords — handled entirely inside Supabase Auth; the app never sees one",
+        "cookies — the app sets none, of any kind, including analytics and advertising"
+      ]
+    }
+  },
+
+  "identity": {
+    "_use": "OutLoud works signed out. There are two identities and they are not the same thing.",
+    "anonymous": {
+      "use": "A UUID minted in the browser on first use and kept in localStorage. Everything saved before somebody makes an account hangs off it.",
+      "personal": true,
+      "note": "A pseudonymous identifier, not anonymous data in the legal sense: it links every session on that device to one person. Clearing site data breaks the link permanently — there is no recovery path."
+    },
+    "account": {
+      "use": "A Supabase auth user, created when somebody signs up. Owns the word bank and links their saved runs together across devices.",
+      "personal": true,
+      "note": "Optional. The app is fully usable without one, except the word bank and the phrase-recall half, which are scoped to auth.users."
+    },
+    "claiming": {
+      "use": "On the first signed-in request from a device, rows carrying the anonymous id get user_id filled in.",
+      "personal": false,
+      "note": "This is how signing up 'brings your history with you'. It is also the moment pseudonymous data becomes account data. Claimed two ways since 2026-09-10: by email for runs where one was typed in, and by session id for everything else -- before that, practice saved anonymously was never claimed by anyone and stayed unreachable forever."
+    }
+  },
+
+  "supabase": {
+    "_use": "The production database. Every table below has RLS enabled; the app writes with the service-role key, which bypasses it. Only word_bank has real per-user policies, so a direct anon-key read of anything else returns nothing.",
+
+    "auth.users": {
+      "_use": "Supabase's own auth table. We do not write to it; it is listed because it holds real identifiers.",
+      "id": { "use": "The account id every user-scoped row points at.", "personal": true },
+      "email": { "use": "Sign-in identity.", "personal": true },
+      "encrypted_password": { "use": "Managed entirely by Supabase Auth. The app never sees or stores a password.", "personal": true },
+      "_note": "Also carries Supabase's own timestamps, confirmation tokens and last-sign-in metadata. Owned by Supabase, not by us."
+    },
+
+    "public.sessions": {
+      "_use": "One row per device/browser. The anonymous identity, and the last time it was seen.",
+      "id": { "use": "The browser's outloud-session-id, used verbatim as the primary key.", "personal": true },
+      "anonymous_identifier": { "use": "Same value again.", "personal": true, "note": "Historical duplicate of id. Kept because rows exist with it." },
+      "email": { "use": "Filled once somebody saves a run with an email address. Null for anonymous practice.", "personal": true },
+      "created_at": { "use": "First time this device was seen.", "personal": false },
+      "last_seen_at": { "use": "Last save from this device. The only activity timestamp on the session itself.", "personal": false },
+      "device_json": { "use": "The raw User-Agent header.", "personal": true, "note": "Stored verbatim, not parsed. It is a fingerprinting surface and the single most reducible item in this file — a device class ('iPhone, Safari') would serve every use we actually have." }
+    },
+
+    "public.person_profiles": {
+      "_use": "Who the learner said they are practising for. Drives register and tone in every prompt.",
+      "id": { "use": "Row id.", "personal": false },
+      "session_id": { "use": "Which device this belongs to.", "personal": true },
+      "relationship": { "use": "Who they are talking to — 'my girlfriend's mum', 'a shopkeeper'. Sets how formal the Spanish should be.", "personal": true, "note": "Free text about a third person who never consented to anything. It is short and typed by the learner, but it is data about someone else." },
+      "region": { "use": "Which Spanish — 'Latin America', 'Spain'. Picks vocabulary and forms.", "personal": false },
+      "default_tone": { "use": "How warm or blunt the character should be.", "personal": false },
+      "created_at": { "use": "When the profile was made.", "personal": false }
+    },
+
+    "public.moments": {
+      "_use": "The core record: one saved practice run. Everything the app knows about how somebody speaks is derived from these.",
+      "id": { "use": "Row id, also the deep-link id in a review URL.", "personal": false },
+      "session_id": { "use": "Which device it was practised on.", "personal": true },
+      "user_id": { "use": "The account, once there is one. Null for runs saved by email only.", "personal": true },
+      "person_profile_id": { "use": "Who it was practised for.", "personal": false },
+      "email_subscription_id": { "use": "Which mail subscription the return email goes to.", "personal": false },
+      "created_at": { "use": "When the run was saved. Drives the journey and every 'waiting N days' label.", "personal": false },
+      "email": { "use": "Where the return email goes.", "personal": true, "note": "NOT NULL, so an anonymous save still writes something here: a synthetic 'anonymous+<session-id>@outloud.local'. It is not a real address and nothing is ever sent to it, but it does carry the session id inside a column called email." },
+      "original_text": { "use": "What they were trying to say, in English. Everything downstream is anchored on it.", "personal": true, "note": "Free text about their own life — a job, a family, an argument. The most sensitive column in the database." },
+      "entry_mode": { "use": "Whether they wanted to say something or received Spanish they did not follow.", "personal": false },
+      "context_json": { "use": "Who / dialect / tone for this run.", "personal": true },
+      "self_reported_blocker": { "use": "What they said breaks for them — freezing, missing words, grammar. Chosen from a fixed list.", "personal": true },
+      "self_reported_blockers_json": { "use": "The same, when they picked more than one.", "personal": true },
+      "teaching_policy_json": { "use": "How much help this run was set to give.", "personal": false },
+      "intervention_outcomes_json": { "use": "What each piece of help actually changed. The evidence behind 'this is working'.", "personal": true },
+      "personal_teaching_model_json": { "use": "A rolling picture of this learner built from their earlier runs: what keeps breaking, what help works on them.", "personal": true, "note": "Derived, not entered — profiling in the ordinary sense of the word. Rebuilt from prior moments on every save." },
+      "first_attempt": { "use": "Their first go, verbatim.", "personal": true },
+      "first_attempt_transcript_edited": { "use": "Whether they corrected the transcript before sending it.", "personal": false },
+      "retry_attempt": { "use": "Their second go, after the rescue.", "personal": true },
+      "rebuild_evaluation_json": { "use": "The verdict on the retry: what got through, what was missing.", "personal": true },
+      "transfer_prompt_json": { "use": "The changed situation they were asked to handle.", "personal": false },
+      "transfer_attempt": { "use": "What they said in it.", "personal": true },
+      "transfer_evaluation_json": { "use": "The verdict on that. Decides the mastery rung and the next review date.", "personal": true },
+      "conversation_turns_json": { "use": "The whole practice conversation — every character line and every reply.", "personal": true, "note": "A full transcript of a conversation about their own life. Largest personal payload in the row." },
+      "focus_gap_json": { "use": "The one thing this run was pointed at, and whether it closed.", "personal": true },
+      "attempt_voice_json": { "use": "Freeze signals from the first attempt: seconds to first word, hesitation count, English words that leaked in.", "personal": true, "note": "Derived from the audio, not the audio itself. No recording is kept anywhere." },
+      "retry_voice_json": { "use": "The same for the retry. The before/after is what shows a freeze getting shorter.", "personal": true },
+      "rescue_json": { "use": "The rescue itself: the natural version, the correction, the transferable pattern. What comes back on the review.", "personal": true },
+      "ledger_state": { "use": "The mastery rung, from 'needed_full_help' to 'confirmed_real_life'. Drives review spacing and the journey.", "personal": false },
+      "retrieval_due_at": { "use": "When this comes back.", "personal": false },
+      "retrieval_claimed_at": { "use": "Locks the row so two workers cannot send the same email twice.", "personal": false },
+      "retrieval_sent_at": { "use": "When the return email went out.", "personal": false },
+      "retrieval_status": { "use": "How the send ended.", "personal": false },
+      "retrieval_attempt_count": { "use": "How many times sending was tried.", "personal": false },
+      "retrieval_last_error": { "use": "Why the last attempt failed.", "personal": false },
+      "review_opened_at": { "use": "When the review link was opened. The one signal that a return email did anything.", "personal": false },
+      "deleted_at": { "use": "Soft delete. Rows are excluded from every read once set, not removed.", "personal": false, "note": "Nothing in the app currently sets this, and there is no user-facing delete. A real deletion request has to be done by hand in Supabase today." },
+      "event_id": { "use": "Which dreaded event this run was a go at, if any (#30). Null for ordinary practice.", "personal": false, "note": "Only sent when there is one, so the column being absent cannot break saving for everybody else." },
+      "deep_link_moment_id": { "use": "Which earlier moment a review run came from, so an arc can be followed.", "personal": false },
+      "_note": "The whole return half of this table is currently inert: /api/retrieval has no caller and no cron, and /m/<id> is a 404. The columns are written but nothing reads them yet."
+    },
+
+    "public.attempts": {
+      "_use": "The two attempts again, as their own rows, for querying across runs.",
+      "id": { "use": "Row id.", "personal": false },
+      "moment_id": { "use": "Which run.", "personal": false },
+      "attempt_number": { "use": "1 or 2.", "personal": false },
+      "transcript": { "use": "What they said, verbatim.", "personal": true },
+      "transcript_edited": { "use": "Whether they corrected it before sending.", "personal": false },
+      "assistance_level": { "use": "How much help they took first.", "personal": false },
+      "meaning_result": { "use": "Whether it got through.", "personal": false },
+      "created_at": { "use": "When.", "personal": false }
+    },
+
+    "public.word_bank": {
+      "_use": "The phrases a learner has collected. Requires an account. This is what the dashboard shows and what the recall queue runs on.",
+      "id": { "use": "Row id.", "personal": false },
+      "user_id": { "use": "Whose phrase it is. NOT NULL — no account, no word bank.", "personal": true },
+      "moment_id": { "use": "Which run it came out of, if any.", "personal": false },
+      "spanish": { "use": "The phrase itself.", "personal": false, "note": "One row per phrase per learner, enforced by a unique index on (user_id, lower(spanish))." },
+      "meaning_en": { "use": "What it means.", "personal": false },
+      "source": { "use": "Where it came from: a coach tool, the rescue card, or 'asked' — a phrase they went looking for themselves.", "personal": false, "note": "'asked' is the only one the learner sought out, which is why it is the only one scheduled to come back." },
+      "times_practiced": { "use": "How often it has been used again.", "personal": false },
+      "last_practiced_at": { "use": "When it was last used.", "personal": false },
+      "created_at": { "use": "When it was collected. Also what the 'you asked me that on tuesday' line is built from.", "personal": false },
+      "due_at": { "use": "When this phrase is next worth putting in front of them. Null means never scheduled.", "personal": false },
+      "resurfaced_count": { "use": "How many times it has come back without being produced. After three it stops being scheduled.", "personal": false },
+      "landed_at": { "use": "When they produced it unaided in a real scene. Set once; a phrase with this is theirs and never returns.", "personal": false }
+    },
+
+    "public.events": {
+      "_use": "A real dated thing somebody is dreading, and the goes laid out between now and then (#30).",
+      "id": { "use": "Row id.", "personal": false },
+      "session_id": { "use": "Which device.", "personal": true },
+      "user_id": { "use": "The account, once claimed.", "personal": true },
+      "created_at": { "use": "When it was planned.", "personal": false },
+      "said": { "use": "What they said at the orb, verbatim. The read-back comes from it and it is the corpus.", "personal": true, "note": "Free text about a real upcoming event in their life, often naming real people." },
+      "name_en": { "use": "The short name the app uses whenever it brings the event up.", "personal": true },
+      "situation_en": { "use": "One sentence describing it.", "personal": true },
+      "who_en": { "use": "Who is in it, if they said.", "personal": true, "note": "Data about third parties again — 'her mum', 'my landlord'." },
+      "when_said": { "use": "Their own words for when — 'friday', 'in two weeks'. Kept even after a date is resolved.", "personal": true },
+      "happens_on": { "use": "The resolved date, or null. Never guessed.", "personal": true, "note": "A date in someone's real calendar." },
+      "timezone": { "use": "So 'today' means their today.", "personal": true },
+      "status": { "use": "planned / running / done / answered / abandoned.", "personal": false },
+      "plan_json": { "use": "The goes: what each one practises, with the invented character for it.", "personal": true },
+      "rescue_json": { "use": "Written by the first go and reused by every one after, so later scenes start without a fresh placement.", "personal": true },
+      "focus_blocker": { "use": "What breaks for them, carried into every go.", "personal": false },
+      "outcome_said": { "use": "Their answer to 'how did it go?', stored verbatim and unclassified.", "personal": true, "note": "Deliberately not labelled by a model. The sentence is worth more than a category, and it is the most candid thing anybody types into this app." },
+      "outcome_at": { "use": "When they answered.", "personal": false },
+      "outcome_spoke": { "use": "Whether they got to say any of it. One tap, no model — the only honest way onto the 'used it for real' rung.", "personal": false },
+      "deleted_at": { "use": "Soft delete.", "personal": false }
+    },
+
+    "public.email_subscriptions": {
+      "_use": "Who gets return emails, and whether they said yes.",
+      "id": { "use": "Row id.", "personal": false },
+      "email": { "use": "The address.", "personal": true },
+      "verification_token_hash": { "use": "The double-opt-in token, hashed. The raw token only ever exists in the email itself.", "personal": true },
+      "verified_at": { "use": "When they confirmed. Nothing is sent before this.", "personal": false },
+      "unsubscribed_at": { "use": "When they opted out. Set, never deleted, so an unsubscribe cannot be undone by a later save.", "personal": false },
+      "created_at": { "use": "When they first gave the address.", "personal": false },
+      "updated_at": { "use": "Last change.", "personal": false }
+    },
+
+    "public.moment_access_tokens": {
+      "_use": "Lets a review link open one saved run without signing in.",
+      "id": { "use": "Row id.", "personal": false },
+      "moment_id": { "use": "Which run the link opens.", "personal": false },
+      "token_hash": { "use": "The hash of the token in the URL. The token itself is never stored.", "personal": true, "note": "Anyone holding the link can read that moment. That is the point of it, and it is also why it expires." },
+      "created_at": { "use": "When it was issued.", "personal": false },
+      "expires_at": { "use": "When it stops working.", "personal": false },
+      "revoked_at": { "use": "Killed early.", "personal": false }
+    },
+
+    "public.retrieval_deliveries": {
+      "_use": "One row per return email we tried to send. Exists so the same email cannot go out twice.",
+      "id": { "use": "Row id.", "personal": false },
+      "moment_id": { "use": "Which run.", "personal": false },
+      "review_stage": { "use": "Which review in the sequence.", "personal": false },
+      "due_at": { "use": "When it was due.", "personal": false },
+      "claimed_at": { "use": "Lock timestamp.", "personal": false },
+      "sent_at": { "use": "When it went.", "personal": false },
+      "status": { "use": "How it ended.", "personal": false },
+      "attempt_count": { "use": "How many tries.", "personal": false },
+      "idempotency_key": { "use": "The unique key that makes a double send impossible.", "personal": false },
+      "last_error": { "use": "Why the last try failed.", "personal": false }
+    },
+
+    "public.retrieval_variations": {
+      "_use": "The changed situation generated for a return email, cached so a retry does not pay for a second one.",
+      "id": { "use": "Row id.", "personal": false },
+      "moment_id": { "use": "Which run it varies.", "personal": false },
+      "review_stage": { "use": "Which review.", "personal": false },
+      "variation_json": { "use": "The generated situation, built from the learner's own rescue.", "personal": true },
+      "model": { "use": "Which model wrote it.", "personal": false },
+      "created_at": { "use": "When.", "personal": false },
+      "completed_at": { "use": "When it finished.", "personal": false },
+      "result_json": { "use": "What came back.", "personal": true }
+    },
+
+    "public.engine_sessions": {
+      "_use": "Short-lived server state for a conversation in progress (the intake and the practice scene).",
+      "id": { "use": "The engine session id.", "personal": false },
+      "kind": { "use": "'coach' or 'converse'. Stops one being read as the other.", "personal": false },
+      "state": { "use": "The whole in-flight conversation: every turn so far, the evidence gathered, the chosen scenario.", "personal": true, "note": "Deleted when the session closes, and expired leftovers are pruned. It is the only row here that is meant to be temporary." },
+      "created_at": { "use": "When it started.", "personal": false },
+      "updated_at": { "use": "Last turn.", "personal": false },
+      "expires_at": { "use": "When it gets pruned.", "personal": false }
+    },
+
+    "public.feedback": {
+      "_use": "The in-app feedback pill.",
+      "id": { "use": "Row id.", "personal": false },
+      "route_path": { "use": "Which screen they were on.", "personal": false },
+      "step": { "use": "Where in the flow.", "personal": false },
+      "rating": { "use": "The answer to the closed question.", "personal": false },
+      "problem": { "use": "What went wrong, in their words.", "personal": true },
+      "expected": { "use": "What they expected instead.", "personal": true },
+      "email": { "use": "Only if they typed one so we can reply.", "personal": true },
+      "permission_to_include_example": { "use": "Whether they agreed we may quote their example.", "personal": false, "note": "The one explicit consent flag in the whole database. Honour it." },
+      "content_json": { "use": "All their answers.", "personal": true },
+      "metadata_json": { "use": "Context about the screen, plus the session id when the client sends one.", "personal": true },
+      "email_status": { "use": "Whether the notification mail went out.", "personal": false },
+      "email_error": { "use": "Why not.", "personal": false },
+      "created_at": { "use": "When.", "personal": false }
+    },
+
+    "public.kept_requests": {
+      "_use": "A sentence somebody said that the router understood and this build cannot act on. Replaced the borrowed analytics table on 2026-09-10.",
+      "id": { "use": "Row id.", "personal": false },
+      "created_at": { "use": "When they said it.", "personal": false },
+      "session_id": { "use": "Which device, so a kept request can be tied to the rest of what that person did. Nullable — a sentence is worth keeping even from a browser with no identity yet.", "personal": true },
+      "intent": { "use": "What the router settled on. Since ask_phrase and stung got engines, what lands here is mostly talk (never being built) and unclear.", "personal": false },
+      "said": { "use": "What they said, verbatim. The corpus of what to build next.", "personal": true, "note": "Free text about their life. This is the one thing that could NOT move to PostHog with the rest of the tracking, and the reason this table exists rather than the sentence going to a third party." },
+      "read_back_en": { "use": "The one-line reading the screen showed them. Stored beside the sentence because the pair is what says whether we understood.", "personal": true },
+      "situation_en": { "use": "Whatever the router pulled out, if anything.", "personal": true },
+      "who_en": { "use": "Who is in it, if they said.", "personal": true },
+      "when_en": { "use": "Their words for when.", "personal": true },
+      "ask_en": { "use": "The phrase they wanted, on an ask_phrase that could not run.", "personal": true },
+      "topic_en": { "use": "What they wanted to talk about, on a talk request we refuse.", "personal": false }
+    },
+
+    "views: ph_sessions, ph_runs, ph_phrases, ph_events": {
+      "_use": "Text-free views over the tables above, built 2026-09-10 so PostHog can be joined to the database without the intimate text following it. `distinct_id` in them is the browser's outloud-session-id, which is exactly what PostHog uses as its distinct_id — that is the whole join.",
+      "_note": "Every column in all four is an id, a timestamp, an enum from a fixed list, or a count. There is deliberately not one free-text column: ph_runs carries the LENGTH of original_text and the attempts, never the text. Point the PostHog warehouse connector at these four and nothing else, and the no-free-text rule holds by construction instead of by discipline.",
+      "personal": true
+    }
+  },
+
+  "browser": {
+    "_use": "Stored on the learner's own device. Never sent anywhere except where noted, and cleared with site data.",
+    "localStorage": {
+      "outloud-session-id": { "use": "The anonymous identity. Written on first visit, sent with every save.", "personal": true, "alsoIn": "supabase (sessions.id, and the session_id on moments, events and analytics_events)", "note": "Clearing it orphans everything saved under it. There is no way back." },
+      "outloud-mic-mode": { "use": "'open' or 'push'. The rollback switch for full-duplex voice.", "personal": false, "alsoIn": "nowhere — device only" },
+      "outloud-pending-verdict": { "use": "A verdict held across a sign-in redirect so an account can be made without losing the run.", "personal": true, "alsoIn": "becomes a moments row if they save" },
+      "outloud-kept-scenarios": { "use": "The last 20 sentences the router understood but could not act on, so the promise on screen is true with no network.", "personal": true, "alsoIn": "analytics_events.metadata_json", "note": "The server keeps its own copy, except for preview sentences, which stay local only." },
+      "outloud-debug-tools": { "use": "Shows the debug pill.", "personal": false, "alsoIn": "nowhere — device only" },
+      "outloud-debug-realtime": { "use": "Verbose voice logging.", "personal": false, "alsoIn": "nowhere — device only" },
+      "sb-<project-ref>-auth-token": {
+        "use": "The signed-in Supabase session: the access token (a JWT carrying the user id and email), the refresh token, and its expiry. Sent as an Authorization header on every request that needs an account.",
+        "personal": true,
+        "alsoIn": "auth.users — the token is a copy of the identity, not the identity itself",
+        "note": "Written by supabase-js, not by us. `getSupabaseBrowser` calls createClient with no options, so the library default applies: persistSession into localStorage. This is the most security-sensitive thing on the device — anything that can read localStorage on this origin can act as the user until the token expires. It is also why there are no auth cookies: the server reads the token from a header (lib/auth-user.ts), never from a cookie."
+      }
+    },
+    "sessionStorage": {
+      "_use": "Hand-offs from /dash into the room. Every one is written, read once on arrival, and deleted immediately.",
+      "outloud-resume-moment": { "use": "The saved rescue for a run being picked back up.", "personal": true, "alsoIn": "moments.rescue_json — Supabase is the original, this is a copy carried one screen" },
+      "outloud-event-beat": { "use": "Which event and which go. Ids only — the room loads the rest itself.", "personal": false, "alsoIn": "nowhere — the ids point at events rows, but no data is duplicated" },
+      "outloud-stung-said": { "use": "The sentence describing a moment that already went wrong, plus the router's one-line reading of it.", "personal": true, "alsoIn": "moments.original_text, but only if they go on to finish and save the run" },
+      "outloud-ask-phrase": { "use": "The phrase question and the sentence they want to be able to say.", "personal": true, "alsoIn": "word_bank.spanish and moments.original_text, but only if they save. The question itself is sent to OpenAI to be answered" },
+      "outloud-autostart": { "use": "A flag meaning 'skip the landing panel'.", "personal": false, "alsoIn": "nowhere — device only" }
+    },
+    "cookies": {
+      "_use": "There are none. Not ours, not Supabase's, not analytics, not advertising.",
+      "note": "Worth stating plainly because it is easy to assume otherwise. The app uses no @supabase/ssr cookie helper: the browser client keeps the session in localStorage and the server reads it from an Authorization header. Vercel may set its own platform cookies at the edge, which is outside the app's code."
+    }
+  },
+
+  "thirdParties": {
+    "openai": {
+      "use": "Every model call: the intake, the scene, the rescue, the evaluation, the router, the lifeline, transcription, and the live voice stream.",
+      "receives": [
+        "what the learner typed or said, verbatim",
+        "the rescue and the conversation so far, on turns that need context",
+        "their self-reported blocker and their who/dialect/tone",
+        "raw audio — both as an uploaded file to Whisper and as a live WebRTC stream from the browser to the Realtime API"
+      ],
+      "personal": true,
+      "note": "All ten text routes send store: false, so OpenAI does not retain the prompt for training. Audio is passed through and never persisted by us: only the transcript and the derived freeze signals are stored. The realtime stream goes browser-to-OpenAI directly and never touches our server.",
+      "_neverSent": "No email address, no account id, and no session id is ever included in a model call."
+    },
+    "supabase": {
+      "use": "The database and authentication. Everything under 'supabase' above lives there.",
+      "personal": true,
+      "note": "Confirmed 2026-09-10: the project runs in **us-east-2**. All practice, transcripts and events are stored in the United States. This is the fact a privacy policy has to state, and the thing to change first if EU storage is ever required."
+    },
+    "posthog": {
+      "use": "Product analytics and session replay. Answers where people drop off, which the database cannot.",
+      "receives": [
+        "event names and their properties — enums, counts, durations, booleans. Never free text: see docs/features/tracking.md section 2",
+        "the browser's outloud-session-id as distinct_id, and the Supabase user id on sign-in — never an email address",
+        "session replays of the interface, with all typed input and all learner/coach text blanked out",
+        "a scheduled copy of four text-free views (ph_sessions, ph_runs, ph_phrases, ph_events) via a warehouse connection, so behaviour and database truth can be joined on the session id"
+      ],
+      "personal": true,
+      "note": "The warehouse connection uses a dedicated Postgres role, `posthog_reader`, with SELECT on those four views and nothing else — PostHog's own connection probe reports zero readable columns for moments, word_bank and every other table. Project \"OutLoud\" (602373) on the US cloud, matching the us-east-2 Supabase project. Session replay is ON by decision (Timo, 2026-09-10): masking covers typed inputs AND rendered content, so a replay shows behaviour and not words. The masking selector list lives in lib/track.ts and is the part most likely to fall behind the UI — new components rendering learner or coach text must carry the `private` class."
+    },
+    "resend": {
+      "use": "Sends the double-opt-in confirmation and the return emails.",
+      "receives": ["the email address", "the rendered email, which contains their phrase and the changed situation"],
+      "personal": true,
+      "note": "Only ever called when RESEND_API_KEY and a from-address are configured. Nothing is sent before verified_at is set."
+    },
+    "vercel": {
+      "use": "Hosting. Standard request logs (IP, User-Agent, path) exist at the platform level.",
+      "personal": true,
+      "note": "Not written by us and not queryable from the app, but it is real data about the user and belongs in a privacy policy."
+    }
+  },
+
+  "gapsWorthKnowing": {
+    "_use": "Honest list. None of these is hypothetical — each is a thing the code does today.",
+    "noDeletePath": "deleted_at exists on moments and events and nothing in the app ever sets it. There is no user-facing 'delete my data', so a request has to be handled by hand in Supabase.",
+    "noRetentionPolicy": "Nothing is ever aged out except engine_sessions. Moments, transcripts and events are kept indefinitely.",
+    "userAgentStoredRaw": "sessions.device_json holds the full User-Agent string. Nothing in the app needs more than a device class.",
+    "sessionIdInsideAnEmailColumn": "An anonymous save writes 'anonymous+<session-id>@outloud.local' into moments.email. Harmless in effect, but anybody reading that column will reasonably assume every value in it is a real address.",
+    "thirdPartyData": "person_profiles.relationship, events.who_en and the free-text columns routinely contain details about people who are not the user and never agreed to anything.",
+    "keptRequestsHoldFreeText": "kept_requests.said is the learner's own sentence, kept deliberately as research. It is personal free text and it never leaves for a third party — that is why it stayed in Supabase when behaviour moved to PostHog on 2026-09-10.",
+    "sessionReplay": "PostHog records the interface. Typed input and rendered learner/coach text are masked, so a replay shows where somebody stopped and not what they said. The guarantee is a selector list in lib/track.ts, which is code that can drift — anything new rendering personal text needs the `private` class or it will be recorded readably.",
+    "authTokenInLocalStorage": "The Supabase session lives in localStorage rather than an httpOnly cookie, because the browser client is created with defaults. It is the standard supabase-js setup and it is fine, but it means any script that can read localStorage on this origin can act as the user until the token expires. Worth knowing before adding a third-party script to the page.",
+    "profiling": "personal_teaching_model_json is an automatically derived profile of how somebody learns, rebuilt from their history on every save. If a privacy policy has a profiling section, this is what goes in it."
+  }
+}

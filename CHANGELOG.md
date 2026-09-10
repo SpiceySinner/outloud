@@ -1,5 +1,747 @@
 # Changelog
 
+## 2026-09-11 — the button that asked for a phrase now answers with one
+
+1.5 step one. The landing screen's second button says **"didn't know how to say something?"** and
+called `enterRoom("stung")` — the engine for *a moment that went badly*. Walked end to end, it
+answered *"tell me what happened — english is fine"*, and after being told the exact sentence
+somebody wanted to be able to say, replied with a choice of two scenarios and never said the
+phrase. `/api/lifeline` was not called at all.
+
+The engine that answers it has existed since the `talk` build and was reachable only through
+`/dash`'s intent router — and nothing in the app links to `/dash`.
+
+Neither option previously written down was needed. Relabelling the button would have made it
+honest and useless; routing through `/api/intent` would have pulled the router forward before the
+merge. **`RoomMode` gained an `ask` entry instead**: one direct question — *what do you want to be
+able to say?* — so the answer IS the thing, and nothing has to infer what they meant. It is an
+entry mode, not a phase; `runAskPhrase` puts the mode back to `speaks-first` the moment the answer
+arrives.
+
+**`strippedAsk`** turns a question into the sentence it asks for: *"how do I say I'll take care of
+it"* → *"I'll take care of it"*. Deliberately conservative — it strips a leading ask and a trailing
+"in Spanish", and hands back the original if that would leave nothing. It has to be, because
+`askEn` becomes the lifeline's query, then the rescue's `originalText`, then the phrase in the word
+bank. Pinned in `strip-unit.mjs`, 18 cases, importing the real file: *"I say it wrong every time"*
+and *"how do I sound less rude"* come back untouched.
+
+Verified in the running app, not reasoned about. The button now produces `/api/lifeline`, three
+options each with **when to use it**, the say-it-back, a real `/api/rescue`, and then the offer to
+*use it for real* or say *that's all I needed*. The whole chain the `talk` plan described, from the
+one door a stranger can actually find.
+
+
+## 2026-09-11 — the closing card shows the result but never the change
+
+Groundwork for 1.5, and it turned out to be the cheap part. Two findings shrank it.
+
+**The top of the ladder has never been reached.** `confirmed_real_life`: 0 runs of 37, over five
+weeks. Not rare — `deriveReviewLedgerState`, the function that infers it, has **zero callers**. It
+is reachable by another door, `/api/events` setting it when somebody reports back that they went to
+the real thing and spoke — and that question is asked on `/dash`, which nothing links to. The
+second feature to fail for only that reason.
+
+**But that is the wrong win for a first visit anyway.** It takes days. The session win already
+happens: 26 of 37 runs reached `answered_on_own` or `used_new_situation`. The taster does not need
+inventing — and per Timo, the single win's job is to earn an **account**, not a subscription.
+Nobody pays for something they did once; habit is what people pay for, and habit needs somewhere
+to accumulate.
+
+So what was missing was the contrast. The card led with the learner's Spanish sentence — right
+instinct — and then reported it underneath as *"you got at least one real reply across clearly"*.
+A participation note, for somebody who had just said fourteen words of Spanish after opening with
+*"the words disappear"*.
+
+**The card now puts the two sentences next to each other**, both in the learner's own words:
+
+```
+YOU CAME IN SAYING   "I understand a lot but when I have to answer I just freeze
+                      and the words disappear."
+YOU LEFT SAYING       No, gracias, solo el café con leche.
+```
+
+Shown only when there really are two different things to compare. The before is deliberately
+quieter than the after: equal weight would turn a win into a before-and-after advert.
+
+**"Changed today" counts instead of hedging.** *"At least one"* is what you write when you do not
+know the number, and the room does know it. It now reports replies that needed no help — the thing
+the contrast cannot show. Worded as *replies in this conversation*, because the journey block
+below counts saved moments across all sessions under nearly the same phrase, and two units with
+one wording put "3 sentences" and "1 sentence so far" on the same screen.
+
+**The weekday promise is gone for anybody signed out.** The card said *"FRIDAY — we'll bring this
+back."* Signed in that is true; `lib/phrase-recall.ts` really does resurface a saved phrase. Signed
+out, `word_bank.user_id` is `not null`, so nothing is saved to come back and no Friday ever
+arrives. It now says what is true: *this run is saved on this device. nothing brings it back on its
+own.* Stated as a fact, not a second ask — 1.1 settled that there is one ask per session and it
+lives at the verdict.
+
+Verified by driving a full typed session to the closing card and looking at it.
+
+
+## 2026-09-11 (later still) — "ah..." was treated as a broken transcript
+
+Reported with a screenshot: a capture of exactly `ah...` shown under **"here's what I heard. fix
+anything that's wrong, then send."** The transcription was perfect. There was nothing in it.
+
+`isFillerOnly` existed for precisely this, and its own comment describes the failure — *"puts a
+confirm box in front of someone who was still working out how to start"*. It did not fire because
+`ah` had been deliberately left out of `fillerSounds` on the grounds that it is a reaction, not a
+stall.
+
+That reasoning is right about a reaction INSIDE an utterance: *"ah, sí, quiero un café"* is an
+answer with a noise on the front, and the rule never touches it because the other words are not
+fillers. It is wrong about a reaction that is the WHOLE utterance. `ah...` on its own answers
+nothing, and whoever produced it was reacting or thinking, not speaking.
+
+So reactions now live in their own set — `ah`, `oh`, `ay`, `uf`, `huh` and their stretched forms —
+and `isFillerOnly` accepts either set. Every word still has to be one of them, which is what keeps
+real answers safe. `mm`, `mmm` and `mhm` stay out for the original sharper reason: as a whole
+utterance they usually mean YES.
+
+**Both capture paths classify now.** The screenshot came from the realtime path, which had already
+run `classifyCapture`, got `ok`, and passed the transcript to `routeCapturedTranscript` — where a
+one-word English answer is "suspicious" and gets the confirm box. The recorded path never
+classified at all, so a decode loop could have gone straight through it unscreened. It now runs the
+same function the realtime path does, before anything is called suspicious, and answers `filler`
+and `empty` with *"take your time."* rather than with a correction screen.
+
+The confirm box means *I heard words and they might be wrong, check them*. Showing it for a
+capture with no content tells somebody who was still thinking that the microphone misheard them,
+which is untrue and the opposite of what that moment needs.
+
+Pinned in `filler-unit.mjs`: 12 captures treated as nothing said, 12 real answers untouched —
+including `ah, sí` and `uh, quiero un café`. It imports `lib/voice-guards.ts` rather than copying
+it.
+
+
+## 2026-09-11 (later) — the app answered a sentence nobody said
+
+From a real voice session, with the console log. Three separate faults, and the model was not one
+of them: every `response.create` carries *"Say this exact line and nothing else"* with
+`conversation: "none"`, so the realtime layer only ever read out what the coach routes wrote.
+
+**A speech segment that began after the mic shut could answer for the learner.** `closeCapture()`
+sets `awaitingTranscript`, which deliberately keeps accepting transcription while the window is
+closed — the transcript for the turn that just ended is still in flight. What it did not do was
+check WHICH segment the transcript belonged to. From the log:
+
+```
+[voice:capture] waiting for transcript, timeout: 6000 ms
+[rt] input_audio_buffer.committed       | micWindow: closed
+[rt] input_audio_buffer.speech_started  | micWindow: closed   <- a new segment, mic shut
+[rt] ...transcription.completed "Valla en az..."
+```
+
+`"Valla en az..."` was submitted as the learner's answer. Nobody said it — it is the room, or the
+tail of the coach's own audio, decoded into words. A `speech_started` while the window is closed
+now ends the window: what was already finalised still counts, nothing after it does. If that
+leaves the turn empty it is discarded as a dud and the learner is asked again, which is the honest
+outcome and much better than being answered about a sentence they never spoke.
+
+**The transcription language was pinned too late to matter.** It was applied inside
+`startRealtimeListening`, which on the open-mic path runs *after* server VAD has already fired —
+the learner is mid-word by then, so the switch describes audio that has gone. It now happens in
+`syncRealtimeMic`, which runs on every mic transition and therefore strictly before the first
+sample of speech. Skipped while a capture is open or its transcript in flight, because changing
+the language under an utterance being decoded corrupts the turn it is meant to fix.
+
+**The stepped-out screen showed three status lines at once.** "speaking", "tap the orb to
+interrupt" and "stepped out — we can pick this up again", stacked, none of them the thing being
+read — and "interrupt" is wrong there anyway, since no scene is running. The room's label and
+subcopy are dropped while stepped out; the aside's own badge is the one line.
+
+Also in that screen: the learner's own lines were 0.75 opacity on soft ink and close to unreadable
+on a phone; the thread rendered oldest-first so it clipped the newest line mid-sentence; and the
+scrollbar thumb sat on top of the text, which is the "stray cursor" in the screenshot. Contrast
+back, pinned to the bottom with the older lines fading out above, and 12px of room for the
+scrollbar.
+
+**Not verified by machine.** All three are on the voice path, which the headless harness cannot
+drive — it aborts the realtime token by design. The stepped-out screen was rendered and looked at;
+the two voice fixes have been reasoned from the log and typecheck clean, and need a real session.
+
+
+## 2026-09-11 — asking a question is also asking for help
+
+Reported from a real session on the homepage, mid-scene, in Timo's own words:
+
+> *"What is the word, like, I know, thanks to the hint, I know like Quiero comprarse, I want to
+> buy, but what's, do I say if I wanna say, how, where is the pizza?"*
+
+The app answered with **"here's what I heard. fix anything that's wrong, then send."** — the
+screen that was supposed to have stopped appearing yesterday.
+
+It did not fire because yesterday's detector only knew one shape. Every phrasing it recognised is
+an **admission**: "I don't know how to say it", "no idea", "I'm lost". That sentence admits
+nothing. It says *"I know"* twice. It is a **question**.
+
+And the question is the normal case, not the edge case. Somebody who half speaks the language
+does not announce defeat; they are already halfway through a sentence and ask which word goes in
+the gap. Building only the admission shape means the app helps people who give up and ignores
+people who are trying.
+
+`lib/stuck-signal.ts` now exports both, and `needsWordsEn` — either shape — is what the room and
+`/api/coach` call. The question pattern is anchored on the asking itself and deliberately not on a
+bare "what to say", because *"I never know what to say when someone asks how I am"* is a
+description of a problem, which is the over-firing this file has already paid for once.
+
+Live, in the real UI: that sentence now steps out to the coach, which opens with **"You can say,
+¿Dónde está la pizza? It means, Where is the pizza?"** No confirm box.
+
+**The unit test now imports `lib/stuck-signal.ts` instead of copying it** (run it with
+`node --experimental-strip-types`). The copy is what let three of these bugs through: when the
+pattern was broken, the copy was broken identically and the test agreed with it. 27 phrasings
+caught, 20 correctly ignored.
+
+
+## 2026-09-10 (evening) — asking for help now reaches the coach
+
+Reported by Timo, about the two moments that matter most: *I tell it the sentence I want to be
+able to say, and it never tells me. And when I say mid-scene that I have no idea how to say
+something, I keep getting the screen where it checks it understood me.* Both were reproduced
+against the running app before anything was changed.
+
+**"Here's what I heard" was the answer to asking for help.** Mid-scene, an English sentence trips
+`looksBrokenAttempt` — which keys on English filler words as evidence that English leaked into
+Spanish — so `routeCapturedTranscript` marked it suspicious and opened the transcript confirm box:
+*"here's what I heard. fix anything that's wrong, then send."* The transcription was perfect. Being
+told your pronunciation is the problem, right after asking for words, is worse than silence, and it
+repeats for as long as you keep asking. A comment beside that screen already described the failure
+and offered a third button as the way out — which the learner had to notice and press.
+
+The room now reads the ask as an ask. `stuckAskShouldStepOut` runs before the suspicion router and
+before scoring, on the typed path and the spoken one, and hands the learner to the aside — which
+was already the coach mode, already a room mode so the mic stays open, already carrying the scene
+snapshot and already able to put them back. It was only ever reachable by pressing a chip. Now the
+asking reaches it.
+
+**The coach then opened by asking what was on their mind.** Correct for somebody who walked out for
+an unknown reason; wrong when they said why on the way out. `/api/aside` gains a third trigger,
+`stuck`, carrying the sentence verbatim — and its turn-0 guidance teaches first. If the sentence
+names the phrase, it hands over that phrase; if it names nothing (*"I have no idea how to say
+that"*), the thing they could not say is the answer to the character's last line, which is already
+in the payload. Find the referent, never invent one, never ask them to repeat what they just said.
+
+Measured, in the real UI: a learner saying *"I have no idea how to say that"* to *"¿quieres algo
+para comer también?"* now gets *"You can say, 'Quisiera algo para comer también, por favor.'"*
+Naming it outright gets *"You can say, 'Me encargo de eso.' … Would you like to try saying it out
+loud now?"* Neither is a question about their feelings, and neither is the confirm box.
+
+**The detector moved to `lib/stuck-signal.ts`.** It was inlined in `/api/coach` and copied into the
+harness that verified it, so when it turned out to be broken the copy was broken identically and
+the test reported green. One home, imported by the route, the room and the tests.
+
+### Known, diagnosed, not fixed
+
+The landing button labelled **"didn't know how to say something? →"** calls `enterRoom("stung")`
+— the engine for *a moment that went badly*, not the one for *how do I say this*. Walking it end
+to end: it answers *"tell me what happened — english is fine"*, and after being told the exact
+sentence somebody wants to be able to say, it replies with a choice of two scenarios and never
+says the phrase. `/api/lifeline` is not called at all. `ask_phrase` is built and in
+`runnableIntents`, but only `/dash`'s voice router reaches it. Left alone deliberately: relabelling
+the button and routing it through `/api/intent` are different products, and that is Timo's call.
+
+
+## 2026-09-10 (later) — the stuck detector never fired on a phone, and fired on the wrong things
+
+The first synthetic-run sweep — four personas, three runs each, through the real UI — found two
+faults in the detector fixed earlier the same day. They pull in opposite directions and neither
+was visible from a transcript.
+
+**Only one shape of apostrophe was spelled.** The pattern wrote the contraction as `don'?t`, which
+matches `dont` and a straight quote. iOS and macOS substitute a curly U+2019 as you type, so the
+sentence that actually arrives from a phone is `I don’t know how to say it` — a different string,
+matching nothing. The morning's fix was real in the harness and **invisible on the device the app
+is mainly used on**. Inputs are normalised before matching now.
+
+This surfaced by accident, which is worth recording: the sweep's own false positives all carried
+straight quotes and fired, while the single sentence carrying a curly one stayed quiet. The
+inconsistency was the clue, not the failure.
+
+**The widened pattern fired on people describing themselves.** Matching any `I don't ...` meant
+`I don't like the way I sound`, `I don't have much time to practice` and `I can't stop translating
+in my head` were all read as "hand me the words". The opening question literally asks people to
+describe their problem, so this was aimed straight at the most common answer in the app. Handing
+somebody a phrase card for a sentence they never asked to say is the mirror image of the morning's
+bug and lands the same way: it looks like listening and is not.
+
+The negation now has to be reaching for *saying* something — `know how`, `say`, `get it out`,
+`put it`, `remember the word` — with a separate anchored branch for the bare `I don't know.` as a
+whole answer, which in a room that just asked you to speak cannot mean anything else.
+
+`stuck-unit.mjs` now pins all three bugs at once: 19 phrasings caught, 18 correctly ignored,
+including every stuck sentence a second time with the phone's apostrophe. Live: the curly
+admission is answered with `Yo me encargo de eso`, in a say-it-back card.
+
+**Also built: the synthetic-run harness** it came out of. Four personas along two independent axes
+— what they can produce, and what they do when they cannot — driven through the real UI on the
+typed path, so the app makes exactly the calls it makes for a person. Documented in
+`docs/features/synthetic-runs.md`, including the part that matters most: this is a measurement,
+not a test suite, and voice is never covered.
+
+
+## 2026-09-10 — "I don't know how to say it" was answered with a new question
+
+Reported from a real session: *tell it you do not know how to say something, and it asks you, in
+the scene, to say that thing.* It turned out to be three faults stacked, and the first diagnosis
+written down for it — that the rule against this only existed on one turn of `/api/coach` — was
+simply wrong. Both routes carry it as a general rule. Reproducing it against the live route is
+what found the real causes.
+
+**The scenario turn had no way to help.** Its instruction is hardcoded to `intent=probe,
+tool=none` and ends *"show me what you would say — in Spanish, however it comes out"*, and
+`stuckNote` was only ever appended from the turn AFTER it. So somebody answering the framing
+question with *"I want to tell my girlfriend's mum I'll take care of it, but I have no idea how"*
+got a scene set in front of them and a demand for Spanish. Six of six runs.
+
+The turn now changes shape rather than gaining a footnote: when they have declared themselves
+stuck, the scene is still set and `sceneCharacter` still filled — naming the person is the
+valuable half — but it ends by handing over the words instead of asking for them. Structural, for
+the same reason the framing turn was in #30: a prompt cannot argue a turn out of the instruction
+that defines it.
+
+**The detector missed the second admission.** `declaredStuckEn` required the pronoun and the
+negation to be adjacent, so *"I **still** don't know how to say it"* did not match and was
+handled as an ordinary attempt — answered with a fresh, unrelated question. Somebody saying it
+for the second time is more stuck, not less, and it was exactly the second time that fell
+through. Up to two words are allowed between now ("still", "really", "honestly", "just"). The
+same lesson the date guard in `/api/event-plan` paid for: a pattern that only matches tidy
+phrasing misses how people talk, and misses hardest when they are frustrated. Spanish stays out
+of it — a learner who answers *"no sé"* has given a real answer.
+
+**Then the help arrived for the wrong thing.** With both fixed, somebody stuck on *"I'll take
+care of it"* was handed *"Quisiera un café y un sándwich"*: `stuckNote` said to help with "the
+SAME thing", and the model read that as the same as the scene. It now says the content is decided
+by them and not by the scene, and that a vague *"I still don't know how to say it"* refers back to
+what they named earlier. Helping confidently with something nobody asked about is the *"what was
+the point of telling it my problem?"* failure with a tool attached — worse than not helping,
+because it looks like listening.
+
+**And the scene itself had been drifting all along.** `pickScenario` fell through to option A —
+built from the opening answer — whenever the reply matched neither option. So *"I froze at my
+girlfriend's parents last friday"* became a cafe, because option A had been built from the word
+"vocabulary" one turn earlier. A reply that overlaps neither option and is long enough to be a
+situation is now the scenario itself. The same run afterwards opens *"This is Ana, your
+girlfriend's mother — kind but very direct."*
+
+**Measured, not asserted:** three scripted openings, two runs each, against the live route.
+**1—2 of 12 turns asked back before; 0 of 12 after**, and the phrase handed over is the one they
+named. The stuck pattern also has a unit check: 12 phrasings caught, 11 real attempts (Spanish
+included) correctly ignored.
+
+## 2026-09-10 — practice saved by a stranger belonged to nobody
+
+#32, and the reason it could not be answered honestly until now.
+
+**The bug.** `/api/library` claimed a new account's earlier runs with
+`.eq("email", user.email)`. A run saved without an email is stored against the browser's
+identity, with `anonymous+<session-id>@outloud.local` in the email column — a string that by
+construction can never equal a real address. So anonymous practice was **saved and
+permanently unreachable**: not by the learner, not by us, not by anyone, forever. Meanwhile
+the closing card said *"sign up with the same address and everything you already saved comes
+with you"*, which was true only for people who had typed one in.
+
+`/api/events` has claimed on `session_id` since #30, and the comment there already named this
+as the missing half one route over. It claims both ways now.
+
+**The trade, stated rather than buried.** Signing in on a shared browser claims whatever
+anonymous practice is sitting in it. That is the trust model events already run on — the
+session id lives in that device's localStorage, so possession of the device is the credential
+— and it is the only model under which "your practice follows you" is true for somebody who
+never gave an address.
+
+**The ask points at something now.** *"Nothing here comes back on its own"* is a claim about
+tomorrow that a first-time visitor has no way to check. It now reads *"4 sessions are saved on
+this device and nothing is holding on to them"*, from a new `GET /api/moments` that returns a
+count for a session id and nothing else — no auth, because the session id **is** the
+credential and a count is strictly less than the full rows `/api/events` already hands back
+for one.
+
+Order matters here: the sentence only became sayable in the same change that made it true.
+Shipped a week earlier it would have been a better-sounding version of the same broken
+promise.
+
+Under two runs it keeps the older wording, and every failure path answers zero rather than
+guessing. A number we cannot stand behind must never end up in a sentence telling somebody
+what they have done.
+
+**One ask, down from two.** Nothing new was added — nothing on `/dash`, nothing after the
+first aha, and the room's `profile-pill` stays silent — and one was taken away. The verdict
+and the closing card both asked, and both were gated on being signed out, which meant the
+second could only ever appear to somebody who had just said no. An app that bans streaks and
+refuses to praise silence does not get to ask twice. The verdict keeps it: the rescue and the
+diagnosis are still on screen there to justify it, and it is the block that also carries the
+email fallback and the signed-in save control. If instrumentation ever shows people leaving
+before it converts, that is when it comes back — not on a guess.
+
+## 2026-09-10 — the card and the account share a line, and the plan can be read
+
+`UI.Idee.md`, built. Three changes to the bottom band of `/dash`.
+
+**The card and the account are on one row**, roughly 85/15. The account used to sit in the tray
+underneath, next to "everything", where the two competed for the same job — both were a way off
+this screen and neither said which. It is now a disc on the card's own line, and the tray has one
+link and one purpose.
+
+**The event card can be opened.** A card can only ever show the next go, which is right for a
+screen whose whole job is "one thing to do". But an evening broken into four pieces is a plan, and
+a plan you cannot read is a plan you have to take on trust. A control on the card's right opens a
+drawer upward with every go in it: which are done, which is next, who is in each one, and when.
+Every row is startable — including the finished ones, which say "again" rather than going quiet.
+Deciding somebody is done before they do is the same small betrayal #38 removed from the retry cap.
+
+**The drawer closes the microphone.** Not a courtesy. An open capture window behind a panel of
+text is the worst thing this screen can produce: the learner reads, server VAD hears nothing, and
+the header comes back with "I didn't catch what you want to do" about a sentence nobody tried to
+say. Silently, because nothing was asked.
+
+### Two things the first pass got wrong
+
+**A glyph nobody has.** The control started as `&#8963;` (UP ARROWHEAD), chosen because the house
+convention here is text glyphs rather than icons. It has almost no font coverage and fell back to
+an ASCII caret sitting on the cap line — it read as a stray `^`. The convention holds only while
+the character is actually covered, which `&rarr;` is and this was not. It is now a drawn list
+icon, the first SVG in the project, and it also says something truer: you get a list, not a
+direction.
+
+**A box inside a box.** The control was a 44px rounded rectangle floating inside the card's
+rounded rectangle. Two nested radii that close together read as debris. It is now a zone *of* the
+card — full height, separated by a hairline, sharing the card's right radius. The target grew from
+44x44 to 46x66 on the way, which is the part that matters: it sits inside another tappable thing,
+and missing it starts a session nobody asked for.
+
+**The account was a letter in a rectangle.** An initial alone reads as a letter; on a disc it
+reads as a person. The pill went from 46 to 58px — the 15% the idea asked for — and holds a
+34px ink disc. Signed out it holds a real silhouette instead of a placeholder letter, which would
+have been a small lie about whose account it is.
+
+### Found while opening the account discussion, not yet fixed
+
+**Anonymous practice is never claimed.** `/api/library` claims prior runs with
+`.eq("email", user.email)`, so a run saved without an email — stored under the synthetic
+`anonymous+<session-id>@outloud.local` — can never match a real address and is never claimed by
+anyone. It is saved, and it is permanently unreachable.
+
+`/api/events` already solves exactly this, one route over, by claiming on `session_id`. The
+closing card meanwhile promises *"sign up with the same address and everything you already saved
+comes with you"*, which is true only for people who typed an address in. See `docs/TODO.md` 1.1.
+
+## 2026-09-07 — `talk` was three things, and one of them is never being built
+
+The last intent on `/dash` had no engine. Looking at it closely it was not one thing waiting for
+one engine — it was **three things wearing one label**, and two of them had engines already built
+and sitting unused.
+
+| what somebody says | what it is | what happens now |
+|---|---|---|
+| *"how do I say I'll take care of it"* | a **question** | the lifeline answers it, and then they have to **say it** |
+| *"I froze at the pharmacy today"* | a **moment** | the room's `stung` intake, which has existed since before this screen did |
+| *"can we just talk for a bit"* | **open chat** | a plain no, with copy that says so |
+
+The design, and the reasoning behind every rule in it, is
+[docs/features/router-talk-feat.md](docs/features/router-talk-feat.md).
+
+### "Not built yet" and "never being built" are different sentences
+
+`talk` used to take the honest-refusal screen: *"I can't build that one yet. I've kept it — it's
+the first thing when I can."* For open-ended chat that is a promise we have decided never to keep
+— free-chat mode is a hard ban — and somebody who comes back in a month to collect on it finds out
+they were being managed. It gets its own state now: *"open chat isn't a thing I do. give me a real
+situation, or something you couldn't say."* The no still names what we do take, because teaching
+what to say is this screen's whole job.
+
+It is still recorded on the way past. How many people ask for open-ended chat is worth knowing
+precisely *because* we are refusing them.
+
+### Told apart by example, never by a keyword list
+
+The obvious implementation is a list — *"how do I say"*, *"what's the word for"*. It would miss
+*"I never know what to say when someone asks how I am"*, which is a phrase question with none of
+those words in it, and fire on *"the woman at the bakery asked me something and I couldn't work out
+how to say I was just looking"*, which is a moment. The date guard in `/api/event-plan` paid for
+that lesson already: a word list scanning a whole sentence is wrong in both directions at once.
+
+Both of those cases are now worked examples in the prompt, and both are in the test. So is the
+precedence rule: *"I couldn't say I'll take care of it at the pharmacy today"* is both a moment and
+a phrase, and **the moment wins** — a situation carries a person, a place and a reason, and the
+phrase can be reached from inside it.
+
+29 sentences against the live router, all passing.
+
+### The chain behind a question
+
+```
+"how do I say I'll take care of it"
+  → 1-3 real options, each with when to use it        /api/lifeline
+  → "now say it."  →  they produce it out loud        ← this IS the attempt
+  → a real rescue                                     /api/rescue
+  → the phrase is kept, with a date to come back      word_bank
+  → "use it for real"  →  a scene                     /api/variation → /api/converse
+```
+
+**The say-it-back is not a flourish.** `/api/converse` refuses to start without a rescue and a
+rescue needs an attempt — the same wall #30 had to get over. Here it is cheap, because the thing
+normally missing is already present: `originalText` is literally what they asked for. And it is
+the product thesis in two seconds. Knowing a phrase and producing it under pressure are different
+things; a screen that stops at the answer is a dictionary, and dictionaries already exist and are
+free.
+
+**A room phase, not a sheet.** Overlays close the microphone — that is why the aside is a room
+mode — so a say-it-back in a sheet would be a screen that asks somebody to speak and cannot hear
+them. All the options show, each with when to use it: choosing between them is most of what
+knowing a phrase means, and the in-scene sheet's single option exists only because it is
+interrupting a conversation.
+
+**No moment is saved for the ask itself.** Only playing the scene saves one. A thirty-second
+lookup is not a session and must not sit in the list next to one.
+
+### The half this is actually for
+
+Days later, in a scene built for something else entirely, the learner lands in a spot where that
+phrase is exactly what is needed — and reaches for it themselves. The feeling is **"I know this
+one."** Timo's idea, and the reason the rest of it is worth building.
+
+`lib/phrase-recall.ts` is pure and AI-free, the twin of `lib/event-plan.ts`: the model writes
+content, deterministic code owns counts and dates. Everything in it stops one specific way this
+dies, all of which ship fine and quietly teach nothing:
+
+- **never the same session** — 20 hours minimum after it was asked for, whatever the schedule says
+- **not every scene** — at most one, and nothing about two scenes in three
+- **not everywhere** — event goes are excluded, and so is the scene straight after a phrase
+  question. Dropping an unrelated phrase into a run-up to a real dated evening is the same failure
+  as offering somebody a rotation topic next to their own dreaded call. Every caller says yes or
+  no explicitly, because a default is how "it fires every time" arrives later without anybody
+  choosing it
+- **the scene NEEDS it, never says it** — a character that produces it first has handed it back,
+  and the learner recognises instead of retrieving
+- **unaided or it did not happen** — `assistanceUsed === "none"`, or it is not recorded as landed
+- **nothing said beforehand** — announcing it on the way in shows somebody a system instead of
+  letting them feel a memory. **Afterwards is the opposite**: *"that's the one you asked me about
+  on tuesday — and you just reached for it."*
+
+The measurement is deterministic: accent- and punctuation-blind containment, the same flattening
+as `appearsIn` in `/api/event-plan`. The evaluator's own `usedTargetChunk` judges the rescue's
+chunk, which here is a different string entirely.
+
+The unit tests found the trap in it. A pattern is stored with its blank in it, and `"quiero ___"`
+reduces to the single word *"quiero"* — which appears in a huge share of everything anybody says in
+Spanish. A pattern whose stem is under two words is now declined rather than guessed at, because a
+phrase wrongly marked as landed never comes back and the learner silently loses it.
+
+### The framing turn, again — and this time the rule is right
+
+Walking through the new `stung` door produced a familiar screen. Somebody who had just said *"I
+froze at the pharmacy today and switched to english"* was asked: *"Where do you want to try first
+— asking at a pharmacy, or telling someone about your job?"*
+
+That is the same failure reported on the landlord call, and it was already in the shipped
+landing-panel path, because the room's `stung` entry asks *"tell me what happened"* first. The fix
+for #30 keyed on `mode === "upcoming"`, and `mode` was only ever standing in for **"we already
+know what they are practising"**. It now keys on the thing itself: a session whose scenario is
+settled before it starts has no framing turn, whatever mode it is in.
+
+Somebody whose whole answer is *"I just froze, I don't know"* still gets the two options — for them
+that is the help, not the insult. Six cases pinned in a test, in both directions.
+
+### Needs applying
+
+`supabase/202609070002_phrase_recall.sql` — `'asked'` joins the `source` CHECK, and `word_bank`
+gains `due_at`, `resurfaced_count` and `landed_at`. Until it runs, a phrase question still answers
+and still becomes a scene; what does not happen is the keeping, and therefore the coming back.
+`/api/library`, which the dashboard reads, does not touch the new columns either way, so it cannot
+break whether the migration has run or not — the same discipline as `event_id`.
+
+Signed out, the keeping half is off entirely: `word_bank.user_id` is not null against `auth.users`.
+
+## 2026-09-07 — building backward from one real evening (#30)
+
+You say *"dinner at my girlfriend's parents on friday"* at the orb, and the screen lays out four
+goes at that specific evening between now and friday, runs them one at a time, and afterwards asks
+how it went. Master plan #30, and the last thing on `/dash` that was answering honestly that it
+could not be built.
+
+### The wall
+
+Everything downstream of the room hangs on a **rescue**, and a rescue needs an **attempt**.
+`/api/converse` refuses to start without one; `moments` has `first_attempt` and `rescue_json` as
+not-null columns. A named event has neither — nobody tried to say anything, somebody named a date.
+
+**So the first go IS the intake.** Seeded with what they said and which part of the evening it is,
+it produces the rescue, and every go after it starts its scene from that same rescue. That is the
+shape `restartSceneFromAside` already used to move somebody who said the situation was wrong for
+them, so `startSceneFor` is now shared between the two. Four goes at an evening, one placement.
+
+### Never invent a date
+
+`/api/event-plan` has to quote the words it read the date from, and the server checks the quote is
+really in what the learner said and really names a time. Otherwise: null, and an undated event
+still gets a plan.
+
+The first version of that guard scanned the whole sentence for time words, and the test caught it
+being wrong in both directions — it would have refused *"christmas with her family"* a perfectly
+good date and then asked *"when is it?"*, to which the only answer is "christmas" again.
+
+### Two things the live test found that reading could not
+
+**The thinning threw the point away.** An event tomorrow gets two goes, not four, and picking them
+by position turned *"I have to call the landlord tomorrow about the heating"* into the hello and
+the goodbye — with the complaint the entire call is about dropped out of the middle. The planner
+now marks which beat is the one they are dreading, and that one survives first.
+
+**Scenes came back with two people in them** — `"Elena and Carlos"`, `"the bride and groom"`. The
+room plays a single character and its own prompt forbids it to switch or rename, so that would
+have left it with nobody to be.
+
+### Two things found on the first real run
+
+**The intake offered a choice that had already been made.** Somebody who had just said *"I have
+to call the landlord tomorrow"* was asked whether they would rather practise calling the landlord
+or telling a friend about their job. Framing exists to pick between two situations, and for an
+event there is nothing to pick — so `upcoming` mode has no framing turn at all: turn 0 sets the
+scene and `chosenScenario` is settled before the session starts. Structural rather than a line in
+the prompt asking it nicely, because the turn machine is what drives that turn.
+
+**You could only start a go by tapping it.** The router was only ever offered the *next* one, so
+*"let's do the second one"* quietly fell back to whatever was next. Every remaining go is offered
+now, numbered, and the client acts on the index it was handed rather than on what happens to be
+next.
+
+### After it happens
+
+*"how did it go?"* is asked once and stored **verbatim and unclassified**: the sentence is the
+research, and a label would be the thing we analysed instead of it.
+
+Then one closed question, answered with a tap: *"did you get to say any of it?"* Only a yes moves
+the linked moments to `confirmed_real_life`. That rung says *"you used it for real"* and until now
+nothing in the app could honestly put anyone on it — it was inferred from a perfect transfer
+evaluation, which is practice. Turning up and freezing is not mastery, which is why the question is
+asked separately rather than read out of the sentence above it.
+
+### Needs a migration
+
+`supabase/202609070001_events.sql`. Until it is applied, creating an event ends at *"I couldn't
+save that one"* rather than in a promise that dies with the tab. Saving a normal moment is
+deliberately unaffected: `event_id` is only sent when there is one, so a schema change for a new
+feature cannot break saving for everybody else.
+
+The room's own behaviour is unchanged, verified by a full typed run to the closing card and by the
+aside's scene change still landing in the right scene with the right person.
+
+## 2026-09-07 — the entry screen says it out loud
+
+You spoke to it and it answered in silence. That is asymmetric, it quietly says the microphone is a
+form field, and it contradicts the product's own rule that the AI speaks first — so the read-back is
+now spoken as well as written.
+
+I had decided against this, on latency and cost. Both arguments fell over on inspection:
+
+- **`kept` and `unclear` are dead ends.** You stay on the screen, so speaking costs no waiting.
+- **`resume` navigates, but the room does not speak on arrival** — it shows the verdict card and
+  waits for a tap. And the session survives the navigation, so the read-back plays *across* the
+  transition. Zero added latency, and the first thing the module singleton bought that was not just
+  hygiene.
+
+### The one real catch
+
+At 4.6 and on both retries the microphone **reopens** straight afterwards. An open mic while the
+coach is still audible hears his own voice and starts a turn nobody asked for. So those lines are
+awaited, and `voice.speak` resolves on **playback drained** (`output_audio_buffer.stopped`), not on
+generation finished. That distinction is the entire reason this needed the session module rather
+than a `response.create` sent inline.
+
+### What moved
+
+The playback lifecycle followed the capture into `lib/voice-session.ts`: `speak()`,
+`cancelSpeech()`, and the five refs behind them. `realtimeInterruptible` and `realtimeInterrupted`
+stayed in `app/page.tsx`, because they are **policy** — the room has closing lines nobody may talk
+over, and the entry screen has nothing of the kind. `speakCoachText` is now its orchestration
+(static clips, auto-listen, handing the turn back) over the module's primitive.
+
+The room's behaviour is unchanged, verified by a full typed run to the closing card before the entry
+screen was touched at all.
+
+### What speaks and what does not
+
+**It speaks when it is responding to something you said, and stays quiet about its own plumbing.**
+Read-back, the refusal and its promise, the 4.6 vocabulary, *"take your time."*, *"that came back
+garbled."* — all spoken. The idle timeout is silent: nobody said anything to answer, and a voice
+from a phone somebody has put down is startling rather than helpful.
+
+A tap always cuts the line and opens the microphone. Talking over a voice interface is the most
+natural thing a person does to one.
+
+## 2026-09-06 — the microphone moves to the entry screen
+
+`/api/intent` was built and passing, and nothing fed it. The orb on `/dash` handed off on a *tap*,
+and the room then started its own fixed intake — so the header invited someone to describe their
+week and the app ignored what they said. That is the failure this whole screen exists to prevent,
+rebuilt on a new screen.
+
+Now the orb is a microphone. Tap once, say what you want, and the screen reads back what it
+understood before anything happens.
+
+### The microphone could not move alone
+
+Around it in the room sat roughly six hundred lines of guards, each one paid for by a real failure:
+VAD profiles, the transcription-language pin, the decoder-loop discard, filler patience, dud
+strikes, the noisy-room offer. Copying any of that onto a second screen is how this codebase keeps
+producing features that look built and are not. So it moved instead:
+
+- **`lib/voice-guards.ts`** — what an utterance *is*. Pure: it classifies a string and never
+  decides what to do about it, because the room mid-session and a learner arriving at the door
+  genuinely want different things from the same "that was only um".
+- **`lib/voice-session.ts`** — the connection, the microphone, one capture. A **module singleton**,
+  not a hook, for two reasons: two screens need it, and it has to outlive a navigation. Going from
+  the entry screen into the room unmounts one React tree and mounts another; a connection held in
+  refs would die there and cost a second microphone prompt and a second token mint for one
+  continuous act. It now survives that gap and the room adopts it.
+
+The boundary is **"get me a transcript"** against **"and then what"**. Speaking — `response.create`,
+interruption, waiting for playback to drain — stayed in the room, because only the room has
+anything to say. Nineteen refs left `app/page.tsx`; seven stayed.
+
+The room's behaviour is unchanged, and that was verified before any of the entry-screen work
+started: a full typed run to the closing card, plus the hand-off.
+
+### What the entry screen does with a sentence
+
+| you say | what happens |
+|---|---|
+| *"let's do that one"* | resumes that saved moment. The only intent with an engine behind it. |
+| *"dinner at her parents on friday"* | read back, then: **I can't build that one yet. I've kept it.** |
+| *"how do I say I'll take care of it"* | the same. `talk` came *off* `runnableIntents`. |
+| anything it can't place | *"I didn't catch what you want to do"* — and the mic reopens under it. |
+
+Nothing ever proceeds on a guess, and nothing falls through to the default intake behind the
+learner's back. The intake is still offered — as a card at the bottom, named, when there is nothing
+waiting — because an offer you choose is not the same thing as a fallback you get.
+
+**Keeping the sentence is the point.** `POST /api/kept-scenario` writes it to `analytics_events`,
+an existing table that had no writer at all. For the learner it turns a dead end into a promise;
+for us it is the corpus the upcoming-event engine needs and does not have — real situations real
+people asked for, in their own words.
+
+### Smaller things in the same change
+
+- **A `connecting` state the design did not have.** The first tap mints a token, asks for the
+  microphone and does the handshake. Saying "listening…" through that is a lie that gets found out
+  in the two seconds it takes, so it says *"one moment — waking the mic."*
+- **The signed-out entry screen had a blank header.** It treated "signed out" as "we don't know
+  yet". A signed-out visitor is a brand-new learner, which is a state with copy of its own.
+- **The bottom band can no longer be empty.** With no saved work and no microphone it was a dead
+  screen. There is always either a pick-up card or the intake, offered by name.
+- **`lib/use-library-data.ts`** — the `/api/library` loader, which existed twice and had already
+  begun to differ in what a failed load meant.
+- `audio.playsInline` (not a property of `HTMLAudioElement`) is now `setAttribute("playsinline")`,
+  which removes a standing type error.
+
+### Not built, and not pretended
+
+`new_scenario` and `talk` have no engines. The screen says so in their own words and keeps what
+they asked for. `runnableIntents` is `["resume"]` and the copy reads from that list, so the two
+cannot drift apart.
+
 ## 2026-09-04 — A home to come back to, in preview
 
 `/dashboard` was a list of words and a list of sessions. It answered "what did I collect" and
@@ -73,6 +815,77 @@ Nothing is wired to the paywall, the chat has no engine (`/api/aside` is the clo
 it is shaped for stepping out of a roleplay, not for open conversation), and signed-in learners
 still land on `/` rather than here — that routing change affects everyone and is a product
 decision, not a cleanup.
+
+---
+
+## 2026-09-06 — The router, and a header that teaches what to say
+
+A microphone offers nothing. A text field has a placeholder and a menu has items, but an open mic
+leaves the learner guessing what the system understands — and that is where voice products die:
+someone says the one sentence it cannot handle and concludes it does not work.
+
+Two halves, shipped together on purpose. See `VOICE_ENTRY.md`.
+
+### `/api/intent` — the router
+
+One sentence in, one intent and one read-back out. Stateless, like `/api/aside`. Four outcomes:
+`resume`, `new_scenario`, `talk`, and **`unclear` as a first-class answer** — never a fallback into
+the default intake, because silently starting the funnel after someone told you what they wanted is
+the "what was the point of telling it my problem?" failure in a new place.
+
+Every server-side downgrade ends in `unclear` rather than a guess: an id we never sent, a resume
+with no match, a scenario with no situation, or a confident intent with no read-back. The cost is
+asymmetric — a wrong route costs a whole session and the belief that the app listens, while
+`unclear` costs one sentence and has copy written for it.
+
+**Two things the first live run exposed.**
+
+The read-back came back a **parrot**: *"how do I say I'll take care of it"* echoed word for word.
+That proves we transcribed them, not that we understood them, and it reads as though nobody was
+listening. The prompt now carries three worked examples of the compression — *"dinner at my
+girlfriend's parents on friday, her mum talks really fast"* → *"friday. her parents. her mum talks
+fast."* A concrete example outweighs a rule sitting beside it; this codebase has learned that one
+the hard way before.
+
+And **"hmm okay so" was routed as `resume`** — throat-clearing starting a session nobody asked for,
+which is the single worst mistake this route can make. The prompt forbids it and the model did it
+anyway, so the server decides: an utterance made **entirely** of hesitation, agreement and
+discourse glue is refused before it costs a request. Every token has to be in the set, which is
+what keeps it safe — `"that one"` survives because neither word is filler, and `"yeah let's do that
+one"` survives because most of it is not.
+
+22 sentences against the live route, all passing, including every case that must come back
+`unclear` and the two that must survive the guard.
+
+### The header on `/dash`
+
+Above the orb, two lines, always the same two roles: what is true now, and what else you could say.
+Written as the words a learner would actually say — *"tell me about friday"* teaches a sentence,
+*"you can describe an upcoming situation"* teaches a category and helps nobody.
+
+Three resting states, chosen by the database rather than by a mood: something waiting, nothing
+waiting but a history, or nothing at all. The shape never changes, only the content — a header that
+is different every visit is a slot machine and nobody learns a vocabulary from one.
+
+**The header must not narrate the card.** The first version read *"'me he perdido' has been waiting
+4 days"* directly above a card saying *"WAITING 4 DAYS / me he perdido"*. One message, two elements,
+on the screen least able to afford it. It now names the phrase — a bare "that one" needs a referent
+— and spends the rest of the line opening the door to saying something else, which is the half the
+card cannot do and the whole worry this screen exists for.
+
+### Layout
+
+The pick-up moved to the bottom as a full card, in thumb reach: it is the retrieval loop, which is
+the memory proof and the thing no competitor has, and a quiet line would have buried it. Account
+button bottom-left. The journey line and the three counts are gone — they live on `/dashboard`, and
+on this screen every element has to beat something already on it. Still fits four viewport sizes
+with no scroll; the orb now scales 240px to 340px.
+
+### Not built
+
+The orb still hands off on a **tap**, not on speech, and the router is therefore not yet fed by
+anything. The mic, the WebRTC session and the capture guards all live in the room. Where the spoken
+sentence comes from is the next decision.
 
 ---
 
