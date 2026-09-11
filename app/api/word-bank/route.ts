@@ -8,9 +8,9 @@ import { getSupabaseAdmin } from "@/lib/supabase-admin";
  * The signed-in learner's collected words and frames. Written at the end of a session (the
  * verdict card's "save"), read by the dashboard.
  *
- * Since 2026-09-07 it is also the recall queue. A phrase the learner ASKED for gets a date to come
- * back on, and PATCH records what happened when it did. The schedule lives on the phrase's own row
- * rather than in a second table because the unique index already guarantees one row per phrase per
+ * Since 2026-09-07 it is also the recall queue. Every saved phrase gets a date to come back on,
+ * and PATCH records what happened when it did. The schedule lives on the phrase's own row rather
+ * than in a second table because the unique index already guarantees one row per phrase per
  * learner, and a second copy of the Spanish string is the drift this codebase keeps paying for.
  */
 
@@ -18,10 +18,12 @@ const wordSchema = z.object({
   spanish: z.string().min(1).max(160),
   meaningEn: z.string().max(240).nullable().optional(),
   /**
-   * `asked` is the odd one out and the important one: every other source is a phrase WE handed
-   * over mid-session, and this is the only one the learner went looking for. That is what makes it
-   * worth bringing back later — they were curious enough to ask, unprompted, which is a stronger
-   * cue than anything we would have chosen for them.
+   * `asked` is the odd one out: every other source is a phrase WE handed over mid-session, and
+   * this is the only one the learner went looking for. They were curious enough to ask,
+   * unprompted, which is a stronger cue than anything we would have chosen for them.
+   *
+   * That no longer decides whether it comes back — everything saved does — but it still decides
+   * what comes back FIRST. `duePhrases` sorts on it.
    */
   source: z.enum(["coach_tool", "rescue_phrase", "rescue_pattern", "asked"]).optional().default("coach_tool"),
 });
@@ -47,10 +49,25 @@ export async function POST(request: Request) {
     spanish: word.spanish.trim(),
     meaning_en: word.meaningEn?.trim() || null,
     source: word.source,
-    // Only what they asked for gets a date. Everything else here is a phrase we handed over
-    // mid-session, and bringing those back is a different feature with different evidence behind
-    // it -- putting them all in the queue would make every scene a quiz within a week.
-    ...(word.source === "asked" ? { due_at: nextDueAt(0) } : {}),
+    /*
+     * Every saved phrase gets a date. (Timo, 2026-09-11.)
+     *
+     * This used to read `word.source === "asked"`, on the argument that queueing everything would
+     * "make every scene a quiz within a week". That argument was wrong, and wrong in a way worth
+     * writing down: **the pool size does not set the frequency.** `pickForScene` returns at most
+     * one phrase and skips two scenes in three no matter how many are due, so widening the pool
+     * changes WHICH phrase comes back, never HOW OFTEN one does.
+     *
+     * What it did instead was make the closing card lie. That card promises "we'll bring this back
+     * in a new situation, with a little less help" about the phrases from the session -- which are
+     * `coach_tool` and `rescue_*`, every one of them excluded here. So the one screen where we ask
+     * for an account was arguing for it with a thing that could not happen.
+     *
+     * A re-save restarts the clock, deliberately: the same phrase coming back out of a second
+     * session is evidence they are still reaching for it, and that is a reason to schedule it
+     * afresh rather than leave it where it was.
+     */
+    due_at: nextDueAt(0),
   }));
 
   // The unique index is on (user_id, lower(spanish)), so a repeated phrase updates its meaning

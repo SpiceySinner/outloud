@@ -8,10 +8,14 @@ import { reviewSpacingDaysAfterReview } from "@/lib/learning-loop";
  * itself out of is not a scheduler.
  *
  * The thing being built here is the moment in `docs/features/router-talk-feat.md` section 3: a
- * learner asks how to say something on Tuesday, and on Friday, inside a scene built for something
- * else entirely, they land in a spot where exactly that phrase is what is needed -- and reach for
- * it themselves. The feeling is "I know this one". The goal is that they feel smart, and that only
+ * learner meets a phrase on Tuesday, and on Friday, inside a scene built for something else
+ * entirely, they land in a spot where exactly that phrase is what is needed -- and reach for it
+ * themselves. The feeling is "I know this one". The goal is that they feel smart, and that only
  * happens if the retrieval is theirs.
+ *
+ * Every phrase the learner keeps is in the queue, not only the ones they asked a question about.
+ * That is what makes the closing card's "we'll bring this back" a statement rather than a hope --
+ * see the note on `due_at` in `app/api/word-bank/route.ts`.
  *
  * Everything in this file exists to protect that from the six ways it dies, all of which ship fine
  * and quietly teach nothing:
@@ -87,8 +91,14 @@ function hoursSince(iso: string, nowMs: number) {
  *
  * The priority is the one in the feature doc, in order:
  *   1. has it ever landed unaided -- if yes it stops competing, it is theirs
- *   2. how long since it came due -- the most overdue is the most valuable to catch
- *   3. how many fruitless returns -- something already offered twice ranks below something fresh
+ *   2. did they go looking for it -- an `asked` phrase outranks one we handed them
+ *   3. how long since it came due -- the most overdue is the most valuable to catch
+ *   4. how many fruitless returns -- something already offered twice ranks below something fresh
+ *
+ * Rule 2 arrived with the fix that put every saved phrase in the queue. Handed-over phrases
+ * outnumber asked-for ones by roughly two per session to none, so on a plain most-overdue sort the
+ * one thing somebody actually went looking for would sit behind a fortnight of vocabulary it never
+ * asked to be tested on. Widening the pool must not cost the strongest cue its place.
  */
 export function duePhrases(phrases: RecallPhrase[], nowMs: number = Date.now()) {
   return phrases
@@ -101,6 +111,8 @@ export function duePhrases(phrases: RecallPhrase[], nowMs: number = Date.now()) 
       return hoursSince(phrase.createdAt, nowMs) >= minimumGapHours;
     })
     .sort((a, b) => {
+      const asked = Number(b.source === "asked") - Number(a.source === "asked");
+      if (asked !== 0) return asked;
       const overdue = new Date(a.dueAt ?? 0).getTime() - new Date(b.dueAt ?? 0).getTime();
       if (overdue !== 0) return overdue;
       return a.resurfacedCount - b.resurfacedCount;

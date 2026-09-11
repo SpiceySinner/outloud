@@ -100,11 +100,17 @@ decision it feeds, and a hard line on what may never leave for a third party.
 
 - [ ] **Verify events arrive** once somebody uses the app for real, and watch one replay end to
       end to confirm the masking covers what it claims to.
-- [ ] **Audit the `.private` class** across the UI. The masking selector list in `lib/track.ts` is
-      a snapshot of one afternoon's class names and will fall behind.
-- [ ] **Turn on `word_bank` traffic.** Q7's three events are wired, but the table has never held a
-      row, so nothing has fired them yet. Nothing to fix — just nobody signed in has asked for a
-      phrase.
+- [x] **Audit the `.private` class** across the UI — **done 2026-09-11, and it had already fallen
+      behind.** `.private` was on zero elements; roughly forty content classes were not on the list,
+      so session replay was recording learners' sentences, the coach's replies and the verdict's
+      diagnosis in readable text. Fixed by inverting the default rather than by extending the list:
+      `maskTextSelector: "*"` plus `replayText`, so everything masks and a short hand-checked
+      `chromeSelectors` names what may be read. Verified against rrweb itself, not just the config.
+- [x] **Turn on `word_bank` traffic** — **2026-09-11, and "nothing to fix" was wrong.** The table
+      really had never held a row, but not because nobody had asked for a phrase. `saveWordBank`
+      had one caller, `saveReturnEmail`, so finishing a session signed in saved a moment and no
+      words: 40 moments, 0 word-bank rows. `saveCurrentMoment` now saves the words with the moment.
+      Q7 still has no data until somebody signs in and finishes a run.
 
 **Done in the second pass (2026-09-10):**
 
@@ -283,25 +289,57 @@ least one real reply across clearly"* — a participation note. The sentence the
 next to each other, and that pairing is the only argument for an account that is made entirely out
 of the learner's own words.
 
-- [ ] **Show the change, not just the result.** The opening answer above the closing line, on the
-      after-card. No new data needed — `openingAnswer` is already in state.
-- [ ] **Stop naming a weekday nothing honours.** The card says *"FRIDAY — we'll bring this back"*.
-      For a signed-in learner that is true, `lib/phrase-recall.ts` really does resurface phrases.
-      Signed out there is no mechanism at all, and 1.1 already proved that practice is stranded on
-      the device. Say what is true in each case, **without adding a second ask** — 1.1 settled that
-      there is one ask per session and it lives at the verdict.
+- [x] **Show the change, not just the result.** The opening answer above the closing line, on the
+      after-card. No new data needed — `openingAnswer` was already in state.
+- [x] **Stop naming a weekday nothing honours** — **done 2026-09-11, and the claim above was
+      wrong.** *"For a signed-in learner that is true"* was written from the design, not the code.
+      It was false for every phrase the closing card is actually about. Three separate gates only
+      let a phrase into the recall queue if `source === "asked"`, and everything on that card is
+      `coach_tool` or `rescue_*` — so the promise was made about exactly the phrases excluded from
+      keeping it, on the one screen where we ask for an account.
 
-Neither touches `/dash`, so neither blocks or is blocked by the merge below.
+      Timo's call (2026-09-11): make it true rather than cut it. Every saved phrase is scheduled
+      now, `asked` still sorts first, and the pool size never touched the frequency in the first
+      place — `pickForScene` returns at most one and skips two scenes in three regardless.
+      `supabase/202609110001_phrase_recall_all_sources.sql` catches up the rows that were promised
+      a return and never scheduled for one.
+
+      The signed-out half stands: `word_bank.user_id` is not null, so nothing is saved and no day
+      arrives. The card says so instead of naming a weekday.
+
+- [x] **A session survives signing in** — **built and walked 2026-09-11.** `RoomSnapshot` carries
+      the whole room across the redirect: phase, conversation, intake, rescue, character, every
+      scene turn, the line on screen, and `savedMomentId` so the next save does not write a second
+      moment. Restore refuses over a live room and past a two-hour TTL, and discards a refused
+      snapshot rather than leaving it to fire later. The sign-in button is back in the header at
+      every point in the session; the profile link stays hidden, being a plain navigation with no
+      stash behind it.
+
+      This was the prerequisite for the taster homepage below: somebody who does a whole go signed
+      out and *then* creates an account keeps the go they just did.
+
+      **Still open, and smaller:** give the profile link the same treatment, or point it somewhere
+      that does not leave the room. Right now it is the one exit that still costs a session.
+
+Neither of the first two touches `/dash`, so neither blocks or is blocked by the merge below.
 
 **Order, and the reason for it.** Homepage first, dash second, account last:
 
-1. **Clean up the homepage.** Folding 1377 lines into a screen whose own shape is unsettled means
-   deciding the shape twice. The taster-session question above changes what the top of that screen
-   even is, so it has to be answered before anything is folded into it.
+1. **~~Clean up the homepage.~~ Done 2026-09-11** — as a code split, which is what Timo meant by
+   it. Thirteen overlay sheets left `app/page.tsx` for six files in `app/components/`, following the
+   `HomePanel` pattern; **6485 → 5950 lines**. Pure motion, verified by a structural fingerprint of
+   all fourteen screens against a mock-AI build, which makes the comparison exact and free. See the
+   CHANGELOG entry.
+
+   **Still open under this heading**, and it is design rather than code: the landing screen does not
+   know who is looking. Signed in you get the same cold funnel, "90 seconds. no signup." included,
+   and no way through to your own practice. That is the gap between a funnel and the onboarding the
+   App Store needs, and it is the taster-session question above.
 2. **Fold `/dash`'s parts in — as components, not pasted.** `HomePanel` already lives in
    `app/components/` and is rendered by the room *and* `/dashboard`; that is the proven pattern and
    the event cards, the drawer and the read-back line are the right size for it. Done that way the
-   room grows by wiring, not by 1377 lines.
+   room grows by wiring, not by 1377 lines. **Step 1 cleared the way for this**: there are now seven
+   components beside `HomePanel` and the room's JSX is wiring rather than markup.
 3. **`/dashboard` becomes the account page.** Last, because it is the only step that cannot break
    a learner mid-session.
 

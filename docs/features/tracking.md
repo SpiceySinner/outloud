@@ -149,19 +149,31 @@ first, and those two facts lead to different fixes.
 The masking is what makes it keepable, and it is not PostHog's default:
 
 - **`maskAllInputs`** — everything typed. The attempt, the retry, the email box.
-- **`maskTextSelector`** — and the *rendered* text as well, which is the unusual half. A DOM
-  recording would otherwise capture the rescue, the coach's lines and the transcript as plainly
-  readable text. The selector list is in `lib/track.ts`.
+- **`maskTextSelector: "*"`** — and every *rendered* string as well, which is the unusual half. A
+  DOM recording would otherwise capture the rescue, the coach's lines and the transcript as plainly
+  readable text.
+- **`maskTextFn`** — `replayText` in `lib/track.ts`, which hands back only our own fixed copy.
 - **no request or response bodies** — they would carry the same sentences straight back out.
 
-What still records: buttons, headers, the phase, the orb, the chrome — everything you need in
-order to see *where* somebody stopped. The result is a replay you can watch for behaviour and
-cannot read for content.
+What still records: layout, length, every click, hover and scroll, and the short list of app copy
+in `chromeSelectors` — the buttons and section labels. The result is a replay you can watch for
+behaviour and cannot read for content.
 
-> **The rule for new work:** any component rendering a learner's words, a coach line, a rescue or
-> a transcript carries `className="... private"`. The selector list in `lib/track.ts` is a
-> snapshot of one afternoon's class names and *will* fall behind the UI otherwise. `.private` is
-> the part that does not rot.
+> **Masked by default; chrome opts out.** This is the second attempt, and the first one is worth
+> knowing about. It was a list of content classes to blank, with `.private` as the escape hatch and
+> a note telling whoever added the next panel to use it. Audited **2026-09-11**: `.private` was on
+> zero elements and roughly forty content classes were missing from the list — including
+> `.then-line`, the learner's own opening sentence quoted back on the closing card, added that same
+> morning. The list was a snapshot of one afternoon, exactly as this doc predicted it would be.
+>
+> A rule you have to remember is not a rule, it is a hope. So the default is inverted: everything
+> masks, and `chromeSelectors` names the handful of strings we can vouch for. A panel added tomorrow
+> is private without anybody deciding it should be, and a mistake now costs a button you cannot read
+> rather than somebody's sentence in a recording.
+>
+> Where somebody stopped is answered by the event catalogue anyway — `rescue_reached`,
+> `verdict_reached`, `session_closed` name the phase precisely. The replay says how long they sat
+> there and what they reached for, and neither of those needs their words.
 
 **Identity:** the `distinct_id` is the browser's `outloud-session-id` — the same pseudonym the
 database uses, so a PostHog funnel and a SQL query are talking about the same person without an

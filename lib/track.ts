@@ -110,17 +110,68 @@ export const trackedEvents = {
 export type TrackedEventName = keyof typeof trackedEvents;
 
 /**
- * Everything session replay must blank out.
+ * What session replay is allowed to read.
  *
- * The list is content, never chrome. Buttons, headers, phase labels and the orb keep recording,
- * because those are what tell you WHERE somebody stopped -- which is the entire reason replay is
- * on. What gets blanked is what they said, what the coach said back, and anything derived from
- * either.
+ * **Masked by default; chrome opts out.** That is the whole design, and it is the second attempt.
  *
- * **`.private` is the escape hatch, and the rule for new work:** any component that renders a
- * learner's words, a coach line, a rescue or a transcript carries `className="... private"`. This
- * list will fall behind the UI otherwise -- it is a snapshot of one afternoon's class names, and
- * the next panel somebody adds will not be in it.
+ * The first attempt was a list of content class names to blank out, with `.private` as the escape
+ * hatch and a comment telling whoever added the next panel to use it. Audited on 2026-09-11:
+ * `.private` had been applied to exactly zero elements, and roughly forty classes rendering a
+ * learner's sentences, the coach's replies and the verdict's diagnosis were not on the list. The
+ * list was a snapshot of one afternoon, exactly as its own comment predicted, and the UI had moved
+ * on without it. `.then-line` -- the learner's own opening sentence, quoted back at them on the
+ * closing card -- was added that same morning and went straight into the recording.
+ *
+ * A rule you have to remember is not a rule, it is a hope. So the default is inverted:
+ * `maskTextSelector: "*"` makes every rendered string a masking candidate, and `maskTextFn` below
+ * hands back only the ones we can name. A panel added tomorrow is private without anybody
+ * deciding it should be, and getting it wrong now costs readability rather than a leak.
+ *
+ * What is lost is small. Masking preserves layout, length and every click, hover and scroll, and
+ * `trackedEvents` above already names the phase precisely -- `rescue_reached`, `verdict_reached`,
+ * `session_closed`. Where somebody stopped is answered by the events; the replay says how long
+ * they sat there and what they reached for, and neither of those needs their words.
+ */
+
+/**
+ * Our own fixed copy: strings that live in this repository, never in a model's output or a
+ * learner's mouth.
+ *
+ * Hand-checked, one by one, and deliberately short -- this is the side where a mistake leaks.
+ * Anything not on it records as asterisks, which is the right way round: a missing entry is a
+ * button you cannot read, and a wrong entry is somebody's sentence in a recording.
+ *
+ * `.profile-pill` is the one that looks like it belongs here and does not: it renders the first
+ * letter of the signed-in address.
+ */
+const chromeSelectors = [
+  // the landing screen and the room's own controls
+  ".primary-action",
+  ".secondary-action",
+  ".quiet-link",
+  ".landing-subcopy",
+  ".step-out-chip",
+  ".debug-pill",
+  // the closing card's section labels -- "you came in saying", "you left saying", "today's line"
+  ".verdict-kicker",
+  // the account ask: the button, the reassurance under it, and the dialog's own chrome
+  ".account-button",
+  ".capture-sub",
+  ".capture-fineprint",
+  ".auth-google",
+  ".auth-divider",
+  ".auth-notice",
+  // the entry screen's preview badge
+  ".dash-preview",
+].join(", ");
+
+/**
+ * Content that stays masked even if it ends up inside something on the list above.
+ *
+ * A backstop, not the mechanism -- since the default became "mask", this list decides nothing on
+ * its own any more. It is kept because it is the audit: these are the classes known to render a
+ * learner's words, a coach line, a rescue or a transcript, and `.private` stays the marker to put
+ * on a new one that lands inside chrome.
  */
 const contentSelectors = [
   ".private",
@@ -131,13 +182,17 @@ const contentSelectors = [
   ".verdict-evidence",
   ".verdict-moment",
   ".verdict-loot",
+  ".then-line",
   ".coach-tool-es",
   ".coach-tool-en",
   ".coach-tool-example",
   ".coach-tool-note",
   ".ask-natural",
   ".ask-verdict",
+  ".ask-option-es",
+  ".ask-option-en",
   ".transcript-list",
+  ".aside-thread",
   ".room-translation",
   ".room-note",
   // the entry screen: the read-back IS their own sentence, and the cards quote saved practice
@@ -147,6 +202,24 @@ const contentSelectors = [
   ".dash-steps-title",
   ".dash-step-title",
 ].join(", ");
+
+/** rrweb's own default, kept identical so a masked replay looks the way PostHog documents. */
+function blanked(text: string) {
+  return text.replace(/\S/g, "*");
+}
+
+/**
+ * One text node, decided.
+ *
+ * Content beats chrome, chrome beats the default, and the default is masked. The order matters:
+ * with it, a sentence rendered inside a button is still a sentence.
+ */
+export function replayText(text: string, element?: HTMLElement) {
+  if (!element || typeof element.closest !== "function") return blanked(text);
+  if (element.closest(contentSelectors)) return blanked(text);
+  if (element.closest(chromeSelectors)) return text;
+  return blanked(text);
+}
 
 let started = false;
 
@@ -184,11 +257,10 @@ export function initTracking() {
      * carry what somebody could not say to their partner's mother, so both halves are covered:
      *
      *   maskAllInputs     -- everything typed. The attempt, the retry, the email.
-     *   maskTextSelector  -- and the RENDERED text as well, which is the unusual part. A DOM
-     *                        recording would otherwise capture the rescue, the coach's lines and
-     *                        the transcript as plainly readable text. `.private` marks those
-     *                        blocks; the chrome you actually need in order to see where somebody
-     *                        stopped -- buttons, headers, the orb, the phase -- records normally.
+     *   maskTextSelector  -- and the RENDERED text as well, which is the unusual part. `"*"` makes
+     *                        every string on the screen a candidate, and `replayText` hands back
+     *                        only our own fixed copy. See the note on it above for why the default
+     *                        is masked rather than the exceptions being listed.
      *
      * The result is a replay you can watch for behaviour and cannot read for content. That is the
      * trade this app has to make rather than picking one side of it.
@@ -196,7 +268,8 @@ export function initTracking() {
     disable_session_recording: false,
     session_recording: {
       maskAllInputs: true,
-      maskTextSelector: contentSelectors,
+      maskTextSelector: "*",
+      maskTextFn: replayText,
       // Request and response bodies would carry the same sentences straight back out again.
       recordHeaders: false,
       recordBody: false,

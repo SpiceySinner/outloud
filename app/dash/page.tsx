@@ -81,12 +81,17 @@ const maxFillerRetries = 2;
 const keptScenariosKey = "outloud-kept-scenarios";
 
 /**
- * While this screen is still being designed it renders the preview account by default, because
- * looking at the layout should not require an account and a month of practice behind it.
- * `?preview=0` shows the real one.
+ * What a SIGNED-OUT visitor sees while this screen is still being designed: the preview account,
+ * badged, because looking at the layout should not require an account and a month of practice
+ * behind it. `?preview=0` shows the empty truth instead.
  *
- * **This is the only line to change when the page is finished.** It is a constant rather than a
- * check scattered through the component so that switching it on cannot be half-done, and the
+ * It used to mean rather more than that. `useLibraryData` checked it before it checked anything
+ * else, so every visitor got the invented month -- signed in or not -- and a learner opening this
+ * screen was shown a stranger's practice in their own account, behind a badge the size of a word.
+ * The hook now checks the session first; this only decides what happens when there is no session.
+ *
+ * **This is still the only line to change when the page is finished.** It is a constant rather than
+ * a check scattered through the component so that switching it off cannot be half-done, and the
  * badge in the corner is wired to the same value -- a screen showing invented practice must never
  * be able to look like it is showing yours.
  */

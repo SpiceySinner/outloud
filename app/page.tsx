@@ -3,7 +3,13 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { OrbCanvas } from "./components/OrbCanvas";
 import { assistanceRank, derivePracticeLedgerState, nextReviewAt } from "@/lib/learning-loop";
-import HomePanel, { JourneyPath, type ClosingRead } from "./components/HomePanel";
+import type { ClosingRead } from "./components/HomePanel";
+import VerdictCard from "./components/VerdictCard";
+import AfterCard, { JourneySheet } from "./components/AfterCard";
+import FeedbackSheet from "./components/FeedbackSheet";
+import { AssistanceSheet, EvidenceSheet, ProfileSheet } from "./components/ProfileSheets";
+import { CorrectionSheet, PronunciationSheet } from "./components/RepairSheets";
+import { AskSheet, EyesOffSheet, PressureSheet, TranscriptSheet } from "./components/SessionSheets";
 import type { DashboardData, MomentCard } from "@/lib/dashboard-data";
 import { shouldTriggerRepair } from "@/lib/repair-loop";
 import {
@@ -427,20 +433,88 @@ function CoachToolCard({
   );
 }
 
-// Google OAuth is a full-page redirect, which wipes all component state. The verdict snapshot
-// is stashed here before redirecting and restored (plus auto-saved) when the session comes back.
+// Google OAuth is a full-page redirect, which wipes all component state. The room is stashed here
+// before redirecting and restored when the session comes back. The key still says "verdict" because
+// that is all it used to hold, and renaming it would strand any snapshot written by the build a
+// learner is mid-redirect from.
 const pendingVerdictKey = "outloud-pending-verdict";
 
-type VerdictSnapshot = {
+/**
+ * The room, frozen across a full-page redirect.
+ *
+ * Signing in with Google is a navigation away and back. Everything in this component is React
+ * state, so the round trip empties it; whatever is not written down here is gone.
+ *
+ * It used to be called `VerdictSnapshot` and it held eight fields, all of them from the intake --
+ * enough to rebuild the verdict card and nothing else. A learner who signed in during the practice
+ * conversation came back to the landing screen. No error, no warning, no sign they had ever been
+ * there, and no way to get back to it: the moment is only written at close, so there was nothing
+ * saved to resume from either.
+ *
+ * That is the wrong way round for what this app is trying to be. The account ask is meant to come
+ * AFTER a win (master-plan #18, as Timo restated it on 2026-09-11), which means the thing somebody
+ * is being asked to sign up for is the run they are in the middle of -- and it was exactly that run
+ * we threw away when they said yes.
+ *
+ * **What is deliberately not here:** the microphone, the realtime connection and the overlays. All
+ * three are rebuilt on mount and a stale copy of any of them is worse than none. The aside is out
+ * too: it is a conversation about the scene rather than the scene, and coming back into the scene
+ * at the turn they stepped out of is both simpler and what they wanted anyway.
+ */
+type RoomSnapshot = {
+  /**
+   * Bumped when a field's MEANING changes, never when one is added -- every read below tolerates a
+   * missing field, so an older snapshot restores as much as it can rather than being thrown away.
+   * A learner mid-redirect during a deploy is the exact person this must not fail for.
+   */
+  v: number;
+  /** So a snapshot cannot resurrect a session from yesterday. See `pendingRoomTtlMs`. */
+  savedAt: string;
+
+  // where they were
   mode: RoomMode;
+  flowPhase: FlowPhase;
+  conversationId: string | null;
+  turnIndex: number;
+
+  // the intake and what it concluded
   openingAnswer: string;
   placementSummary: string;
   placementAttempts: PlacementAttempt[];
-  placementRescue: RescueResponse;
+  placementEvaluations: AttemptEvaluation[];
+  placementRescue: RescueResponse | null;
+  coachId: string | null;
+  coachTurn: CoachResponse | null;
   coachLoot: Array<{ es: string; en: string | null }>;
   coachEvidence: string[];
   reportedBlocker: SelfReportedBlocker | null;
+
+  // the conversation
+  sceneCharacter: CoachResponse["sceneCharacter"];
+  sessionTurns: SessionTurn[];
+  currentConversationTurn: ConverseReply | null;
+  coachLine: string | null;
+  coachMeaning: string | null;
+  coachMeaningKind: "translation" | "instruction" | null;
+  sessionCallout: string | null;
+
+  // and what has already been banked from it
+  savedMomentId: string | null;
+  sessionClosedAt: string | null;
+  askPhrase: AskPhraseHandoff | null;
+  toneMode: "patient" | "real" | "pressure";
 };
+
+/**
+ * How long a frozen room is worth thawing.
+ *
+ * An OAuth round trip is seconds. This is generous enough to cover somebody who gets as far as
+ * Google's account picker, wanders off, and comes back -- and short enough that signing in on a
+ * quiet Tuesday never drops them into Monday's conversation. Restoring is also refused outright
+ * while anything is on screen, which is the guard that actually matters; this one only handles the
+ * case where nothing is.
+ */
+const pendingRoomTtlMs = 2 * 60 * 60 * 1000;
 
 function ProfileGlyph() {
   return (
@@ -653,7 +727,7 @@ export default function Home() {
   // ran through a stale closure where flowPhase was still "opening" and restarted the coach.
   const handleRealtimeEventRef = useRef<(event: RealtimeServerEvent) => void>(() => undefined);
   // Same latest-ref pattern for the auth listener, which is also registered exactly once.
-  const restoreVerdictAfterAuthRef = useRef<(email: string) => void>(() => undefined);
+  const restoreRoomAfterAuthRef = useRef<(email: string) => void>(() => undefined);
   /** Same reason as the two above: /dash's hand-off effect runs before `enterRoom` is declared. */
   const enterRoomRef = useRef<(mode: RoomMode) => void>(() => undefined);
   /**
@@ -946,6 +1020,32 @@ export default function Home() {
   const isLanding = mode === "landing";
   const isStung = mode === "stung";
   const isAskEntry = mode === "ask";
+  /*
+   * Has this visit produced anything that leaving the page would take away?
+   *
+   * Both ways out of the room's header are full-page navigations -- the profile link routes away
+   * and the sign-in button ends in a Google OAuth redirect -- and neither of them saves a thing.
+   * It now has two jobs, and they pull in opposite directions, which is why they share a name.
+   *
+   * `stashRoomForAuth` uses it to decide there is something worth writing down before a redirect.
+   * `restoreRoomAfterAuth` uses it to refuse to overwrite a live room with a stale snapshot. The
+   * header uses it for the one exit that still has nothing behind it: the profile link, which is a
+   * plain navigation with no stash and no restore. Signing in is safe now and the pill says so.
+   *
+   * `placementRescue` counts even though it is also what gets stashed: it means a verdict exists,
+   * and a verdict is the thing somebody would be most annoyed to lose.
+   *
+   * `openingAnswer` is first in the list and it is the one that was missed on the first attempt at
+   * this: `handleOpeningAttempt` sets it and CLEARS `placementAttempts` in the same breath, so a
+   * learner who had said exactly one thing -- the sentence the whole session is built out of --
+   * registered as having nothing to lose. Caught by walking it in a browser rather than by reading
+   * it, which is the only way that one was ever going to show up.
+   */
+  const roomHasUnsavedWork =
+    openingAnswer.trim().length > 0 ||
+    placementAttempts.length > 0 ||
+    sessionTurns.length > 0 ||
+    Boolean(placementRescue);
   const pressureMode = toneMode === "pressure";
   const isUserTurn = turnState === "ready" || turnState === "listening" || turnState === "still-listening";
   // Single source of truth for "the orb cannot be pressed right now", used by both the button's
@@ -3055,7 +3155,7 @@ export default function Home() {
   }
 
   /**
-   * What this learner asked for and has not produced yet.
+   * Everything this learner has kept and not produced yet.
    *
    * Signed out this is empty and the whole half is simply off: `word_bank.user_id` is not null
    * against `auth.users`. Loaded once per visit to the room rather than per scene -- a scene start
@@ -3082,8 +3182,10 @@ export default function Home() {
         }>;
       }>(await fetch("/api/word-bank", { headers: { Authorization: `Bearer ${token}` } }));
 
+      // The third gate, and the quietest one: the server could schedule every phrase and this line
+      // would still drop all but the asked-for ones on the way in. Filtering here and filtering on
+      // the write were two copies of one rule, which is how the rule survived being changed once.
       duePhrasesRef.current = (answer.words ?? [])
-        .filter((word) => word.source === "asked")
         .map((word) => ({
           id: word.id,
           spanish: word.spanish,
@@ -3764,6 +3866,22 @@ export default function Home() {
       );
       setSavedMomentId(response.momentId);
 
+      /*
+       * The words go with the moment.
+       *
+       * `saveWordBank` had exactly one caller -- `saveReturnEmail` -- so a signed-in learner who
+       * finished a session and did not type an address into the email box saved a moment and no
+       * words at all. The production table says it plainly: 40 moments, 0 rows in `word_bank`.
+       *
+       * That is the other half of "the phrase never came back", and the bigger half. Scheduling
+       * every saved phrase (2026-09-11) is worth nothing while nothing is ever saved.
+       *
+       * Idempotent, and it has to be: the upsert is keyed on (user_id, lower(spanish)), so the
+       * repeat from `saveReturnEmail` costs a request and changes nothing. Signed out it returns
+       * before touching the network, which is honest -- `word_bank.user_id` is not null.
+       */
+      void saveWordBank(response.momentId);
+
       // The go is done. Written back so the entry screen counts it, and so the run-up moves on to
       // the next part of the evening instead of offering the same one again.
       const activeEvent = activeEventRef.current;
@@ -3842,6 +3960,10 @@ export default function Home() {
     setReturnEmailStatus("saving");
     try {
       const momentId = await saveCurrentMoment(sessionTurns, currentConversationTurn, email);
+      // Kept even though `saveCurrentMoment` now does this itself, for the case it cannot cover:
+      // somebody who played the whole session signed out and creates the account at the verdict.
+      // The moment was already saved by then, so that call returns early -- and the words, which
+      // needed a token nobody had at the time, would never be written at all.
       await saveWordBank(momentId ?? null);
       await readJson<{ ok: boolean }>(
         await fetch("/api/retrieval-email", {
@@ -3941,26 +4063,66 @@ export default function Home() {
     setAuthOpen(true);
   }
 
-  function stashVerdictForAuth() {
-    if (!placementRescue) return;
-    const snapshot: VerdictSnapshot = {
+  /**
+   * Everything, written down, immediately before the page goes away.
+   *
+   * The guard used to be `if (!placementRescue) return` -- so the half of the session before the
+   * verdict, which is the half somebody is most likely to be in when they decide to sign up, was
+   * never written at all. Now the only thing that stops it is having nothing to write.
+   */
+  function stashRoomForAuth() {
+    if (!roomHasUnsavedWork) return;
+    const snapshot: RoomSnapshot = {
+      v: 2,
+      savedAt: new Date().toISOString(),
       mode,
+      flowPhase,
+      conversationId,
+      turnIndex,
       openingAnswer,
       placementSummary,
       placementAttempts,
+      placementEvaluations,
       placementRescue,
+      coachId,
+      coachTurn,
       coachLoot,
       coachEvidence,
       reportedBlocker,
+      sceneCharacter,
+      sessionTurns,
+      currentConversationTurn,
+      coachLine,
+      coachMeaning,
+      coachMeaningKind,
+      sessionCallout,
+      savedMomentId,
+      sessionClosedAt,
+      askPhrase,
+      toneMode,
     };
     try {
       window.localStorage.setItem(pendingVerdictKey, JSON.stringify(snapshot));
     } catch {
-      // Storage blocked: OAuth still works, the card just won't restore after the redirect.
+      /*
+       * Storage blocked, or the snapshot is bigger than the quota. OAuth still works and the
+       * learner still gets their account; what they lose is the run, which is what happened every
+       * time before this existed.
+       *
+       * Deliberately silent. An error about our storage, raised at the moment somebody has just
+       * decided to trust us with an account, is the worst possible time to talk about our problems.
+       */
     }
   }
 
-  function restoreVerdictAfterAuth(email: string) {
+  /**
+   * Put them back where they were.
+   *
+   * Runs on every sign-in, and does nothing unless a snapshot is waiting. The two refusals inside
+   * it are as important as the restore itself -- never over a live room, and never a stale one --
+   * and both of them throw the snapshot away rather than leaving it for later. See below.
+   */
+  function restoreRoomAfterAuth(email: string) {
     let raw: string | null = null;
     try {
       raw = window.localStorage.getItem(pendingVerdictKey);
@@ -3968,30 +4130,97 @@ export default function Home() {
       return;
     }
     if (!raw) return;
+
+    /*
+     * Read AND cleared before any of the refusals below, deliberately.
+     *
+     * A snapshot is one shot. If a refusal left it in place it would sit there waiting for the
+     * next sign-in or reload, and the case where that happens is precisely the case where we have
+     * just decided the learner does not want it -- so it would come back at an even worse moment,
+     * with even less to do with what they were doing.
+     */
     try {
       window.localStorage.removeItem(pendingVerdictKey);
     } catch {
       // Removal failing is harmless; parsing below still guards the shape.
     }
+
+    // Never over a live room. After an OAuth redirect the page has just reloaded and there is
+    // nothing to overwrite -- but signing in with a password does NOT reload, so without this an
+    // abandoned snapshot would replace the conversation somebody is having right now.
+    if (roomHasUnsavedWork) return;
+
     try {
-      const snapshot = JSON.parse(raw) as VerdictSnapshot;
-      if (!snapshot.placementRescue) return;
-      setMode(snapshot.mode);
-      setOpeningAnswer(snapshot.openingAnswer);
-      setPlacementAttempts(snapshot.placementAttempts);
-      setPlacementRescue(snapshot.placementRescue);
-      setPlacementSummary(snapshot.placementSummary);
-      setCoachLoot(snapshot.coachLoot);
-      setCoachEvidence(snapshot.coachEvidence);
+      const snapshot = JSON.parse(raw) as Partial<RoomSnapshot>;
+
+      // Never a stale one: the same worry, in slow motion.
+      const savedAtMs = snapshot.savedAt ? new Date(snapshot.savedAt).getTime() : NaN;
+      if (Number.isFinite(savedAtMs) && Date.now() - savedAtMs > pendingRoomTtlMs) return;
+
+      // Something has to be here, or this is a snapshot of an empty room and restoring it would
+      // drag somebody off the landing screen into nothing.
+      const worthRestoring =
+        Boolean(snapshot.openingAnswer?.trim()) ||
+        Boolean(snapshot.placementRescue) ||
+        Boolean(snapshot.sessionTurns?.length);
+      if (!worthRestoring) return;
+
+      // Where they were. A v1 snapshot has neither, and lands on the verdict card exactly as it
+      // used to -- which is right, because that is the only place a v1 snapshot was ever written.
+      setMode(snapshot.mode ?? "speaks-first");
+      setFlowPhase(snapshot.flowPhase ?? "verdict");
+      setConversationId(snapshot.conversationId ?? null);
+      setTurnIndex(snapshot.turnIndex ?? 0);
+
+      // The intake and what it concluded.
+      setOpeningAnswer(snapshot.openingAnswer ?? "");
+      setPlacementSummary(snapshot.placementSummary ?? "");
+      setPlacementAttempts(snapshot.placementAttempts ?? []);
+      setPlacementEvaluations(snapshot.placementEvaluations ?? []);
+      setPlacementRescue(snapshot.placementRescue ?? null);
+      setCoachId(snapshot.coachId ?? null);
+      setCoachTurn(snapshot.coachTurn ?? null);
+      setCoachLoot(snapshot.coachLoot ?? []);
+      setCoachEvidence(snapshot.coachEvidence ?? []);
       // Older snapshots (written before the coach classified this) have no field; "not_sure"
       // would assert a hypothesis the learner never gave, so an absent value stays null.
       setReportedBlocker(snapshot.reportedBlocker ?? null);
-      setPlacementEvaluations([]);
-      setFlowPhase("verdict");
+
+      // The conversation.
+      setSceneCharacter(snapshot.sceneCharacter ?? null);
+      setSessionTurns(snapshot.sessionTurns ?? []);
+      setCurrentConversationTurn(snapshot.currentConversationTurn ?? null);
+      setCoachLine(snapshot.coachLine ?? null);
+      showMeaning(snapshot.coachMeaning ?? null, snapshot.coachMeaningKind ?? null, { folded: true });
+      setSessionCallout(snapshot.sessionCallout ?? null);
+      setAskPhrase(snapshot.askPhrase ?? null);
+      setToneMode(snapshot.toneMode ?? "real");
+
+      // What was already banked. Without `savedMomentId` the next save writes a SECOND moment for
+      // the same conversation, and the library grows a duplicate nobody can tell apart.
+      setSavedMomentId(snapshot.savedMomentId ?? null);
+      setSessionClosedAt(snapshot.sessionClosedAt ?? null);
+
+      // Their turn, whatever they were doing. The mic and the realtime channel came up fresh with
+      // the page, and `speaking` would leave the orb waiting for a line nobody is going to say.
       setTurnState("ready");
-      setOverlay("verdict");
+
+      // The card is a card, so it needs its overlay back. Anywhere else in the room, an overlay
+      // would be a sheet dropped on top of a conversation they did not ask to interrupt.
+      const landedOn = snapshot.flowPhase ?? "verdict";
+      setOverlay(landedOn === "verdict" ? "verdict" : null);
+
       setReturnEmail(email);
-      setPendingAutoSaveEmail(email);
+
+      /*
+       * The auto-save is only for a run that is OVER.
+       *
+       * `saveReturnEmail` writes the moment, the words, and a retrieval email. Mid-conversation
+       * that would file a half-finished run and post somebody a summary of a session they are
+       * still sitting in. At the verdict and after it, it is exactly what signing up is for.
+       */
+      const finished = Boolean(snapshot.placementRescue) && (landedOn === "verdict" || Boolean(snapshot.sessionClosedAt));
+      if (finished) setPendingAutoSaveEmail(email);
     } catch {
       // Corrupt snapshot: nothing to restore.
     }
@@ -4004,7 +4233,7 @@ export default function Home() {
   // Rebind after every render so channel events always see current state (see the ref comment).
   useEffect(() => {
     handleRealtimeEventRef.current = handleRealtimeEvent;
-    restoreVerdictAfterAuthRef.current = restoreVerdictAfterAuth;
+    restoreRoomAfterAuthRef.current = restoreRoomAfterAuth;
   });
 
   // One subscription for the life of the room, dispatching through the ref above.
@@ -4194,8 +4423,8 @@ export default function Home() {
     } = supabase.auth.onAuthStateChange((_event, session) => {
       const email = session?.user?.email ?? null;
       setAuthedEmail(email);
-      // Restore is a no-op unless a pre-redirect snapshot is waiting in localStorage.
-      if (email) restoreVerdictAfterAuthRef.current(email);
+      // A no-op unless a snapshot is waiting, the room is empty, and the snapshot is fresh.
+      if (email) restoreRoomAfterAuthRef.current(email);
     });
     return () => {
       cancelled = true;
@@ -4971,19 +5200,40 @@ export default function Home() {
           </button>
           {/* Debug only. The profile pill opens the sign-in dialog when signed out, so without an
               account there is otherwise no way into /profile or /dashboard from the room at all.
-              Unmount tears down the mic and the realtime connection, so leaving mid-session is
-              safe. */}
+              Unmount tears down the mic and the realtime connection cleanly -- but it does NOT save
+              the session, so this discards whatever is on the screen. Acceptable for a debug link
+              that only appears with `?debug`; it was not acceptable for the pill below it. */}
           {debugTools ? (
             <Link className="debug-pill" href="/profile" aria-label="debug: open the account page">
               debug
             </Link>
           ) : null}
-          {/* Signed out, the profile page has nothing to show but an empty state, so the icon
-              opens the sign-in dialog directly instead of routing there first. */}
+          {/*
+              Signed out, the profile page has nothing to show but an empty state, so the icon opens
+              the sign-in dialog directly instead of routing there first.
+
+              The two branches are treated differently now, and the difference is whether anything
+              catches the session on the way out.
+
+              **Signing in is safe.** It was not: both ways out are full-page navigations and
+              neither saved anything, so somebody four turns into a conversation who tapped the
+              little circle in the corner came back to an empty room. `stashRoomForAuth` now writes
+              the whole room before the redirect and `restoreRoomAfterAuth` puts it back, so the
+              button can stand where it is at any point in the session -- which is the point of
+              building it. Master-plan #18, as Timo restated it on 2026-09-11, asks for the account
+              to be earned by a win rather than gated in front of one, and a learner cannot say yes
+              to that at the moment it lands on them if saying yes costs them the win.
+
+              **The profile link still is not.** It is a plain navigation with no stash and no
+              restore, so it stays hidden while there is anything to lose. Whoever gives that link
+              the same treatment can delete this branch.
+          */}
           {authedEmail ? (
-            <Link className="profile-pill" href="/profile" aria-label="your profile">
-              {authedEmail.slice(0, 1).toUpperCase() || <ProfileGlyph />}
-            </Link>
+            roomHasUnsavedWork ? null : (
+              <Link className="profile-pill" href="/profile" aria-label="your profile">
+                {authedEmail.slice(0, 1).toUpperCase() || <ProfileGlyph />}
+              </Link>
+            )
           ) : (
             <button className="profile-pill" type="button" aria-label="sign in" onClick={() => openAuth("signin")}>
               <ProfileGlyph />
@@ -5521,705 +5771,164 @@ export default function Home() {
               <button className="sheet-handle" type="button" aria-label="close overlay" onClick={closeOverlay} />
 
               {overlay === "verdict" ? (
-              <section className="room-sheet verdict-card" aria-label="Verdict">
-                <p className="verdict-kicker">what OutLoud heard</p>
-                {/*
-                  This used to be the sentence above, hardcoded -- the same claim for every
-                  learner, printed where a diagnosis belongs. It is now the model's read of what
-                  they said trips them up against what actually happened (#46). The old string
-                  survives only as the fallback for moments saved before the field existed.
-                */}
-                <h2>
-                  {placementRescue?.stated_vs_observed?.line_en ||
-                    "you have enough Spanish. the gap is getting it out fast enough."}
-                </h2>
-                {/*
-                  Telling someone their own read was wrong is the highest-stakes sentence in the
-                  app, so it never stands alone: when the verdict contradicts or complicates what
-                  they said, the evidence for it is shown right underneath.
-                */}
-                {(placementRescue?.stated_vs_observed?.result === "correct" ||
-                  placementRescue?.stated_vs_observed?.result === "both") &&
-                placementRescue.observed_blocker.evidence ? (
-                  <p className="verdict-evidence">{placementRescue.observed_blocker.evidence}</p>
-                ) : null}
-                {momentAfter ? (
-                  <div className="verdict-moment">
-                    <span>your moment</span>
-                    {momentBefore && momentBefore.userAttempt !== momentAfter.userAttempt ? (
-                      <p className="moment-before">&ldquo;{momentBefore.userAttempt}&rdquo;</p>
-                    ) : null}
-                    <p className="moment-after">&ldquo;{momentAfter.userAttempt}&rdquo;</p>
-                    <small>
-                      {momentBefore && momentBefore.userAttempt !== momentAfter.userAttempt
-                        ? "same session, a few replies apart."
-                        : "you said this today — out loud."}
-                    </small>
-                  </div>
-                ) : null}
-                {lootItems.length ? (
-                  <div className="verdict-loot">
-                    <span>what you reached for</span>
-                    <ul>
-                      {lootItems.map((item) => (
-                        <li key={item.es}>
-                          <strong>{item.es}</strong>
-                          {item.en ? <small>{item.en}</small> : null}
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                ) : null}
-                <div className="verdict-plan">
-                  <span>next time</span>
-                  <p>same words, new situation — let&apos;s see if they come out on their own.</p>
-                </div>
-                <div className="verdict-account">
-                  {authedEmail ? (
-                    <>
-                      <p className="capture-sub">signed in as {authedEmail}.</p>
-                      <button
-                        className="account-button"
-                        type="button"
-                        disabled={returnEmailStatus === "saving"}
-                        onClick={() => {
-                          setReturnEmail(authedEmail);
-                          void saveReturnEmail(authedEmail);
-                        }}
-                      >
-                        {returnEmailStatus === "saved"
-                          ? "words saved — see you tomorrow"
-                          : returnEmailStatus === "saving"
-                            ? "saving"
-                            : "save today's words"}
-                      </button>
-                      {returnEmailStatus === "saved" ? (
-                        <Link className="quiet-link" href="/dashboard">
-                          see all your words &rarr;
-                        </Link>
-                      ) : null}
-                      <button className="quiet-link" type="button" onClick={signOut}>
-                        sign out
-                      </button>
-                    </>
-                  ) : (
-                    <>
-                  {/*
-                    This used to say the words "disappear when you close this", which is both an
-                    understatement and the wrong problem. The run IS saved -- with whatever email
-                    is given and `user_id: null` -- but reading anything back goes through
-                    `getAuthedUser`, so without an account OutLoud greets a returning learner as a
-                    stranger while their practice sits in the database. Someone hit exactly that.
-                    So the card now says what an account does, why the line is drawn at a login,
-                    and that signing up on the same address claims what is already there (which
-                    /api/library really does, on first load).
-                  */}
-                  {/*
-                    #32, and the half of it that took longest to be true. The ask used to
-                    promise a future the learner had no way to check. It points at what is
-                    already sitting in this browser instead, which is only honest because
-                    `/api/library` now claims on session id as well as email -- before that,
-                    these runs came with nobody. Under two there is nothing worth pointing
-                    at, so it says the other thing.
-                  */}
-                  <p className="capture-sub">
-                    {unclaimedRuns && unclaimedRuns > 1
-                      ? `${unclaimedRuns} sessions are saved on this device and nothing is holding on to them. an account is what keeps them — and what lets OutLoud remember what trips you up.`
-                      : "nothing here comes back on its own. an account is what lets OutLoud remember you — what trips you up, every session, all of it."}
-                  </p>
-                  <button className="account-button" type="button" onClick={() => openAuth("signup")}>
-                    create a free account
-                  </button>
-                  <p className="capture-fineprint">
-                    your practice is tied to a login, not to a typed-in address — otherwise anyone
-                    who guessed your email could read it. signing up on this device brings
-                    everything you already practised with you, whether or not you ever gave us
-                    an address.
-                  </p>
-                  <button
-                    className="quiet-link"
-                    type="button"
-                    onClick={() => setEmailFallbackOpen((current) => !current)}
-                  >
-                    or just email me a link to this one
-                  </button>
-                  {emailFallbackOpen ? (
-                    <div className="email-capture verdict-capture">
-                      <div>
-                        <input
-                          id="verdict-email"
-                          type="email"
-                          inputMode="email"
-                          autoComplete="email"
-                          aria-label="email for your words"
-                          placeholder="you@example.com"
-                          value={returnEmail}
-                          onChange={(event) => {
-                            setReturnEmail(event.target.value);
-                            setReturnEmailStatus("idle");
-                          }}
-                        />
-                        <button
-                          type="button"
-                          disabled={!returnEmail.trim() || returnEmailStatus === "saving"}
-                          onClick={() => void saveReturnEmail()}
-                        >
-                          {returnEmailStatus === "saving" ? "saving" : "save them"}
-                        </button>
-                      </div>
-                      {returnEmailStatus === "saved" ? (
-                        <small>sent. that link opens this session only — it won&apos;t know you next time.</small>
-                      ) : null}
-                      {returnEmailStatus === "error" ? <small>couldn&apos;t save yet. try once more.</small> : null}
-                    </div>
-                  ) : null}
-                    </>
-                  )}
-                </div>
-                <button className="sheet-primary" type="button" onClick={() => void startFirstSession()}>
-                  start the conversation
-                </button>
-              </section>
-            ) : null}
+                <VerdictCard
+                  rescue={placementRescue}
+                  authedEmail={authedEmail}
+                  momentBefore={momentBefore}
+                  momentAfter={momentAfter}
+                  lootItems={lootItems}
+                  unclaimedRuns={unclaimedRuns}
+                  returnEmail={returnEmail}
+                  returnEmailStatus={returnEmailStatus}
+                  emailFallbackOpen={emailFallbackOpen}
+                  setReturnEmail={setReturnEmail}
+                  setReturnEmailStatus={setReturnEmailStatus}
+                  setEmailFallbackOpen={setEmailFallbackOpen}
+                  onSaveWords={(emailOverride) => void saveReturnEmail(emailOverride)}
+                  onSignOut={signOut}
+                  onCreateAccount={() => openAuth("signup")}
+                  onStart={() => void startFirstSession()}
+                />
+              ) : null}
 
               {overlay === "after" ? (
-              <section className="room-sheet after-card" aria-label="After session">
-                {/*
-                  The change, not just the result.
-
-                  The card led with the learner's Spanish sentence -- right instinct, and it is
-                  still the headline. What it never did was put it next to the sentence they
-                  arrived with, so the strongest thing on the screen was reported underneath as
-                  "you got at least one real reply across clearly": a participation note for
-                  somebody who had just said fourteen words of Spanish after opening with "the
-                  words disappear".
-
-                  Both halves are their own words, which is what makes this the one argument for
-                  an account that cannot be read as marketing. Shown only when there really are
-                  two different things to compare.
-                */}
-                {openingAnswer.trim() && todayLine && openingAnswer.trim() !== todayLine ? (
-                  <div className="then-now">
-                    <p className="verdict-kicker">you came in saying</p>
-                    <p className="then-line">{openingAnswer.trim()}</p>
-                  </div>
-                ) : null}
-                <p className="verdict-kicker">{openingAnswer.trim() && todayLine ? "you left saying" : "today's line"}</p>
-                <h2>{todayLine || "you got the conversation started."}</h2>
-                <HomePanel
-                  variant="session-end"
+                <AfterCard
+                  openingAnswer={openingAnswer}
+                  todayLine={todayLine}
                   data={closingData}
                   closing={closingRead}
                   focusLabel={sessionFocusLine}
-                />
-                <p className="sheet-note sage-note">
-                  if it comes up with someone tonight, try just this line.
-                </p>
-                {saveStatus !== "idle" ? (
-                  <p className="tiny-note">
-                    {saveStatus === "saving"
-                      ? "saving this run."
-                      : saveStatus === "saved"
-                        ? lastReviewUrl
-                          ? "saved with a private return link."
-                          : "saved."
-                        : "could not save this run yet."}
-                  </p>
-                ) : null}
-                <div className="email-capture">
-                  {/*
-                    Was "want me to bring this back tomorrow?" -- a promise an email alone cannot
-                    keep. It buys a private token link to this one session; being remembered is a
-                    different thing and needs an account.
-                  */}
-                  <label htmlFor="return-email">email me a link back to this session</label>
-                  <div>
-                    <input
-                      id="return-email"
-                      type="email"
-                      inputMode="email"
-                      autoComplete="email"
-                      placeholder="you@example.com"
-                      value={returnEmail}
-                      onChange={(event) => {
-                        setReturnEmail(event.target.value);
-                        setReturnEmailStatus("idle");
-                      }}
-                    />
-                    <button
-                      type="button"
-                      disabled={!returnEmail.trim() || returnEmailStatus === "saving"}
-                      onClick={() => void saveReturnEmail()}
-                    >
-                      {returnEmailStatus === "saving" ? "sending" : "send it"}
-                    </button>
-                  </div>
-                  {returnEmailStatus === "saved" ? <small>sent — that link opens this session.</small> : null}
-                  {returnEmailStatus === "error" ? <small>couldn&apos;t save yet. try once more.</small> : null}
-                </div>
-                {/*
-                  The account ask used to be repeated here.
-
-                  It was gated on `authedEmail` being null, exactly like the one on the
-                  verdict -- which meant it could only ever appear to somebody who had just
-                  been asked and said no. Asking a second time is what every other app does
-                  and what this one bans elsewhere: no streaks, no praise for silence, no
-                  nagging. One ask, at the verdict, where the rescue and the diagnosis are
-                  still on screen to justify it.
-
-                  If the numbers ever say people leave before the verdict converts, this is
-                  where it comes back -- but that is a question for real instrumentation
-                  (docs/TODO.md 1.2), not for a guess.
-                */}
-                <div className="sheet-split-actions">
-                  <button type="button" onClick={() => setOverlay("transcript")}>
-                    review transcript
-                  </button>
-                  <button type="button" onClick={() => void startFirstSession()}>
-                    keep going
-                  </button>
-                </div>
-                {/*
-                  The only way into "what OutLoud knows about you". That card and the evidence
-                  card behind it opened each other and nothing else opened either -- a closed loop
-                  with no door, so the surface that is supposed to prove the app remembers your
-                  problem (#50) could not be reached at all. The end of a session is the right
-                  door: it is the moment the learner is already looking at what just happened.
-                */}
-                <button className="sheet-link sage-link" type="button" onClick={() => setOverlay("profile")}>
-                  what OutLoud knows about you
-                </button>
-                <button
-                  className="sheet-primary"
-                  type="button"
-                  onClick={() => {
+                  saveStatus={saveStatus}
+                  hasReturnLink={Boolean(lastReviewUrl)}
+                  returnEmail={returnEmail}
+                  returnEmailStatus={returnEmailStatus}
+                  setReturnEmail={setReturnEmail}
+                  setReturnEmailStatus={setReturnEmailStatus}
+                  onSendLink={() => void saveReturnEmail()}
+                  onReviewTranscript={() => setOverlay("transcript")}
+                  onWhatWeKnow={() => setOverlay("profile")}
+                  onKeepGoing={() => void startFirstSession()}
+                  onDone={() => {
                     closeOverlay();
                     setMode("landing");
                     setTurnState("speaking");
                   }}
-                >
-                  done
-                </button>
-              </section>
-            ) : null}
+                />
+              ) : null}
 
               {overlay === "feedback" ? (
-              <section className="room-sheet" aria-label="Feedback">
-                {/* eyes off is a mode, not a per-turn action, so it lives here rather than in the
-                    session tool row. The header pill this sheet opens from is already its indicator. */}
-                <button
-                  className={eyesOffMode ? "quiet-link is-active" : "quiet-link"}
-                  type="button"
-                  aria-pressed={eyesOffMode}
-                  onClick={() => setEyesOffMode((current) => !current)}
-                >
-                  {eyesOffMode ? "eyes off is on — turn it off" : "switch to eyes off"}
-                </button>
-                {feedbackDone ? (
-                  <div className="feedback-complete">
-                    <span className="complete-mark">✓</span>
-                    <h2>that actually changes what we build next. thanks.</h2>
-                    <p>{feedbackSaved ? "saved." : "back to the room"}</p>
-                    <button className="sheet-primary" type="button" onClick={closeOverlay}>
-                      done
-                    </button>
-                  </div>
-                ) : (
-                  <>
-                    <div className="feedback-progress">
-                      <span>{feedbackStep + 1} of {activeFeedbackQuestions.length}</span>
-                      <span className="feedback-dashes">
-                        {activeFeedbackQuestions.map((item, index) => (
-                          <span
-                            className={index <= feedbackStep ? "is-current" : ""}
-                            key={item.key}
-                          />
-                        ))}
-                      </span>
-                    </div>
-                    <h2>{activeFeedback.question}</h2>
-                    {activeFeedback.note ? <p className="sheet-note">{activeFeedback.note}</p> : null}
-                    {activeFeedback.options.length ? (
-                      <div className="feedback-options">
-                        {activeFeedback.options.map((option, index) => (
-                          <button
-                            className={feedbackPick === index ? "is-picked" : ""}
-                            key={option}
-                            type="button"
-                            onClick={() => setFeedbackPick(index)}
-                          >
-                            <span>{feedbackPick === index ? "✓" : ""}</span>
-                            {option}
-                          </button>
-                        ))}
-                      </div>
-                    ) : null}
-                    <textarea
-                      className="feedback-input"
-                      aria-label={activeFeedback.placeholder}
-                      placeholder={activeFeedback.placeholder}
-                      value={feedbackText}
-                      onChange={(event) => setFeedbackText(event.target.value)}
-                    />
-                    {(feedbackPick !== null || activeFeedback.options.length === 0) ? (
-                      <button
-                        className="sheet-primary"
-                        type="button"
-                        disabled={feedbackSubmitting}
-                        onClick={() => void submitFeedbackAnswer(false)}
-                      >
-                        {feedbackSubmitting
-                          ? "sending"
-                          : feedbackStep === activeFeedbackQuestions.length - 1
-                            ? "send feedback"
-                            : "continue"}
-                      </button>
-                    ) : null}
-                    <button
-                      className="sheet-link"
-                      type="button"
-                      disabled={feedbackSubmitting}
-                      onClick={() => void submitFeedbackAnswer(true)}
-                    >
-                      skip this question
-                    </button>
-                  </>
-                )}
-              </section>
-            ) : null}
+                <FeedbackSheet
+                  eyesOffMode={eyesOffMode}
+                  setEyesOffMode={setEyesOffMode}
+                  done={feedbackDone}
+                  saved={feedbackSaved}
+                  step={feedbackStep}
+                  questions={activeFeedbackQuestions}
+                  question={activeFeedback}
+                  pick={feedbackPick}
+                  setPick={setFeedbackPick}
+                  text={feedbackText}
+                  setText={setFeedbackText}
+                  submitting={feedbackSubmitting}
+                  onSubmit={(skipped) => void submitFeedbackAnswer(skipped)}
+                  onClose={closeOverlay}
+                />
+              ) : null}
 
             {overlay === "profile" ? (
-              <section className="room-sheet" aria-label="What OutLoud knows about you">
-                <h2>what OutLoud knows about you</h2>
-                <div className="skill-list">
-                  {profileRows.length === 0 ? (
-                    <p className="page-body">
-                      nothing observed yet — one conversation turn and your thing shows up here.
-                    </p>
-                  ) : null}
-                  {profileRows.map((row, index) => (
-                    <button
-                      key={row.blocker}
-                      type="button"
-                      onClick={() => {
-                        setProfileEvidenceIndex(index);
-                        setOverlay("evidence");
-                      }}
-                    >
-                      <span>{row.name}</span>
-                      <strong className={row.tone}>{row.state}</strong>
-                      <em>›</em>
-                    </button>
-                  ))}
-                </div>
-                <div className="teaching-note">keywords unlock you; full answers make you dependent.</div>
-                <div className="sheet-split-actions">
-                  <button type="button" onClick={() => setOverlay("journey")}>
-                    speaking journey
-                  </button>
-                  <button type="button" onClick={() => setOverlay("pressure")}>
-                    how she speaks
-                  </button>
-                </div>
-              </section>
+              <ProfileSheet
+                rows={profileRows}
+                onOpenEvidence={(index) => {
+                  setProfileEvidenceIndex(index);
+                  setOverlay("evidence");
+                }}
+                onOpenJourney={() => setOverlay("journey")}
+                onOpenPressure={() => setOverlay("pressure")}
+              />
             ) : null}
 
             {overlay === "journey" ? (
-              <section className="room-sheet" aria-label="Speaking journey">
-                <h2>your speaking journey</h2>
-                <JourneyPath moments={closingData.moments} focusLabel={sessionFocusLine} />
-              </section>
+              <JourneySheet data={closingData} focusLabel={sessionFocusLine} />
             ) : null}
 
             {overlay === "evidence" ? (
-              <section className="room-sheet" aria-label="Evidence">
-                <h2>{activeEvidence?.name ?? "nothing observed yet"}</h2>
-                <div className="evidence-card">
-                  <p>{activeEvidence?.evidence || "OutLoud needs one more reply before it keeps this."}</p>
-                  <small>{activeEvidence?.state ?? "not enough yet"}</small>
-                </div>
-                <button className="sheet-link sage-link" type="button" onClick={() => setOverlay("profile")}>
-                  why OutLoud thinks this
-                </button>
-              </section>
+              <EvidenceSheet row={activeEvidence} onBack={() => setOverlay("profile")} />
             ) : null}
 
             {overlay === "transcript" ? (
-              <section className="room-sheet" aria-label="Transcript review">
-                <h2>review transcript</h2>
-                <div className="transcript-list">
-                  {sessionTurns.length ? (
-                    sessionTurns.map((turn, index) => (
-                      <article key={`${turn.characterLineEs}-${index}`}>
-                        <span>her</span>
-                        <p>{turn.characterLineEs}</p>
-                        <span>you</span>
-                        <p>{turn.userAttempt}</p>
-                        {turn.evaluation?.correctedAttemptEs ? (
-                          <>
-                            <span>natural version</span>
-                            <p>{turn.evaluation.correctedAttemptEs}</p>
-                          </>
-                        ) : null}
-                      </article>
-                    ))
-                  ) : (
-                    <article>
-                      <p>finish one conversation turn and this will show what happened.</p>
-                    </article>
-                  )}
-                </div>
-                <button className="sheet-link sage-link" type="button" onClick={() => setOverlay("after")}>
-                  back
-                </button>
-              </section>
+              <TranscriptSheet turns={sessionTurns} onBack={() => setOverlay("after")} />
             ) : null}
 
             {overlay === "pressure" ? (
-              <section className="room-sheet" aria-label="Pressure">
-                <h2>how real should it feel?</h2>
-                <div className="pressure-list">
-                  <button
-                    className={toneMode === "patient" ? "is-active" : ""}
-                    type="button"
-                    onClick={() => setToneMode("patient")}
-                  >
-                    patient
-                  </button>
-                  <button
-                    className={toneMode === "real" ? "is-active" : ""}
-                    type="button"
-                    onClick={() => setToneMode("real")}
-                  >
-                    real person
-                  </button>
-                  <button
-                    className={toneMode === "pressure" ? "is-active" : ""}
-                    type="button"
-                    onClick={() => setToneMode("pressure")}
-                  >
-                    under pressure
-                  </button>
-                </div>
-                <p className="sheet-note sage-note">
-                  {toneMode === "pressure"
-                    ? "more interruptions, real curveballs, less waiting."
-                    : toneMode === "patient"
-                      ? "same pace as real person for now — a calmer mode is coming."
-                      : "some interruptions. natural follow-ups. a little less waiting."}
-                </p>
-                <p className="tiny-note">you can change this anytime.</p>
-              </section>
+              <PressureSheet toneMode={toneMode} setToneMode={setToneMode} />
             ) : null}
 
             {overlay === "assistance" ? (
-              <section className="room-sheet" aria-label="Assistance ladder">
-                <h2>a little help</h2>
-                <div className="ladder-list">
-                  {assistanceLadder.map((rung) => (
-                    <button
-                      className={rung.name === currentAssistanceRung ? "is-current" : ""}
-                      type="button"
-                      key={rung.name}
-                    >
-                      <span>{rung.name}</span>
-                      <strong>{rung.label}</strong>
-                      {rung.sample ? <em>{rung.sample}</em> : null}
-                    </button>
-                  ))}
-                </div>
-                {/*
-                  Without this the reordered ladder just looks arbitrary -- two learners see a
-                  different order and neither is told why. It is one sentence and it is the whole
-                  point of #48: the help is shaped by what was diagnosed.
-                */}
-                {assistanceRationale ? <p className="ladder-why">{assistanceRationale}</p> : null}
-                <div className="sheet-split-actions">
-                  <button type="button" onClick={() => setOverlay("correction")}>
-                    fix the sentence
-                  </button>
-                  <button type="button" onClick={() => setOverlay("pronunciation")}>
-                    say it clearer
-                  </button>
-                </div>
-              </section>
+              <AssistanceSheet
+                ladder={assistanceLadder}
+                currentRung={currentAssistanceRung}
+                rationale={assistanceRationale}
+                onFix={() => setOverlay("correction")}
+                onPronounce={() => setOverlay("pronunciation")}
+              />
             ) : null}
 
             {overlay === "correction" ? (
-              <section className="room-sheet" aria-label="Correction">
-                <h2>one correction</h2>
-                <div className="correction-stack">
-                  <div>
-                    <span>gap</span>
-                    <p>{activeCorrection.gap}</p>
-                  </div>
-                  <div>
-                    <span>pattern</span>
-                    <p>{activeCorrection.pattern}</p>
-                  </div>
-                  <div className="natural-line">
-                    <span>natural version</span>
-                    <p>{activeCorrection.naturalVersion || "finish one reply and this will fill in."}</p>
-                  </div>
-                </div>
-                {activePronunciationTarget ? (
-                  <button
-                    type="button"
-                    className="quiet-link"
-                    onClick={() => setOverlay("pronunciation")}
-                  >
-                    pronunciation also affected clarity — practice it →
-                  </button>
-                ) : null}
-                {lastTranscriptionConfidence === "borderline" ? (
-                  <p className="tiny-note">this was hard to hear clearly — the correction above may be less reliable.</p>
-                ) : null}
-                {correctionRetryResult ? (
-                  <p className="sheet-note sage-note">{correctionRetryResult.conciseFeedbackEn}</p>
-                ) : null}
-                <button
-                  className="sheet-primary"
-                  type="button"
-                  disabled={!activeCorrection.naturalVersion}
-                  onClick={startCorrectionRetry}
-                >
-                  say it back
-                </button>
-                <p className="tiny-note">
-                  {activeCorrection.naturalVersion
-                    ? `say: ${activeCorrection.naturalVersion}`
-                    : "OutLoud needs one reply first."}
-                </p>
-              </section>
+              <CorrectionSheet
+                correction={activeCorrection}
+                hasPronunciationTarget={Boolean(activePronunciationTarget)}
+                transcriptionWasBorderline={lastTranscriptionConfidence === "borderline"}
+                retryFeedback={correctionRetryResult?.conciseFeedbackEn ?? null}
+                onPronounce={() => setOverlay("pronunciation")}
+                onSayItBack={startCorrectionRetry}
+              />
             ) : null}
 
             {overlay === "pronunciation" ? (
-              <section className="room-sheet" aria-label="Pronunciation">
-                <h2>make it clear</h2>
-                <div className="syllable-row">
-                  {activePronunciationSyllables.map((part, index) => (
-                    <button
-                      className={index === (activePronunciationTarget?.stressedSyllableIndex ?? 1) ? "is-stressed" : ""}
-                      type="button"
-                      key={`${part}-${index}`}
-                    >
-                      {part}
-                    </button>
-                  ))}
-                </div>
-                <div className="pronunciation-panel">
-                  <span>intelligibility only</span>
-                  <p>{pronunciationResult?.coachingNoteEn ?? activePronunciationTarget?.word ?? activeCorrection.naturalVersion}</p>
-                </div>
-                <button
-                  className="sheet-primary"
-                  type="button"
-                  disabled={!activeCorrection.naturalVersion && !activePronunciationTarget?.word}
-                  onClick={startPronunciationRetry}
-                >
-                  try again
-                </button>
-                {retryTarget?.kind === "pronunciation" ? (
-                  <button
-                    className="quiet-link"
-                    type="button"
-                    onClick={() => {
-                      setRetryTarget(null);
-                      restoreCurrentTurn("Back to the conversation.");
-                      setOverlay(null);
-                    }}
-                  >
-                    that&apos;s enough for now
-                  </button>
-                ) : null}
-                <p className="tiny-note">go as many times as you want.</p>
-              </section>
+              <PronunciationSheet
+                syllables={activePronunciationSyllables}
+                stressedIndex={activePronunciationTarget?.stressedSyllableIndex ?? 1}
+                word={activePronunciationTarget?.word ?? null}
+                coachingNote={pronunciationResult?.coachingNoteEn ?? null}
+                naturalVersion={activeCorrection.naturalVersion}
+                isRetrying={retryTarget?.kind === "pronunciation"}
+                onTryAgain={startPronunciationRetry}
+                onEnough={() => {
+                  setRetryTarget(null);
+                  restoreCurrentTurn("Back to the conversation.");
+                  setOverlay(null);
+                }}
+              />
             ) : null}
 
             {overlay === "ask" ? (
-              <section className="room-sheet" aria-label="Ask anything">
-                <h2>ask anything</h2>
-                <p className="sheet-note">quick question, then back to this turn.</p>
-                <textarea
-                  className="ask-box"
-                  aria-label="ask a question"
-                  placeholder="ask in English"
-                  value={askDraft}
-                  onChange={(event) => {
-                    setAskDraft(event.target.value);
-                    setAskStatus("idle");
-                  }}
-                />
-                {askAnswer ? (
-                  <div className="correction-stack">
-                    <div className="natural-line">
-                      <span>use this</span>
-                      <p>{askAnswer.options[0]?.spanish ?? askAnswer.fallbackFrameEs}</p>
-                    </div>
-                    <div>
-                      <span>means</span>
-                      <p>{askAnswer.options[0]?.meaningEn ?? askAnswer.noteEn}</p>
-                    </div>
-                    <div>
-                      <span>frame</span>
-                      <p>{askAnswer.fallbackFrameEs}</p>
-                    </div>
-                  </div>
-                ) : null}
-                {askStatus === "error" ? (
-                  <p className="sheet-note">OutLoud could not answer that yet. Try it shorter.</p>
-                ) : null}
-                <button
-                  className="sheet-primary"
-                  type="button"
-                  disabled={!askDraft.trim() || askStatus === "asking"}
-                  onClick={() => void submitAskQuestion()}
-                >
-                  {askStatus === "asking" ? "asking" : askAnswer ? "ask another" : "ask"}
-                </button>
-                <button className="sheet-link sage-link" type="button" onClick={closeOverlay}>
-                  back to the room
-                </button>
-              </section>
+              <AskSheet
+                draft={askDraft}
+                setDraft={setAskDraft}
+                resetStatus={() => setAskStatus("idle")}
+                answer={askAnswer}
+                status={askStatus}
+                onAsk={() => void submitAskQuestion()}
+                onClose={closeOverlay}
+              />
             ) : null}
 
             {overlay === "eyes-off" ? (
-              <section className="room-sheet" aria-label="Eyes off mode">
-                <h2>eyes off</h2>
-                <div className="eyes-off-stack">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      closeOverlay();
-                      replayCoachLine(false);
-                    }}
-                  >
-                    repeat that
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      closeOverlay();
-                      replayCoachLine(true);
-                    }}
-                  >
-                    slower pacing
-                  </button>
-                  <button type="button" onClick={() => setOverlay("assistance")}>
-                    give me the next word
-                  </button>
-                </div>
-                <button
-                  className="sheet-primary"
-                  type="button"
-                  onClick={() => {
-                    setEyesOffMode(false);
-                    closeOverlay();
-                  }}
-                >
-                  back to touch
-                </button>
-              </section>
+              <EyesOffSheet
+                onRepeat={() => {
+                  closeOverlay();
+                  replayCoachLine(false);
+                }}
+                onSlower={() => {
+                  closeOverlay();
+                  replayCoachLine(true);
+                }}
+                onNextWord={() => setOverlay("assistance")}
+                onBackToTouch={() => {
+                  setEyesOffMode(false);
+                  closeOverlay();
+                }}
+              />
             ) : null}
             </div>
           </div>
@@ -6229,7 +5938,7 @@ export default function Home() {
         <AuthDialog
           initialMode={authIntent}
           onClose={() => setAuthOpen(false)}
-          onBeforeRedirect={stashVerdictForAuth}
+          onBeforeRedirect={stashRoomForAuth}
           onAuthed={(email) => {
             setReturnEmail(email);
             void saveReturnEmail(email);

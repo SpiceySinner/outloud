@@ -13,8 +13,13 @@ import { mockDashboard } from "@/lib/dashboard-mock";
  * two copies of the same forty lines. The copies had already begun to differ in what a failed load
  * meant, which is exactly the kind of drift that ends with one screen quietly showing nothing.
  *
- * The preview account is checked before anything else, because looking at a screen built around a
- * month of practice should never require a month of practice.
+ * The preview account is a fallback for somebody with nothing to show, never a default. Looking at
+ * a screen built around a month of practice should not require a month of practice -- but a learner
+ * who IS signed in has their own, and showing them an invented one instead is the worst version of
+ * this screen: a month of somebody else's progress, wearing their account.
+ *
+ * So the order is: an explicit `?preview=1` wins, then the real session, and only a signed-out
+ * visitor falls back to the invented one. `?preview=0` still refuses the fallback outright.
  */
 
 type LibrarySession = {
@@ -50,18 +55,27 @@ export function useLibraryData(options: { previewByDefault?: boolean } = {}): Li
   const [preview, setPreview] = useState(false);
 
   const load = useCallback(async () => {
-    let wantsPreview = previewByDefault;
-    try {
-      const flag = new URLSearchParams(window.location.search).get("preview");
-      if (flag === "1") wantsPreview = true;
-      if (flag === "0") wantsPreview = false;
-    } catch {
-      // No URL to read: keep the default.
-    }
-    if (wantsPreview) {
+    const showPreview = () => {
       setPreview(true);
       setData(mockDashboard);
       setState("ready");
+    };
+
+    // `null` is "nobody said" -- which is not the same as "no", and conflating the two is what put
+    // the invented account in front of signed-in learners.
+    let forced: boolean | null = null;
+    try {
+      const flag = new URLSearchParams(window.location.search).get("preview");
+      if (flag === "1") forced = true;
+      if (flag === "0") forced = false;
+    } catch {
+      // No URL to read: nobody said.
+    }
+
+    // Asked for by name. The only route to the preview that does not first check who is asking,
+    // because somebody typing `?preview=1` is looking at the layout on purpose.
+    if (forced === true) {
+      showPreview();
       return;
     }
     setPreview(false);
@@ -76,6 +90,13 @@ export function useLibraryData(options: { previewByDefault?: boolean } = {}): Li
     const { data: sessionData } = await supabase.auth.getSession();
     const token = sessionData.session?.access_token;
     if (!token) {
+      // Nothing of theirs to show. A screen calling itself the entry to your practice, empty, tells
+      // a first-time visitor less than the same screen full of somebody's -- as long as it says so,
+      // which the badge does. `?preview=0` is how you ask for the empty truth anyway.
+      if (previewByDefault && forced !== false) {
+        showPreview();
+        return;
+      }
       setState("signed-out");
       return;
     }

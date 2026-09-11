@@ -1,5 +1,237 @@
 # Changelog
 
+## 2026-09-11 — thirteen sheets out of the room file
+
+Step 1 of TODO 1.5. `app/page.tsx` held **6485 lines**, and inside its JSX sat thirteen overlay
+sheets — the verdict card down to the eyes-off sheet — about 715 lines of markup in a file that is
+otherwise the session engine. Step 2 folds `/dash` in *as components*, and the point of doing this
+first is that the room should then grow by wiring rather than by pasting.
+
+**Pure motion. No behaviour changed, no markup changed.** Six new files in `app/components/`,
+following `HomePanel.tsx`:
+
+| file | sheets |
+|---|---|
+| `VerdictCard.tsx` | verdict |
+| `AfterCard.tsx` | after, journey |
+| `FeedbackSheet.tsx` | feedback |
+| `ProfileSheets.tsx` | profile, evidence, assistance |
+| `RepairSheets.tsx` | correction, pronunciation |
+| `SessionSheets.tsx` | transcript, pressure, ask, eyes-off |
+
+`app/page.tsx`: **6485 → 5950**.
+
+**No derivation moved with its sheet.** `momentBefore`, `lootItems`, `feedbackDone`,
+`activeEvidence` and the rest are each read by exactly one sheet and would have looked at home
+inside it. They stayed in the room and travel as props, for the reason `lib/dashboard-data.ts` gives
+in its own header: the same claim about a learner, computed in two places, is how an app ends up
+telling somebody two different things about themselves. It also keeps every stage a pure cut and
+paste, which is what makes the verification below mean anything.
+
+Where a sheet needed a type declared in `app/page.tsx` — `PlacementAttempt`, `FeedbackQuestion`,
+`LifelineResponse` — it declares the fields it actually reads instead of importing the type back.
+The room and its own sheet should not depend on each other.
+
+**Two things worth knowing before touching these sheets again**, both found by reading rather than
+guessed at:
+
+- `closeOverlay` is not "hide me". It also clears `feedbackStep`, `feedbackPick`, `feedbackText`,
+  `askDraft`, `askStatus` and `askAnswer`. It is passed down; nothing reimplements it.
+- The journey and pressure sheets are **dead ends** — neither has a button that changes which sheet
+  is open, so the sheet handle is the only way out, and it closes the after card behind them too.
+
+### How it was checked
+
+A structural fingerprint of all fourteen screens (thirteen sheets plus the verdict's email
+fallback), before and after: the tag tree, class names, attributes and whether each text node is
+present and non-empty, with the text itself normalised away.
+
+The first attempt at this did not work, and why is the useful part. Against the real model no two
+sessions produce the same screen, so the same sheet came back with 48 nodes on one run and 46 on the
+next — a diff that cannot tell a lost prop from a differently-worded rescue. Every route on the
+session path already has a mock branch behind `OUTLOUD_MOCK_AI`, so the check now runs against a
+production build served with it on. Identical sessions every time, byte-identical fingerprints, and
+no model calls at all.
+
+Before trusting it, it was pointed at unchanged code and had to report thirteen sheets identical.
+It did. Then, after each of the six stages: `npx tsc --noEmit` (the three known pre-existing
+errors), `npx eslint app lib` clean, and the fingerprint diff. All six green, and the last run
+covered all fourteen screens.
+
+Plus the three existing walks, against the real dev server: the full session to the closing card,
+the room surviving a sign-in redirect, and the replay masking, which is worth re-running precisely
+because it hangs on class names and this touched a great many of them.
+
+## 2026-09-11 — a session survives signing in
+
+The snapshot that carried a learner across the Google redirect was called `VerdictSnapshot` and it
+held eight fields, all from the intake. Everything else in a 6000-line client component is React
+state, and a full-page redirect empties it. So somebody who signed in during the practice
+conversation came back to the landing screen: no error, no warning, no sign they had been there,
+and nothing to resume from either, because the moment is only written at close.
+
+That is backwards for what this app is trying to be. The account is meant to be earned by a win —
+master-plan **#18**, as Timo restated it — which means the thing somebody is being asked to sign up
+for is the run they are in the middle of. It was exactly that run we threw away when they said yes.
+Nobody can accept an offer at the moment it lands if accepting costs them the reason they wanted it.
+
+**`RoomSnapshot`** now carries the whole room: the phase, the conversation id and turn index, the
+intake and its rescue, the character, every scene turn, the line on screen, and what has already
+been banked. Deliberately not in it: the microphone, the realtime connection and the overlays, all
+of which are rebuilt on mount, where a stale copy is worse than none.
+
+Three things are load-bearing and none of them is the snapshot itself:
+
+- **`savedMomentId` travels.** Without it the next save writes a second moment for the same
+  conversation and the library grows a duplicate nobody can tell apart.
+- **Restore refuses over a live room.** Password sign-in never reloads, so an abandoned snapshot
+  could otherwise reach into the conversation somebody is having right now. A refused snapshot is
+  also *discarded*, not left to fire on the next reload — the case where it is refused is the case
+  where we have just decided they do not want it.
+- **The auto-save only fires for a run that is over.** `saveReturnEmail` writes the moment, the
+  words and a retrieval email; mid-conversation that would file a half-finished run and post
+  somebody a summary of a session they are still sitting in.
+
+The sign-in button goes back into the room header at every point in the session, which is the
+payoff. The profile link stays hidden while there is work: it is a plain navigation with no stash
+behind it, and whoever gives it the same treatment can delete that branch.
+
+**Tested by walking it.** A real session to mid-scene, "continue with Google" with the redirect
+blocked, back to the app, and the snapshot read from storage: the phase, the conversation, the
+rescue, the character, the line and the scene turn are all in it. Then a session put into storage
+and the page reloaded the way an OAuth return does — the room comes back on the same line, ready to
+answer, with no verdict sheet dropped on top, and the snapshot consumed. Coming back *signed out*
+restores nothing, which is the abandoned-redirect case.
+
+The two halves that need a real account were run against a throwaway one, created through GoTrue's
+admin API and deleted afterwards along with everything it wrote:
+
+- signing in with a password mid-session leaves the room alone, and a planted stale snapshot never
+  reaches the screen;
+- **finishing a session signed in really does write to `word_bank`** — two rows, both with a
+  `due_at` two days out, sources `rescue_phrase` and `rescue_pattern`. Those are exactly the two
+  sources that were permanently ineligible for resurfacing this morning, in a table that had held
+  zero rows for three weeks. Both fixes from earlier today, confirmed against the table rather than
+  the code.
+
+## 2026-09-11 — the words were never saved either
+
+Found while applying the backfill above: `word_bank` holds **zero rows**, against 40 saved moments.
+The migration was a no-op because there was nothing to migrate.
+
+`saveWordBank` had exactly one caller, `saveReturnEmail`. So a signed-in learner who finished a
+session and did not type an address into the email box saved a moment and no words at all. Every
+route the app has to the word bank ran through a box that a signed-in learner has no reason to fill
+in.
+
+That is the bigger half of "the phrase never came back". Scheduling every saved phrase is worth
+nothing while nothing is ever saved, and the closing card has been promising a return on top of an
+empty table for three weeks.
+
+`saveCurrentMoment` now saves the words with the moment. Idempotent by design — the upsert is keyed
+on `(user_id, lower(spanish))` — so the call in `saveReturnEmail` stays for the case this one cannot
+cover: somebody who played the whole session signed out and creates the account at the verdict, when
+the moment is already saved and the words needed a token nobody had at the time.
+
+Confirmed that the path runs by walking a full session: `POST /api/moments` fires at close, which is
+where the word save now sits. Signed out it returns before the network, which is correct —
+`word_bank.user_id` is not null. **The signed-in half still needs one real run to confirm rows land.**
+
+## 2026-09-11 — the phrase that never came back
+
+The closing card has been telling learners **"we'll bring this back in a new situation, with a
+little less help"** about the phrases their session produced. It could not. Three gates, in three
+files, only let a phrase into the recall queue if `source === "asked"` — and every phrase on that
+card is `coach_tool`, `rescue_phrase` or `rescue_pattern`. `lib/phrase-recall.ts` skips any row
+without a `due_at`, so the promise was false for effectively every phrase in the app, made on the
+one screen where we ask for an account.
+
+Written down hours earlier in this same repository: *"signed in that is true — `lib/phrase-recall.ts`
+really does resurface a saved phrase."* That came from reading the design, not the code.
+
+**Timo's call: make it true rather than cut it.** The argument the old comment made for the
+restriction — that queueing everything would "make every scene a quiz within a week" — was simply
+wrong, and worth writing down as a lesson: **the pool size does not set the frequency.**
+`pickForScene` returns at most one phrase and skips roughly two scenes in three no matter how many
+are due. Widening the pool changes *which* phrase comes back, never *how often* one does.
+
+- `app/api/word-bank/route.ts` — every saved phrase gets a `due_at`. A re-save restarts the clock,
+  deliberately: the same phrase surfacing from a second session is evidence they are still reaching
+  for it.
+- `lib/phrase-recall.ts` — `duePhrases` now sorts `asked` first. Handed-over phrases outnumber
+  asked-for ones by about two a session to none, so on a plain most-overdue sort the one thing
+  somebody went looking for would sit behind a fortnight of vocabulary it never asked to be tested
+  on. Widening the pool must not cost the strongest cue its place.
+- `app/page.tsx` — `loadDuePhrases` no longer filters the rest out on the way in. This was the
+  quiet one: the server could schedule every phrase and this line would still have dropped them.
+  Two copies of one rule, which is how the rule survived being changed once.
+- `supabase/202609110001_phrase_recall_all_sources.sql` — **not yet applied.** Backfills `due_at`
+  from `created_at` for every unscheduled, unlanded row: the phrases that were promised a return
+  and never scheduled for one. `created_at`-based so a learner's history staggers instead of all
+  coming due at the same instant. Landed rows are untouched — they are theirs.
+
+Checked against the real module, eleven cases, including that a phrase saved an hour ago still does
+not come back today and that a forty-phrase pool still yields at most one.
+
+## 2026-09-11 — session replay was reading the sentences
+
+`lib/track.ts` masked session replay with a list of content class names, with `.private` as the
+escape hatch and a comment warning that the list *"is a snapshot of one afternoon's class names and
+the next panel somebody adds will not be in it."*
+
+Audited: `.private` was on **zero** elements, and roughly forty classes rendering a learner's
+sentences, the coach's replies and the verdict's diagnosis were not on the list. Its own comment had
+described what happened. Among the missing was `.then-line` — the learner's opening sentence, quoted
+back at them on the closing card — added that morning and recorded from its first render.
+
+**Fixed by inverting the default, not by extending the list.** A rule you have to remember is not a
+rule, it is a hope.
+
+- `maskTextSelector: "*"` makes every rendered string a masking candidate.
+- `maskTextFn: replayText` hands back only what we can vouch for: `chromeSelectors`, fourteen
+  hand-checked classes of our own fixed copy. Content beats chrome, chrome beats the default, and
+  the default is masked — so a sentence rendered inside a button is still a sentence.
+- A panel added tomorrow is private without anybody deciding it should be. A mistake now costs a
+  button you cannot read rather than somebody's words in a recording.
+- `.profile-pill` is the one that looks like chrome and is not: it renders the first letter of the
+  signed-in address.
+
+Verified twice rather than assumed. Against rrweb itself, using the recorder build posthog-js ships:
+content asterisked, chrome readable, and content nested inside chrome still asterisked. And against
+the running app, walking every text node on four screens with the two selector lists parsed out of
+`lib/track.ts` at run time — a test carrying its own copy of the rule proves only that two copies
+agree, which is exactly how the old list managed to look correct while being forty classes behind.
+
+Nothing is really lost. Masking keeps layout, length, and every click, hover and scroll, and the
+event catalogue already names the phase precisely.
+
+## 2026-09-11 — the little circle that ate the session
+
+The room's header pill offered sign-in at any moment. Both of its branches leave the page — the
+profile link routes away, the sign-in button ends in a Google OAuth redirect — and neither saves
+anything. `stashVerdictForAuth` is the only rescue there is and it writes nothing unless a verdict
+already exists.
+
+So a learner four turns into a conversation who tapped the circle in the corner came back to an
+empty room. No error, no warning, no record they had ever been there. It reads as a crash, and it
+sits four millimetres from the exit button.
+
+The pill is now hidden while there is work on the screen (`roomHasUnsavedWork`). Nothing is lost by
+it: master-plan **#18**, as Timo restated it on 2026-09-11, puts the account ask *after* a win
+rather than before a paywall, and that ask already exists on the verdict card — where the session is
+finished, the value is still on screen, and signing in costs the learner nothing.
+
+## 2026-09-11 — `/dash` showed everyone a stranger's month
+
+`useLibraryData` checked `previewByDefault` before it checked the session, so **every** visitor got
+the invented account — signed in or not. A learner opening the entry screen was shown somebody
+else's month of practice inside their own account, behind a badge the size of a word.
+
+The order is now: an explicit `?preview=1` wins, then the real session, and only a signed-out
+visitor falls back to the invented one. `?preview=0` still refuses the fallback. `previewByDefault`
+survives as the one line to change when the screen is finished, but it now decides only what happens
+when there is no session to show.
+
 ## 2026-09-11 — the button that asked for a phrase now answers with one
 
 1.5 step one. The landing screen's second button says **"didn't know how to say something?"** and
