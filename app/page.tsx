@@ -54,6 +54,7 @@ import { getSupabaseBrowser } from "@/lib/supabase-browser";
 import {
   autoStartKey,
   eventBeatKey,
+  leftRoomKey,
   resumeMomentKey,
   askPhraseKey,
   stungKey,
@@ -444,6 +445,30 @@ function CoachToolCard({
 const pendingVerdictKey = "outloud-pending-verdict";
 
 /**
+ * The two ways a room can be put down and picked back up, and why they do not share a store.
+ *
+ * `auth` is the OAuth redirect. The document is replaced, goes to Google and comes back, so the
+ * snapshot has to outlive a navigation that leaves this origin entirely. `localStorage`, which is
+ * what has always worked here.
+ *
+ * `return` is leaving on purpose and coming back — the account pill, or a reload. **`sessionStorage`
+ * is the entire safety argument for that one.** A snapshot written on every way out cannot rely on
+ * what makes the auth one safe: that it exists only while a redirect is in flight, and is only ever
+ * read when somebody has just signed in. `sessionStorage` supplies the missing half, because it
+ * belongs to a tab — closing the tab throws the intention away with it, tomorrow morning is a new
+ * tab with nothing in it, and two open tabs cannot steal each other's session.
+ */
+type SnapshotJourney = "auth" | "return";
+
+function snapshotStore(journey: SnapshotJourney): Storage {
+  return journey === "auth" ? window.localStorage : window.sessionStorage;
+}
+
+function snapshotKey(journey: SnapshotJourney): string {
+  return journey === "auth" ? pendingVerdictKey : leftRoomKey;
+}
+
+/**
  * The room, frozen across a full-page redirect.
  *
  * Signing in with Google is a navigation away and back. Everything in this component is React
@@ -731,7 +756,10 @@ export default function Home() {
   // ran through a stale closure where flowPhase was still "opening" and restarted the coach.
   const handleRealtimeEventRef = useRef<(event: RealtimeServerEvent) => void>(() => undefined);
   // Same latest-ref pattern for the auth listener, which is also registered exactly once.
-  const restoreRoomAfterAuthRef = useRef<(email: string) => void>(() => undefined);
+  const restoreRoomRef = useRef<(journey: SnapshotJourney, email: string | null) => void>(
+    () => undefined,
+  );
+  const stashRoomRef = useRef<(journey: SnapshotJourney) => void>(() => undefined);
   /** Same reason as the two above: /dash's hand-off effect runs before `enterRoom` is declared. */
   const enterRoomRef = useRef<(mode: RoomMode) => void>(() => undefined);
   /**
@@ -1115,14 +1143,15 @@ export default function Home() {
   /*
    * Has this visit produced anything that leaving the page would take away?
    *
-   * Both ways out of the room's header are full-page navigations -- the profile link routes away
-   * and the sign-in button ends in a Google OAuth redirect -- and neither of them saves a thing.
-   * It now has two jobs, and they pull in opposite directions, which is why they share a name.
+   * Two jobs that pull in opposite directions, which is why they share a name.
    *
-   * `stashRoomForAuth` uses it to decide there is something worth writing down before a redirect.
-   * `restoreRoomAfterAuth` uses it to refuse to overwrite a live room with a stale snapshot. The
-   * header uses it for the one exit that still has nothing behind it: the profile link, which is a
-   * plain navigation with no stash and no restore. Signing in is safe now and the pill says so.
+   * `stashRoom` uses it to decide there is something worth writing down before leaving.
+   * `restoreRoom` uses it to refuse to overwrite a live room with a stale snapshot.
+   *
+   * It used to have a third: hiding the account pill, because that link was a plain navigation with
+   * no stash and no restore, and following it cost you the run. Both ways out of the header are
+   * covered now -- the pill stashes in its `onClick`, and `pagehide` catches everything that
+   * unloads the document -- so that branch is gone and the pill no longer disappears.
    *
    * `placementRescue` counts even though it is also what gets stashed: it means a verdict exists,
    * and a verdict is the thing somebody would be most annoyed to lose.
@@ -4162,8 +4191,21 @@ export default function Home() {
    * verdict, which is the half somebody is most likely to be in when they decide to sign up, was
    * never written at all. Now the only thing that stops it is having nothing to write.
    */
-  function stashRoomForAuth() {
+  function stashRoom(journey: SnapshotJourney) {
     if (!roomHasUnsavedWork) return;
+    /*
+     * On the landing screen there is nothing on screen to come back to, whatever is still in state.
+     *
+     * This matters because the exit button does NOT clear `openingAnswer` or `placementRescue` --
+     * so after somebody says "I'm done", `roomHasUnsavedWork` is still true, and without this the
+     * `pagehide` below would write a snapshot of a room they had just closed and hand it straight
+     * back on the next load.
+     *
+     * The same argument almost certainly holds for the `auth` journey. It is left alone because
+     * that path is covered by a check that passes today, and widening a guard is not what this
+     * change is for.
+     */
+    if (journey === "return" && mode === "landing") return;
     const snapshot: RoomSnapshot = {
       v: 2,
       savedAt: new Date().toISOString(),
@@ -4194,7 +4236,7 @@ export default function Home() {
       toneMode,
     };
     try {
-      window.localStorage.setItem(pendingVerdictKey, JSON.stringify(snapshot));
+      snapshotStore(journey).setItem(snapshotKey(journey), JSON.stringify(snapshot));
     } catch {
       /*
        * Storage blocked, or the snapshot is bigger than the quota. OAuth still works and the
@@ -4210,14 +4252,20 @@ export default function Home() {
   /**
    * Put them back where they were.
    *
-   * Runs on every sign-in, and does nothing unless a snapshot is waiting. The two refusals inside
-   * it are as important as the restore itself -- never over a live room, and never a stale one --
-   * and both of them throw the snapshot away rather than leaving it for later. See below.
+   * Does nothing unless a snapshot is waiting. The refusals inside it are as important as the
+   * restore itself -- never over a live room, and never a stale one -- and every one of them throws
+   * the snapshot away rather than leaving it for later. See below.
+   *
+   * `email` is the address that just signed in, and **null when nobody did**. Two things hang off
+   * it and must not happen on a plain return: filling the return box, and the auto-save, which
+   * writes the moment AND posts a summary. Somebody who glanced at their account has not asked for
+   * either.
    */
-  function restoreRoomAfterAuth(email: string) {
+  function restoreRoom(journey: SnapshotJourney, email: string | null) {
+    const key = snapshotKey(journey);
     let raw: string | null = null;
     try {
-      raw = window.localStorage.getItem(pendingVerdictKey);
+      raw = snapshotStore(journey).getItem(key);
     } catch {
       return;
     }
@@ -4232,14 +4280,20 @@ export default function Home() {
      * with even less to do with what they were doing.
      */
     try {
-      window.localStorage.removeItem(pendingVerdictKey);
+      snapshotStore(journey).removeItem(key);
     } catch {
       // Removal failing is harmless; parsing below still guards the shape.
     }
 
-    // Never over a live room. After an OAuth redirect the page has just reloaded and there is
-    // nothing to overwrite -- but signing in with a password does NOT reload, so without this an
-    // abandoned snapshot would replace the conversation somebody is having right now.
+    /*
+     * Never over a live room. After an OAuth redirect the page has just reloaded and there is
+     * nothing to overwrite -- but signing in with a password does NOT reload, so without this an
+     * abandoned snapshot would replace the conversation somebody is having right now.
+     *
+     * **On the `return` journey this guard does nothing**, because it runs at mount and the room is
+     * empty at mount by definition. That is exactly why that journey's safety had to come from
+     * somewhere else -- see `SnapshotJourney`.
+     */
     if (roomHasUnsavedWork) return;
 
     try {
@@ -4297,22 +4351,32 @@ export default function Home() {
       // the page, and `speaking` would leave the orb waiting for a line nobody is going to say.
       setTurnState("ready");
 
+      /*
+       * Only on the way back from somewhere they chose to go. After signing in the account card is
+       * already the explanation, and a second line under it would be the app narrating itself.
+       * Coming back from the account screen, or from a reload, there is nothing else on the page
+       * that says why the conversation is suddenly here again -- and the same sentence already
+       * does this job when a saved moment is picked up.
+       */
+      if (journey === "return") setRoomNote("picking this back up.");
+
       // The card is a card, so it needs its overlay back. Anywhere else in the room, an overlay
       // would be a sheet dropped on top of a conversation they did not ask to interrupt.
       const landedOn = snapshot.flowPhase ?? "verdict";
       setOverlay(landedOn === "verdict" ? "verdict" : null);
 
-      setReturnEmail(email);
+      if (email) setReturnEmail(email);
 
       /*
-       * The auto-save is only for a run that is OVER.
+       * The auto-save is only for a run that is OVER, and only when somebody has just signed in.
        *
        * `saveReturnEmail` writes the moment, the words, and a retrieval email. Mid-conversation
        * that would file a half-finished run and post somebody a summary of a session they are
-       * still sitting in. At the verdict and after it, it is exactly what signing up is for.
+       * still sitting in. At the verdict and after it, it is exactly what signing up is for -- and
+       * on a plain return nobody has asked for any of it.
        */
       const finished = Boolean(snapshot.placementRescue) && (landedOn === "verdict" || Boolean(snapshot.sessionClosedAt));
-      if (finished) setPendingAutoSaveEmail(email);
+      if (email && finished) setPendingAutoSaveEmail(email);
     } catch {
       // Corrupt snapshot: nothing to restore.
     }
@@ -4325,7 +4389,8 @@ export default function Home() {
   // Rebind after every render so channel events always see current state (see the ref comment).
   useEffect(() => {
     handleRealtimeEventRef.current = handleRealtimeEvent;
-    restoreRoomAfterAuthRef.current = restoreRoomAfterAuth;
+    restoreRoomRef.current = restoreRoom;
+    stashRoomRef.current = stashRoom;
   });
 
   // One subscription for the life of the room, dispatching through the ref above.
@@ -4340,6 +4405,59 @@ export default function Home() {
   useEffect(() => {
     void loadDuePhrases();
     // eslint-disable-next-line react-hooks/exhaustive-deps -- runs once, on arrival
+  }, []);
+
+  /**
+   * The room, written down on the way out — however they left.
+   *
+   * The account pill stashes in its own `onClick`, because a client-side navigation unmounts the
+   * component without ever unloading the document, so nothing fires here. This covers everything
+   * that DOES unload it: a reload, the back button out of the app, a tab closing, a crash. Until
+   * now none of those were covered at all — a run is not written to the database until it closes,
+   * so a reload at turn four threw the whole thing away.
+   *
+   * `pagehide` rather than `beforeunload`: mobile Safari does not fire `beforeunload` reliably, and
+   * some browsers read it as a reason to put a "leave site?" dialog in front of somebody.
+   *
+   * A closing tab fires this too, and that is exactly why the snapshot lives in `sessionStorage` --
+   * the write happens, and then the tab takes it with it.
+   */
+  useEffect(() => {
+    const onHide = () => stashRoomRef.current("return");
+    window.addEventListener("pagehide", onHide);
+    return () => window.removeEventListener("pagehide", onHide);
+  }, []);
+
+  /**
+   * The room they put down on purpose, picked back up.
+   *
+   * **Declared first, which in this ladder means last in precedence.** Every reader below clears
+   * its own key as it reads it, so a key can only be checked by an effect that runs BEFORE its
+   * reader. Anything naming a particular conversation to start outranks coming back to the one you
+   * left, so this has to look at all five while they are still there.
+   *
+   * It clears its own key even when it yields, for the reason `restoreRoom` clears before its
+   * refusals: a snapshot left lying around comes back at a worse moment than the one it missed.
+   */
+  useEffect(() => {
+    let waiting = false;
+    try {
+      waiting =
+        Boolean(window.sessionStorage.getItem(leftRoomKey)) &&
+        !window.sessionStorage.getItem(resumeMomentKey) &&
+        !window.sessionStorage.getItem(eventBeatKey) &&
+        !window.sessionStorage.getItem(askPhraseKey) &&
+        !window.sessionStorage.getItem(stungKey) &&
+        !window.sessionStorage.getItem(autoStartKey);
+      if (!waiting) window.sessionStorage.removeItem(leftRoomKey);
+    } catch {
+      return;
+    }
+    if (!waiting) return;
+    // Deferred like every other reader here: a synchronous setState in an effect body is a
+    // cascading render, and the ref binding above has to have run first.
+    const timer = window.setTimeout(() => restoreRoomRef.current("return", null), 0);
+    return () => window.clearTimeout(timer);
   }, []);
 
   /**
@@ -4516,7 +4634,7 @@ export default function Home() {
       const email = session?.user?.email ?? null;
       setAuthedEmail(email);
       // A no-op unless a snapshot is waiting, the room is empty, and the snapshot is fresh.
-      if (email) restoreRoomAfterAuthRef.current(email);
+      if (email) restoreRoomRef.current("auth", email);
     });
     return () => {
       cancelled = true;
@@ -5248,6 +5366,15 @@ export default function Home() {
                 closeOverlay();
                 return;
               }
+              /*
+               * Said out loud: they are finished. A snapshot left here would hand the run back on
+               * the next mount, which is precisely the case where we have just been told not to.
+               */
+              try {
+                window.sessionStorage.removeItem(leftRoomKey);
+              } catch {
+                // Storage blocked. Nothing was written either, so there is nothing to leave behind.
+              }
               setMode("landing");
               setTypedFallbackOpen(false);
               setTypedAttempt("");
@@ -5321,11 +5448,16 @@ export default function Home() {
               the same treatment can delete this branch.
           */}
           {authedEmail ? (
-            roomHasUnsavedWork ? null : (
-              <Link className="profile-pill" href="/account" aria-label="your account">
-                {authedEmail.slice(0, 1).toUpperCase() || <ProfileGlyph />}
-              </Link>
-            )
+            <Link
+              className="profile-pill"
+              href="/account"
+              aria-label="your account"
+              // Fires before the navigation, so the room is written down before it goes away. The
+              // hidden branch this replaces was here because it was not.
+              onClick={() => stashRoom("return")}
+            >
+              {authedEmail.slice(0, 1).toUpperCase() || <ProfileGlyph />}
+            </Link>
           ) : (
             <button className="profile-pill" type="button" aria-label="sign in" onClick={() => openAuth("signin")}>
               <ProfileGlyph />
@@ -6142,7 +6274,7 @@ export default function Home() {
         <AuthDialog
           initialMode={authIntent}
           onClose={() => setAuthOpen(false)}
-          onBeforeRedirect={stashRoomForAuth}
+          onBeforeRedirect={() => stashRoom("auth")}
           onAuthed={(email) => {
             setReturnEmail(email);
             void saveReturnEmail(email);

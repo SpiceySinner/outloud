@@ -7,6 +7,26 @@
 export const resumeMomentKey = "outloud-resume-moment";
 
 /**
+ * The room, put down on purpose, waiting to be picked back up.
+ *
+ * The odd one out in this file: every other key here is a hand-off *between* two screens, written
+ * by one and read by the other. This one the room writes about itself, before a navigation it
+ * expects to come back from — the account pill, or a reload.
+ *
+ * It lives here anyway because signing out has to clear it, and that lives on `/account`. A run
+ * restored after somebody signed out would be the right practice wearing the wrong session.
+ *
+ * **`sessionStorage`, never `localStorage`,** and that is the whole safety argument. The auth
+ * snapshot can be careless about provenance because it exists only while a redirect is in flight;
+ * this one exists after every way out, so it needs a lifetime that ends when the intention does. A
+ * tab is exactly that lifetime.
+ *
+ * Last in the room's precedence ladder, below all five keys above: anything that names a
+ * particular conversation to start beats coming back to the one you left.
+ */
+export const leftRoomKey = "outloud-left-room";
+
+/**
  * Set by /dash when the orb is tapped with nothing to pick up. The room reads it on mount and
  * goes straight into a session instead of showing the landing panel -- otherwise "tap the orb and
  * talk" costs two taps and a screen that says the same thing again.

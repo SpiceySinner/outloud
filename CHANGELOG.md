@@ -1,5 +1,98 @@
 # Changelog
 
+## 2026-09-12 — leaving the room stops costing the room
+
+The account pill used to **disappear** the moment there was anything to lose. The comment beside it
+said why: a plain navigation with no stash and no restore, so following it cost you the run. It was
+the last open item in TODO 1.5 — and it meant that signed in, mid-session, there was no way to your
+own account and therefore no way to sign out.
+
+**The finding that made it bigger.** There was no `beforeunload`, no `pagehide`, no
+`visibilitychange` anywhere in the project, and `stashRoomForAuth` had exactly one call site:
+immediately before the Google redirect. A run is not written to the database until it closes. So a
+reload at turn four threw the whole thing away, silently, and always had.
+
+### The hard part, and where the safety actually comes from
+
+The restore already had four guards, and at mount the most important one evaporates:
+
+| | signing in | at mount |
+|---|---|---|
+| `if (roomHasUnsavedWork) return` | holds | **useless** — the room is empty at mount by definition |
+| the two-hour TTL | holds | holds, but that covers a lunch break |
+| "something has to be in it" | holds | holds |
+| read once, clear immediately | holds | holds |
+
+The auth snapshot is safe for reasons that are not in its code: it is written **only** while a
+redirect is in flight, and read **only** when somebody has just signed in. Its existence is the
+signal. A snapshot written on every way out does not have that, so the provenance had to be made
+explicit — and the answer is the store itself.
+
+**`sessionStorage`, not `localStorage`.** It belongs to a tab, which supplies all three of the
+missing guarantees at once: closing the tab throws the intention away with it, tomorrow morning is a
+new tab with nothing in it, and two open tabs cannot steal each other's session.
+
+**The restore became the sixth hand-off key.** The room already reads five on mount in a documented
+precedence order. The new one goes last in precedence — anything naming a particular conversation to
+start beats coming back to the one you left — which meant declaring it **first**, because every
+reader in that ladder clears its own key as it reads, so a key can only be checked by an effect that
+runs before its reader. With that, the race against `resumeMomentKey` and `autoStartKey` does not
+have to be solved; it does not exist.
+
+### What changed
+
+- `stashRoomForAuth` / `restoreRoomAfterAuth` became `stashRoom(journey)` / `restoreRoom(journey,
+  email)`. `email` is null on a plain return, and two things hang off it that must not happen then:
+  filling the return box, and the auto-save — which writes the moment **and posts a summary**.
+  Somebody who glanced at their account has asked for neither.
+- The pill stashes in its `onClick` and stopped hiding.
+- `pagehide` covers every way out that unloads the document. Not `beforeunload`: mobile Safari does
+  not fire it reliably and some browsers read it as grounds for a "leave site?" dialog.
+- The exit button and sign-out **clear** the key. Both mean "I am done".
+- `stashRoom` refuses on the landing screen. The exit button does not reset `openingAnswer` or
+  `placementRescue`, so without this a reload after pressing exit would hand back a room that had
+  just been closed.
+- Coming back sets "picking this back up." — the same sentence a resumed moment already uses.
+
+### How it was checked
+
+Five cases against the mock build, recorded **before** the change so the before state is on record:
+the pill was indeed absent mid-session, and a reload did indeed lose everything.
+
+| | |
+|---|---|
+| the account pill, then back | restored |
+| reload mid-scene | restored |
+| **exit, then reload** | **not restored** |
+| **a second tab while the first is mid-scene** | **stays empty** |
+| **sign out, then back to the room** | **not restored** |
+
+The three in bold are the real tests. A restore that fires when nobody wanted it is worse than no
+restore: it drops a finished conversation on somebody, or hands one browser's practice to whoever
+opens the tab next.
+
+`session-survives-auth-check.mjs` failed on one assertion afterwards, and it was the check that was
+stale rather than the code: it asserted that an abandoned redirect leaves you with an empty room.
+That was an honest description of a limitation, not a property worth keeping, and it is exactly what
+this change exists to end. The expectation is inverted, with the reason written next to it.
+
+### Found on the way, and not fixed
+
+**Every client-side link is dead in the production build.** In a local `vinext build` +
+`vinext start`, every `next/link` navigation throws `TypeError: e is not a function` and the URL
+never changes — `/` to `/account`, `/account` back to `/`, `/dash` to `/account`, including links
+written long before this work. The dev server does all of them cleanly, and every route renders
+fine when reached by a fresh page load.
+
+It is not this change's doing and it is not the account page's. What has **not** been established
+is when it started or whether the deployed app has it — `vite.config.ts` targets Cloudflare by
+default, so a local `vinext start` may not be what the host runs. It is in TODO section 2.
+
+Two consequences here. The five-case check leaves the room with `goto` rather than by clicking,
+because clicking through a broken bundle would test the bundler; and the click itself — that the
+key is written before the navigation, that `/account` arrives, that coming back brings the
+conversation — is proved separately against the dev server.
+
 ## 2026-09-11 — `/dashboard` and `/profile` become `/account`
 
 Step 3 of TODO 1.5, and the last of the three. Four surfaces are now three.

@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import HomePanel from "@/app/components/HomePanel";
-import { formatSavedDate, resumeMomentKey, type ResumeMoment } from "@/lib/account-links";
+import { formatSavedDate, leftRoomKey, resumeMomentKey, type ResumeMoment } from "@/lib/account-links";
 import { focusFromMoments, trendDirection, type MomentCard } from "@/lib/dashboard-data";
 import { getSupabaseBrowser } from "@/lib/supabase-browser";
 import { useLibraryData } from "@/lib/use-library-data";
@@ -93,6 +93,16 @@ export default function AccountPage() {
   }
 
   async function signOut() {
+    /*
+     * The room may have written itself down on the way here, expecting to be picked back up. After
+     * a sign-out it must not be: the practice is still on the device, but restoring it would put
+     * one account's conversation in front of whoever is signed in next.
+     */
+    try {
+      window.sessionStorage.removeItem(leftRoomKey);
+    } catch {
+      // Storage blocked, so nothing was written on the way in either.
+    }
     await getSupabaseBrowser()?.auth.signOut();
     router.push("/");
   }

@@ -363,13 +363,11 @@ Neither of the first two touches `/dash`, so neither blocks or is blocked by the
    and `/profile` merged into one screen and both routes are gone. All seven links repointed. The
    coach chat was cut with them, which is the other decision in this section.
 
-   **Still open, and it is the last thing in 1.5 that costs a learner anything:** the account pill
-   is a plain navigation with no snapshot, so it stays hidden while there is work to lose. That
-   guard was right when the pill went to a screen nobody needed mid-session; it is wrong now that
-   it goes to the only place a learner can sign out. Fixing it is not a one-liner: `stashRoomForAuth`
-   exists, but `restoreRoomAfterAuth` is wired to `onAuthStateChange` and a plain back-navigation
-   fires no auth event, so the restore needs a mount-time path as well — with its own guard against
-   restoring a run that should have stayed closed.
+   **~~The account pill costs a session.~~ Done 2026-09-12.** It no longer hides, because leaving
+   the room no longer loses it. The snapshot grew a second journey in `sessionStorage`, the restore
+   became the sixth reader in the hand-off ladder, and `pagehide` covers every way out that unloads
+   the document — so a reload mid-session costs nothing either, which it always used to. See the
+   CHANGELOG.
 
 **~~Blocking detail for step 3.~~ Cleared 2026-09-11.** Sign-out, the email and the auth provider
 all landed on `/account` before `/profile` was deleted, and every link was repointed. One
@@ -382,6 +380,26 @@ sign-out you can reach when you are NOT mid-session.
 ## 2. Things that look finished and are not
 
 *The dangerous class. Each of these has working code, user-facing copy, or both — and does nothing.*
+
+- [ ] **Every client-side link is dead in the production build.** Found 2026-09-12, while testing
+      something else, and it is the most alarming thing on this list.
+
+      In a local `vinext build` + `vinext start`, **every** `next/link` navigation throws
+      `TypeError: e is not a function` and the URL does not change: `/` → `/account`, `/account` →
+      `/`, `/dash` → `/account`. The dev server does all of them cleanly. Reached directly with a
+      fresh page load, every route renders fine — so it is the client-side transition, not any
+      page.
+
+      What is NOT yet known, and has to be before anything is concluded:
+      - **when it started.** It was not proven against an earlier commit; it affects links written
+        long before the work of the last two days, which is the reason for thinking it is not new.
+      - **whether the deployed app has it.** `vite.config.ts` targets Cloudflare by default and
+        switches to Nitro under `NITRO_PRESET` or `VERCEL=1`. A local `vinext start` may not be
+        what the host actually runs.
+
+      Worth knowing either way: **every Playwright check in the scratchpad that navigates by
+      clicking a link has been running against a build where that cannot work.** Checks that use
+      `page.goto` are unaffected, which is most of them.
 
 - [ ] **The entire return half is inert.** This is the biggest one on the list.
       - `/api/retrieval` has **zero callers** and there is **no `vercel.json`**, so no cron ever
