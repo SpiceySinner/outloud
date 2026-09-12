@@ -970,6 +970,15 @@ html:not([data-outloud-hydrated="true"]) .app-shell button {
   cursor: pointer;
 }
 
+/*
+ * Two bands, the way `/dash` is built: the stage takes whatever is left and the bottom sizes to
+ * its content. `min-height: 0` on the stage is the load-bearing half -- without it a flex child
+ * refuses to shrink below its content and the pick-up card gets pushed off a short phone.
+ *
+ * The top padding clears `.room-chrome`, which is z-index 3 and renders OVER this panel: the exit
+ * button and the account pill are still the room's, still on top, and content starting at the very
+ * top edge would slide underneath them.
+ */
 .landing-panel {
   position: absolute;
   inset: 0;
@@ -977,22 +986,63 @@ html:not([data-outloud-hydrated="true"]) .app-shell button {
   display: flex;
   flex-direction: column;
   align-items: center;
-  justify-content: center;
-  padding: 0 34px 30px;
+  padding: 72px 26px max(14px, env(safe-area-inset-bottom));
   background: var(--paper);
   text-align: center;
   animation: panel-in 220ms var(--ease-room) both;
 }
 
+.landing-stage {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.landing-bottom {
+  flex: none;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+/* The orb is a microphone on this screen now, so it is a button. Bare, because the canvas is the
+   affordance and a border around it would read as a second control. */
+.landing-orb-wrap {
+  appearance: none;
+  display: grid;
+  place-items: center;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  /* The press is a hold-to-talk gesture with pointer capture, so the browser must not claim the
+     drag for scrolling first. */
+  touch-action: none;
+}
+
+.landing-orb-wrap:disabled {
+  cursor: default;
+}
+
+/* Bounded by the viewport height as well as the width, the same way `.dash-orb` is: a short phone
+   shrinks the orb rather than pushing the card below it off the screen. */
 .landing-orb {
-  width: 220px;
-  height: 220px;
+  width: min(340px, 80vw, 40dvh);
+  height: min(340px, 80vw, 40dvh);
   display: block;
-  margin: 0 0 12px;
+  margin: 0;
 }
 
 .landing-panel h1 {
-  margin: 0 0 14px;
+  margin: 0;
   max-width: 330px;
   color: var(--ink);
   font-family: var(--font-newsreader), Georgia, serif;
@@ -1003,7 +1053,7 @@ html:not([data-outloud-hydrated="true"]) .app-shell button {
 }
 
 .landing-subcopy {
-  margin: 0 0 30px;
+  margin: 0 0 6px;
   max-width: 280px;
   color: var(--muted);
   font-family: var(--font-schibsted), system-ui, sans-serif;
@@ -3093,6 +3143,53 @@ html:not([data-outloud-hydrated="true"]) .app-shell button {
   color: var(--muted);
   font-size: 12.5px;
   text-align: center;
+}
+
+/* The typed way into the router, shown once the microphone is known to be unreachable.
+   Deliberately plain: this is the fallback, not a second front door, and styling it to compete
+   with the orb would teach everybody else to type at a screen built to be spoken to. */
+.dash-typed {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+  max-width: 330px;
+  margin: 0 auto;
+}
+
+.dash-typed-box {
+  flex: 1;
+  min-width: 0;
+  padding: 9px 12px;
+  border: 1px solid rgba(31, 29, 26, 0.16);
+  border-radius: 10px;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: inherit;
+  font-size: 14px;
+}
+
+.dash-typed-box::placeholder {
+  color: var(--muted);
+}
+
+.dash-typed-box:focus-visible {
+  outline: 2px solid rgba(196, 69, 31, 0.45);
+  outline-offset: 1px;
+}
+
+.dash-typed-go {
+  flex: none;
+  padding: 9px 16px;
+  border: 0;
+  border-radius: 10px;
+  background: var(--ink);
+  color: var(--paper);
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.dash-typed-go:disabled {
+  opacity: 0.4;
 }
 
 /* --- the bottom: one thing to pick up, then the way out --- */

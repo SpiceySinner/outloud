@@ -10,6 +10,10 @@ import FeedbackSheet from "./components/FeedbackSheet";
 import { AssistanceSheet, EvidenceSheet, ProfileSheet } from "./components/ProfileSheets";
 import { CorrectionSheet, PronunciationSheet } from "./components/RepairSheets";
 import { AskSheet, EyesOffSheet, PressureSheet, TranscriptSheet } from "./components/SessionSheets";
+import PickUpCard, { FocusLine } from "./components/PickUpCard";
+import StepsDrawer from "./components/StepsDrawer";
+import { useEntryData } from "@/lib/use-entry-data";
+import { useVoiceEntry } from "@/lib/use-voice-entry";
 import type { DashboardData, MomentCard } from "@/lib/dashboard-data";
 import { shouldTriggerRepair } from "@/lib/repair-loop";
 import {
@@ -1018,6 +1022,94 @@ export default function Home() {
   const [unclaimedRuns, setUnclaimedRuns] = useState<number | null>(null);
   const [lastReviewUrl, setLastReviewUrl] = useState<string | null>(null);
   const isLanding = mode === "landing";
+
+  /*
+   * What is waiting for this learner, and the orb that lets them say what they want instead.
+   *
+   * Both hooks are shared with `/dash`, which is the point of them existing: the landing screen
+   * used to be the same cold funnel whether you had never opened the app or had a month of
+   * practice and a dinner on friday behind it.
+   *
+   * `previewByDefault: false` is load-bearing. `/dash` shows the invented account to a signed-out
+   * visitor because it is an unfinished screen worth looking at; the homepage must never do that.
+   * A stranger's month of practice on the real front door, wearing your session, is the one
+   * failure mode of this feature that would be worth more than the feature.
+   */
+  const entryData = useEntryData({ previewByDefault: false });
+  const [stepsFor, setStepsFor] = useState<string | null>(null);
+  const entry = useVoiceEntry(
+    {
+      libraryState: entryData.libraryState,
+      moments: entryData.moments,
+      due: entryData.due,
+      focus: entryData.focus,
+      pickUp: entryData.pickUp,
+      pickUpIsDue: entryData.pickUpIsDue,
+      liveEvent: entryData.liveEvent,
+      readyBeat: entryData.readyBeat,
+      nextBeat: entryData.nextBeat,
+      eventDay: entryData.eventDay,
+      doneEvent: entryData.doneEvent,
+      events: entryData.events,
+      todayIso: entryData.todayIso,
+      preview: entryData.preview,
+      // The engine goes inert the moment the room is doing anything else. It only ever drives the
+      // landing screen; a capture opening behind a live session would fight the room for the mic.
+      busy: !isLanding,
+    },
+    {
+      /*
+       * Here is the whole reason the engine is a hook rather than a page.
+       *
+       * On `/dash` each of these writes a sessionStorage key and navigates to `/`, because the
+       * two screens are two documents. In the room they are direct calls to functions that have
+       * existed all along -- no key, no navigation, no snapshot to lose on the way.
+       */
+      startBeat: (event, beatIndex) => void runEventBeat(event, beatIndex),
+      resumeMoment: (moment) => resumeSavedMoment(moment),
+      startAskPhrase: (said, askEn) => void runAskPhrase({ said, askEn }),
+      startStung: (said, situationEn) => void runStungIntake({ said, situationEn }),
+      onEventsChanged: entryData.setEvents,
+    },
+  );
+
+  /*
+   * Who is looking, in one line.
+   *
+   * Signed out with nothing on this device is a first-time visitor, and they get the funnel that
+   * has always been here -- "90 seconds. no signup." is true for them and only for them. Anybody
+   * else gets their own practice: a dated evening, an overdue phrase, or the honest empty version
+   * with a way in. Events are keyed to the browser rather than an account, so somebody who
+   * planned one before signing up still sees it.
+   */
+  const showFunnel = !authedEmail && !entryData.liveEvent && !entryData.pickUp;
+  /**
+   * Picks a saved moment back up, here rather than via `/dash` and a page load.
+   *
+   * The same twelve lines the `resumeMomentKey` effect runs on arrival. They stay duplicated ONLY
+   * until `/account` stops writing that key -- one is a hand-off from another document and this
+   * one is not, and collapsing them before that would mean the effect had to fake a moment object
+   * it does not have.
+   */
+  function resumeSavedMoment(moment: MomentCard | null) {
+    if (!moment) {
+      entry.rest("that one isn't here any more.", "pick something else, or describe a situation.");
+      return;
+    }
+    if (!moment.rescue) return;
+    setMode("speaks-first");
+    setPlacementRescue(moment.rescue as RescueResponse);
+    setPlacementSummary(moment.summary);
+    setPlacementAttempts([]);
+    setPlacementEvaluations([]);
+    setSavedMomentId(moment.id);
+    setCoachLine("picking this back up.");
+    showMeaning(null, null);
+    setFlowPhase("verdict");
+    setTurnState("ready");
+    setOverlay("verdict");
+  }
+
   const isStung = mode === "stung";
   const isAskEntry = mode === "ask";
   /*
@@ -1451,7 +1543,7 @@ export default function Home() {
       evidenceByBlocker.set(placementType, placementRescue.observed_blocker.evidence);
     }
   }
-  // Within-session movement for the focus dimension. Across sessions lives on /profile, which is
+  // Within-session movement for the focus dimension. Across sessions lives on /account, which is
   // the only surface that holds history; claiming a trend from one session would be theatre.
   const evaluatedTurns = sessionTurns.filter((turn) => Boolean(turn.evaluation));
   const clearTurns = evaluatedTurns.filter((turn) => turn.evaluation?.meaningResult === "clear").length;
@@ -5198,13 +5290,13 @@ export default function Home() {
             <span>{eyesOffMode ? "eyes off" : "feedback"}</span>
             <HeartIcon />
           </button>
-          {/* Debug only. The profile pill opens the sign-in dialog when signed out, so without an
-              account there is otherwise no way into /profile or /dashboard from the room at all.
+          {/* Debug only. The account pill opens the sign-in dialog when signed out, so without an
+              account there is otherwise no way into /account from the room at all.
               Unmount tears down the mic and the realtime connection cleanly -- but it does NOT save
               the session, so this discards whatever is on the screen. Acceptable for a debug link
               that only appears with `?debug`; it was not acceptable for the pill below it. */}
           {debugTools ? (
-            <Link className="debug-pill" href="/profile" aria-label="debug: open the account page">
+            <Link className="debug-pill" href="/account" aria-label="debug: open the account page">
               debug
             </Link>
           ) : null}
@@ -5230,7 +5322,7 @@ export default function Home() {
           */}
           {authedEmail ? (
             roomHasUnsavedWork ? null : (
-              <Link className="profile-pill" href="/profile" aria-label="your profile">
+              <Link className="profile-pill" href="/account" aria-label="your account">
                 {authedEmail.slice(0, 1).toUpperCase() || <ProfileGlyph />}
               </Link>
             )
@@ -5725,34 +5817,146 @@ export default function Home() {
 
         {isLanding ? (
           <section className="landing-panel" aria-label="OutLoud landing">
-            <OrbCanvas state="idle" className="landing-orb" size={440} />
-            <h1>you understand Spanish. you just can&apos;t speak it.</h1>
-            <p className="landing-subcopy">
-              talk to an AI coach that figures out exactly what&apos;s holding you back
-              {" — "}and fixes it.
-            </p>
-            <button
-              className="primary-action"
-              type="button"
-              onClick={() => enterRoom("speaks-first")}
-            >
-              start talking.
-            </button>
-            {/*
-              This ran `enterRoom("stung")` -- the engine for "a moment that went badly" -- so
-              somebody who stated the exact sentence they wanted got "tell me what happened" and
-              then a choice of two scenarios, and never the sentence. The engine that answers it
-              already existed and was reachable only from `/dash`, which nothing links to.
-            */}
-            <button
-              className="secondary-action"
-              type="button"
-              onClick={() => enterRoom("ask")}
-            >
-              didn&apos;t know how to say something? &rarr;
-            </button>
-            <p className="microcopy">90 seconds. no signup. just talk.</p>
+            <div className="landing-stage">
+              {/*
+                The half that knows who is looking.
+
+                A first-time visitor gets the claim the product makes; anybody with practice behind
+                them gets the invitation to say what they want, which is a different job. Running
+                both at once was the shape this screen had before, and it is why somebody with a
+                month of sessions was still being sold the app on arrival.
+              */}
+              {showFunnel ? (
+                <>
+                  <h1>you understand Spanish. you just can&apos;t speak it.</h1>
+                  <p className="landing-subcopy">
+                    talk to an AI coach that figures out exactly what&apos;s holding you back
+                    {" — "}and fixes it.
+                  </p>
+                </>
+              ) : (
+                <div className="dash-header" aria-live="polite">
+                  <p className="dash-lead">{entry.header.lead}</p>
+                  <p className="dash-alt">{entry.header.alt}</p>
+                </div>
+              )}
+
+              {/*
+                The orb listens here now, exactly as it does on `/dash` -- same hook, same phase
+                machine, same router. The room's own orb is still mounted behind this panel and
+                still disabled on the landing; it has a different job (a turn in a scene) and the
+                two must not become one control that guesses which it is.
+              */}
+              <button className="landing-orb-wrap" type="button" {...entry.orbProps}>
+                <OrbCanvas state={entry.orbState} className="landing-orb" size={440} />
+              </button>
+
+              {entryData.focus && entry.phase === "resting" && !entry.retry ? (
+                <FocusLine label={entryData.focus.label} />
+              ) : null}
+
+              {entry.micBlocked && !entry.orbBusy ? (
+                <form
+                  className="dash-typed"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    void entry.submitTyped(entry.typedDraft);
+                  }}
+                >
+                  <input
+                    className="dash-typed-box"
+                    type="text"
+                    aria-label="type what you want to do"
+                    placeholder="type it instead"
+                    value={entry.typedDraft}
+                    onChange={(event) => entry.setTypedDraft(event.target.value)}
+                  />
+                  <button className="dash-typed-go" type="submit" disabled={!entry.typedDraft.trim()}>
+                    go
+                  </button>
+                </form>
+              ) : null}
+            </div>
+
+            <div className="landing-bottom">
+              {showFunnel ? (
+                <>
+                  <button
+                    className="primary-action"
+                    type="button"
+                    onClick={() => enterRoom("speaks-first")}
+                  >
+                    start talking.
+                  </button>
+                  {/*
+                    This ran `enterRoom("stung")` -- the engine for "a moment that went badly" -- so
+                    somebody who stated the exact sentence they wanted got "tell me what happened"
+                    and then a choice of two scenarios, and never the sentence.
+                  */}
+                  <button
+                    className="secondary-action"
+                    type="button"
+                    onClick={() => enterRoom("ask")}
+                  >
+                    didn&apos;t know how to say something? &rarr;
+                  </button>
+                  <p className="microcopy">90 seconds. no signup. just talk.</p>
+                </>
+              ) : (
+                <>
+                  <PickUpCard
+                    event={entryData.liveEvent}
+                    nextBeat={entryData.nextBeat}
+                    readyBeat={Boolean(entryData.readyBeat)}
+                    stepsOpen={Boolean(entryData.liveEvent && stepsFor === entryData.liveEvent.id)}
+                    moment={entryData.pickUp}
+                    momentIsDue={entryData.pickUpIsDue}
+                    libraryReady={entryData.libraryState === "ready"}
+                    askOutcome={entry.phase === "outcome"}
+                    todayIso={entryData.todayIso}
+                    accountEmail={authedEmail}
+                    /* The room's chrome already carries the account pill, one layer above this. */
+                    accountHref={null}
+                    disabled={false}
+                    onAnswerSpoke={entry.answerSpoke}
+                    onStartBeat={(beatIndex) => {
+                      if (entryData.liveEvent) void runEventBeat(entryData.liveEvent, beatIndex);
+                    }}
+                    onOpenSteps={() => {
+                      entry.standDown();
+                      if (entryData.liveEvent) setStepsFor(entryData.liveEvent.id);
+                    }}
+                    onPickUp={() => resumeSavedMoment(entryData.pickUp)}
+                    onStartTalking={() => enterRoom("speaks-first")}
+                  />
+                  <div className="dash-tray">
+                    <Link className="dash-tray-link" href="/account">
+                      everything
+                    </Link>
+                  </div>
+                </>
+              )}
+            </div>
           </section>
+        ) : null}
+
+        {/*
+          A sibling of the landing panel and a child of `.room`, never nested deeper: the drawer is
+          absolutely positioned and needs an ancestor that caps its width and clips its overflow.
+          `.room` is that box, and happens to be the same one `.dash-shell` is.
+        */}
+        {isLanding && entryData.liveEvent && stepsFor === entryData.liveEvent.id ? (
+          <StepsDrawer
+            event={entryData.liveEvent}
+            eventDay={entryData.eventDay}
+            nextBeatIndex={entryData.nextBeat?.index ?? null}
+            todayIso={entryData.todayIso}
+            disabled={false}
+            onStartBeat={(beatIndex) => {
+              if (entryData.liveEvent) void runEventBeat(entryData.liveEvent, beatIndex);
+            }}
+            onClose={() => setStepsFor(null)}
+          />
         ) : null}
 
         {overlay ? (

@@ -135,7 +135,7 @@ export default function VerdictCard({
                   : "save today's words"}
             </button>
             {returnEmailStatus === "saved" ? (
-              <Link className="quiet-link" href="/dashboard">
+              <Link className="quiet-link" href="/account">
                 see all your words &rarr;
               </Link>
             ) : null}

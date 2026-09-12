@@ -1,5 +1,175 @@
 # Changelog
 
+## 2026-09-11 — `/dashboard` and `/profile` become `/account`
+
+Step 3 of TODO 1.5, and the last of the three. Four surfaces are now three.
+
+`/dashboard`'s own header comment called it *"Home. What a learner lands on once the funnel is
+behind them"* — which is the room's job since the landing screen learned who is looking. A second
+screen calling itself home is how somebody ends up with two front doors and no idea which is
+theirs. So what is left on `/account` is the half neither screen was on its own: **who you are,
+what you have done, and the way out.**
+
+| | |
+|---|---|
+| `app/account/page.tsx` | new, 212 |
+| `app/dashboard/page.tsx` | deleted, was 221 |
+| `app/profile/page.tsx` | deleted, was 170 |
+| links repointed | 7 |
+
+**Two things did not come across.**
+
+The **hero** — `/dashboard` opened with the focus label as a headline and "start talking" under it.
+The room's landing carries both now, against live data, so a second copy would be the same claim in
+two places with nothing keeping them honest.
+
+The **coach chat**, Timo's call in 1.5. It had no engine, a disabled input saying so out loud, and
+canned replies behind a preview flag. `mockChatReplies` stays in `lib/dashboard-mock.ts` because
+#30 is a real plan and that mock is the shape it was drawn in; it simply has no caller.
+
+**One duplication resolved itself.** Both old files built the trend sentence inline, in two
+different wordings — precisely the fault `lib/dashboard-data.ts` warns about in its own header.
+There is one now, and it stays inline until there is a second caller.
+
+**One correction to the plan.** TODO 1.5 said sign-out existed in exactly one place. It was two:
+the verdict card has had its own since 1.1 and keeps it, because catching somebody at the verdict
+is the whole point of that one. What `/profile` held alone was the sign-out you can reach when you
+are *not* mid-session, and that is what moved.
+
+### How it was checked
+
+- `/account?preview=1` — the merged screen carries everything both old ones did: identity, the
+  three stats, the focus reading and its trend, all five `HomePanel` sections, sign-out. The chat
+  is asserted **gone**, not merely unrendered.
+- **a real throwaway account**, created and deleted through GoTrue's admin API. Two things the
+  preview cannot answer, because it has no session at all: the identity line reads the auth session
+  directly rather than `/api/library`, and sign-out is the only action on the page. Signed in it
+  read `signed in with email · since 11. Sept.` and the honest zeros; signing out returned to the
+  room and left `/account` showing the empty state.
+- **every door**, from both hosts: the room's account pill and debug pill, `/dash`'s tray. The
+  account disc on `/dash` was removed rather than repointed — the disc and the tray went to two
+  screens, and one row with the same destination twice reads as a choice that is not one.
+- `/dashboard` and `/profile` return 404, asserted rather than assumed.
+
+### Still costs a session
+
+The account pill is a plain navigation with no snapshot, so it still hides while there is work to
+lose. That guard was right when it led to a screen nobody needed mid-session. It is wrong now that
+it leads to the only place a learner can sign out — and it is not a one-liner, because
+`restoreRoomAfterAuth` is wired to `onAuthStateChange` and a back-navigation fires no auth event.
+
+## 2026-09-11 — the homepage learns who is looking
+
+Step 2 of TODO 1.5, and the reason for it in Timo's words: *the landing not knowing who is standing
+in front of it is why we want `/dash` on the homepage — so we can give them a dashboard feeling.*
+
+`/dash` had all of it built and **nothing in the repo linked to it**. The pick-up card, the event
+cards, the steps drawer, the focus line, and the orb that listens and works out what you want — all
+reachable only by typing the URL.
+
+### What the landing does now
+
+| | before | after |
+|---|---|---|
+| signed out, nothing on this device | the funnel | **unchanged**, plus an orb that listens |
+| signed out, an event planned here | the funnel | the event, the next go, the drawer |
+| signed in | the funnel | their own practice |
+
+Events are keyed to the browser rather than an account (`/api/events` has never required a
+session), so somebody who planned one before signing up still sees it. That was Timo's call and it
+is the honest reading of how events were built.
+
+**`previewByDefault: false` in the room.** `/dash` shows the invented account to a signed-out
+visitor because it is an unfinished screen worth looking at without a month of practice behind it.
+The homepage must never do that, and it is a parameter rather than a shared constant so it cannot
+be switched on by accident.
+
+### The orb, and why the engine is a hook
+
+Timo asked for the orb to work on the homepage exactly as well as it does on `/dash`. Pasted in,
+that was ~800 lines of phase machine, microphone and router landing in a file that had just had 535
+lines taken out of it — and two copies of the one decision on that screen that must not drift: what
+a sentence means.
+
+So the engine moved **once**, into `lib/use-voice-entry.ts`, and takes two things: what is on
+screen, and what to do about it. That second half is the whole difference between the hosts:
+
+| the learner says | `/dash` | the room |
+|---|---|---|
+| "let's do that one" | write `outloud-event-beat`, navigate to `/` | `runEventBeat(event, index)` |
+| "pick that back up" | write `outloud-resume-moment`, navigate | twelve lines of state |
+| "just talk to me" | write `outloud-autostart`, navigate | `enterRoom("speaks-first")` |
+
+All three receivers already existed in the room. In the room the hand-off keys are not written at
+all — proved, not assumed, by a check that reads `sessionStorage` afterwards.
+
+The derivations went the same way, into `lib/use-entry-data.ts`. The individual helpers were
+already shared; what was not was the **ranking** — a dated evening beats an overdue phrase beats
+the last thing you did — and that ranking is a claim about the learner.
+
+| file | |
+|---|---|
+| `app/dash/page.tsx` | **1382 → 410** |
+| `lib/use-voice-entry.ts` | new, 1077 |
+| `lib/use-entry-data.ts` | new, 161 |
+| `app/components/PickUpCard.tsx` | new, 213 |
+| `app/components/StepsDrawer.tsx` | new, 94 |
+| `app/page.tsx` | 5950 → 6154 |
+
+### A dead end, found and closed
+
+`blocked` — no microphone — was a dead end. The copy said "the card below still works", which was
+true and beside the point: the router is the only route to a new scenario, an event plan or a
+phrase question, and somebody whose browser refuses the microphone was told to take whatever was on
+offer instead. It has a typed way in now, joining the flow at exactly the junction a clean
+transcript does, so there is still one router and one set of rules.
+
+Writing the check for it immediately found a second fault, and a worse one. `route` and `planEvent`
+both **ask something back** — "I didn't catch what you want to do", "when is it?" — and then reopen
+the microphone. With no microphone that reopen fails, and the failure path clears the line that was
+just put on the header. The question was wiped in the same breath it was asked, twice over. `openMic`
+now refuses a retry it already knows will fail, and leaves the question standing.
+
+### How it was checked
+
+Two harnesses, both proved against unchanged code first, both free — `/api/intent` and
+`/api/event-plan` answer from regexes under `OUTLOUD_MOCK_AI`, and `?preview=1` serves an invented
+account with no network at all.
+
+- **the router, seven cases** — every intent typed in, and the sequence of header states it passes
+  through recorded. The first version of this disagreed with itself on three of seven runs: "one
+  sec." is real but whether a 120ms poll catches it is not, so the plumbing states are filtered and
+  what is left is every state a learner is meant to read.
+- **six structural fingerprints of `/dash`** — the card row, the drawer and the stage, in five data
+  states. Identical after each stage.
+- **the router in the room** — four intents typed into the landing, asserting the room took each
+  one in place: no navigation, and nothing left in `sessionStorage`.
+- **the warm landing's masking** — new exposure, not moved exposure. The event name, the saved
+  phrase and its meaning were only ever on a screen nothing linked to; they are on the front door
+  now. Nothing on either warm state survives into a session replay.
+- plus `closing-panel-check`, `session-survives-auth-check`, `replay-mask-check`, `home-check`,
+  `dash-check`, `dash-default-check`, `event-states-check`, and `tsc` / `eslint` after every stage.
+
+**What is still not covered is the microphone itself.** The harness aborts the realtime token,
+which is exactly the "no microphone" path — the right place to prove the honest failure state and
+the wrong place to claim the capture works. That one is still a real phone.
+
+### `/dash` is kept
+
+**`/dash` is not going anywhere, and this is why** (Timo, 2026-09-11, overruling an earlier note
+here that said it should be deleted after step 3):
+
+> we need `/dash` so I can cross-check whether what you built on the homepage actually works. And
+> you can't do that with your tests, because you can't give voice input — and for a reason probably
+> nobody knows, the voice input is completely different from the text input.
+
+Both halves are right and the second is the important one. Every check in this repo drives the
+TYPED path: the Playwright harness aborts the realtime token, which is by construction the "no
+microphone" branch. So the microphone has no automated cover at all and cannot get any. `/dash` is
+the control — the same two hooks, the same engine, a screen whose behaviour is already known — and
+the only way to tell "the homepage is broken" from "the merge broke it" is to run the same sentence
+into both by voice. Deleting it would remove the one instrument that can answer that.
+
 ## 2026-09-11 — thirteen sheets out of the room file
 
 Step 1 of TODO 1.5. `app/page.tsx` held **6485 lines**, and inside its JSX sat thirteen overlay

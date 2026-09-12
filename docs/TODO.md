@@ -227,7 +227,7 @@ all working, and all unreachable for anybody who did not read the source. That a
 open item: the landing button asks *"didn't know how to say something?"* and runs the wrong engine
 because the right one lives on a screen with no door.
 
-Four surfaces today, two after:
+Four surfaces today, three after (`/dash` is kept on purpose — see step 2):
 
 | | lines | what it is |
 |---|---|---|
@@ -264,8 +264,12 @@ that class of fault rather than relocating it.
       verdict, where the value is still on screen, and already made it point at practice that
       really is sitting on the device. The taster ends in the same place — the same screen, with a
       genuine way past it.
-- [ ] **`/profile` is deleted; `/dashboard` becomes the account page.**
-- [ ] **The AI chat comes out of `/dashboard`.**
+- [ ] **`/profile` is deleted; `/dashboard` becomes `/account`.** Started 2026-09-11. The route is
+      renamed, not just repurposed — Timo's word for it is `/account`, and "dashboard" was the name
+      of the job the room does now.
+- [x] **The AI chat comes out of `/dashboard`.** Done 2026-09-11, with the merge. `mockChatReplies`
+      and the `ChatMessage` type are deliberately kept — #30 is a real plan and that mock is the
+      shape it was drawn in — but they have no caller now.
 
 **1.5.0 — the pre-stage, before any of the three (started 2026-09-11).** Two findings made this
 smaller than it looked.
@@ -335,18 +339,43 @@ Neither of the first two touches `/dash`, so neither blocks or is blocked by the
    know who is looking. Signed in you get the same cold funnel, "90 seconds. no signup." included,
    and no way through to your own practice. That is the gap between a funnel and the onboarding the
    App Store needs, and it is the taster-session question above.
-2. **Fold `/dash`'s parts in — as components, not pasted.** `HomePanel` already lives in
-   `app/components/` and is rendered by the room *and* `/dashboard`; that is the proven pattern and
-   the event cards, the drawer and the read-back line are the right size for it. Done that way the
-   room grows by wiring, not by 1377 lines. **Step 1 cleared the way for this**: there are now seven
-   components beside `HomePanel` and the room's JSX is wiring rather than markup.
-3. **`/dashboard` becomes the account page.** Last, because it is the only step that cannot break
-   a learner mid-session.
+2. **~~Fold `/dash`'s parts in — as components, not pasted.~~ Done 2026-09-11.** The cards and the
+   drawer became components; the engine became `lib/use-voice-entry.ts` and the derivations
+   `lib/use-entry-data.ts`. `/dash` went **1382 → 410 lines** and is now one of two hosts.
 
-**Blocking detail for step 3.** Sign-out exists in exactly one place — `/profile` — along with the
-email and auth-provider display. It has to land in `/dashboard` before `/profile` is deleted, and
-four links point at it: the account disc on `/dash`, the avatar on `/dashboard`, and both the debug
-pill and the profile pill in the room.
+   **The landing knows who is looking**, which is what Timo wanted this step for. Signed out with
+   nothing on the device is still the funnel, word for word. Anybody else — signed in, or with an
+   event planned on this browser — gets their own practice. The orb listens on the homepage exactly
+   as it does on `/dash`, and routes into the room's own functions instead of writing a hand-off key
+   and navigating.
+
+   **`/dash` stays.** An earlier version of this line said it was worth deleting after step 3.
+   That was an assumption, and Timo overruled it with a better reason: it is the manual control for
+   the half of the homepage no test can reach. Every check here drives the typed path, because the
+   harness aborts the realtime token — so the microphone has no automated cover and cannot get any,
+   and voice does not behave like text. Running the same sentence into both screens by hand is the
+   only way to tell "the homepage is broken" from "the merge broke it". The four hand-off keys
+   (`autoStartKey`, `eventBeatKey`, `stungKey`, `askPhraseKey`) stay with it.
+
+   Also new and worth knowing: the `blocked` phase has a typed way into the router. It was a dead
+   end, and building it found a worse fault — see the CHANGELOG.
+3. **~~`/dashboard` becomes the account page.~~ Done 2026-09-11 — as `/account`.** `/dashboard`
+   and `/profile` merged into one screen and both routes are gone. All seven links repointed. The
+   coach chat was cut with them, which is the other decision in this section.
+
+   **Still open, and it is the last thing in 1.5 that costs a learner anything:** the account pill
+   is a plain navigation with no snapshot, so it stays hidden while there is work to lose. That
+   guard was right when the pill went to a screen nobody needed mid-session; it is wrong now that
+   it goes to the only place a learner can sign out. Fixing it is not a one-liner: `stashRoomForAuth`
+   exists, but `restoreRoomAfterAuth` is wired to `onAuthStateChange` and a plain back-navigation
+   fires no auth event, so the restore needs a mount-time path as well — with its own guard against
+   restoring a run that should have stayed closed.
+
+**~~Blocking detail for step 3.~~ Cleared 2026-09-11.** Sign-out, the email and the auth provider
+all landed on `/account` before `/profile` was deleted, and every link was repointed. One
+correction to what this said: sign-out was in **two** places, not one — the verdict card has had
+its own since 1.1, and it stays there, which is the point of it. What `/profile` held alone was the
+sign-out you can reach when you are NOT mid-session.
 
 ---
 
