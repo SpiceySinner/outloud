@@ -1,5 +1,67 @@
 # Changelog
 
+## 2026-09-12 — the funnel gets its screen back
+
+Found by Timo, by voice, on a fresh browser: run the 90-second flow and it comes out mixed with the
+rest of the product. You are never let say what is hard for you, and the funnel breaks from there.
+
+Two faults, both from the 2026-09-11 merge of `/dash` into the homepage, and both invisible to
+every automated check, because the typed path never touches the voice stream.
+
+**1. The funnel's orb was the entry engine's orb.** The landing screen has two faces — the funnel
+for a first-time visitor, the entry engine for anybody with practice behind them — but the orb
+between them was wired to the engine on both. So the biggest thing on the screen, under "you
+understand Spanish. you just can't speak it.", opened a microphone into `/api/intent`: a classifier
+built for "what do you want to do?", handed "I freeze when I have to answer". It replies with a
+read-back into the stung intake, or with "I didn't catch what you want to do" — and on the funnel
+there is no header to put that line on, so the visitor heard a refusal and saw nothing change. Only
+the small "start talking." button reached the placement conversation.
+
+**2. The engine listened to the room's turns.** The voice session is one shared connection, and
+the engine subscribes to the same event stream the room does. Its listener had no guard for "the
+room has the screen", and it is registered first, because the hook is called above the room's own
+subscription. So every turn that server VAD ended inside the room was closed by the engine before
+the room saw it: `closeCapture` ran there, the room's handler then found nothing to finish, and the
+learner's Spanish attempt went to the intent router. The room's turn never ended.
+
+Neither is the router's fault. It is right about what it does; it was being handed sentences that
+were never for it.
+
+### What changed
+
+- `busy` — the engine's "somebody else has the screen" flag — now covers the funnel:
+  `!isLanding || showFunnel`. The decision about who is looking moved above the hook, so the hook
+  can know.
+- On the funnel the orb is the room's: tapping it does exactly what "start talking." does. The
+  engine's header, focus line and typed box render only on the other face.
+- The engine is deaf while busy. Its stream listener and `finishListening` both return before
+  touching a capture, and `say` refuses to speak into a live room. The room's handler ignores the
+  stream on the landing, which is the mirror image: one listener per face of the screen.
+- A stand-down when `busy` flips on: the idle timer, the read-back hand-off, a "when is it?" or
+  "how did it go?" waiting for its answer, and any capture the engine itself opened are dropped.
+  `ownsCaptureRef` is what makes "itself" answerable — `voice.capturing` cannot say whose window it
+  is. The phase resets during render, the way React asks for state that follows a prop; the effect
+  touches only refs, timers and the shared session.
+- The read-back timers go through one `handOff` with a handle, because a tap on the card during
+  the read-back used to start one session and the timer a second one on top of it.
+- `orbState` typed as its four literals. A return object widens them to `string`, which `tsc` had
+  been reporting on `/dash` since the merge.
+
+### How it was checked
+
+`funnel-separation-check.mjs`, run against the unchanged build first: case A failed exactly as
+reported — the funnel's orb was labelled "say what you want" and tapping it opened the engine's
+typed box under the funnel headline. After the change both cases pass. The router check in the
+room (4 intents), the five-case leaving check, the auth-survival check and the closing-panel check
+all still pass. The two page errors the leaving check now records are the production-build
+navigation fault already in TODO section 2 — the pill is clicked in two of its cases, and until
+this week the pill was hidden mid-session, so no click ever happened.
+
+**What this does not verify is the voice half.** No automated run connects the realtime session, so
+fault 2 is fixed by reading and reasoning, not by a green run. The proof is a real run on the
+phone: the funnel from a fresh browser, then the same sentence on `/dash`, which is what `/dash`
+is for.
+
 ## 2026-09-12 — leaving the room stops costing the room
 
 The account pill used to **disappear** the moment there was anything to lose. The comment beside it

@@ -181,6 +181,13 @@ export function useVoiceEntry(ctx: EntryContext, actions: EntryActions) {
   const pendingEventRef = useRef<PendingEvent | null>(null);
   /** The event whose "how did it go?" is currently on screen, if any. */
   const askingOutcomeRef = useRef<string | null>(null);
+  /** The read-back beat between understanding a sentence and acting on it. A stand-down cancels it. */
+  const handOffTimerRef = useRef<number | null>(null);
+  /**
+   * True while the open capture is one THIS engine opened. The voice session is shared with the
+   * room and `voice.capturing` cannot say whose window it is; this can.
+   */
+  const ownsCaptureRef = useRef(false);
 
   /*
    * The host, reachable from inside a callback without appearing in its dependency array.
@@ -194,6 +201,19 @@ export function useVoiceEntry(ctx: EntryContext, actions: EntryActions) {
     ctxRef.current = ctx;
     actionsRef.current = actions;
   });
+
+  /*
+   * The host has taken the screen: the engine is at rest, whatever it was doing.
+   *
+   * Adjusted during render, the way React asks for state that follows a prop, rather than in the
+   * stand-down effect below -- the two halves of one stand-down, split by what each is allowed to
+   * touch. This half is the engine's own state; that half is the shared voice session.
+   */
+  const [wasBusy, setWasBusy] = useState(ctx.busy);
+  if (ctx.busy !== wasBusy) {
+    setWasBusy(ctx.busy);
+    if (ctx.busy && phase !== "resting") setPhase("resting");
+  }
 
   /*
    * Stable local names for the host's actions, so the engine below reads exactly as it did when
@@ -277,6 +297,19 @@ export function useVoiceEntry(ctx: EntryContext, actions: EntryActions) {
   }
 
   /**
+   * The beat between reading a sentence back and acting on it, held so a stand-down can cancel
+   * it. Without the handle, a tap on the card during the read-back starts one session and the
+   * timer starts a second one on top of it.
+   */
+  function handOff(action: () => void) {
+    if (handOffTimerRef.current !== null) window.clearTimeout(handOffTimerRef.current);
+    handOffTimerRef.current = window.setTimeout(() => {
+      handOffTimerRef.current = null;
+      action();
+    }, readBackMs);
+  }
+
+  /**
    * Says a line out loud and resolves once the sound has actually stopped.
    *
    * The rule for what gets spoken: **the screen speaks when it is responding to something you
@@ -289,6 +322,9 @@ export function useVoiceEntry(ctx: EntryContext, actions: EntryActions) {
    * resolves on playback drained precisely so that cannot happen.
    */
   const say = useCallback(async (line: string) => {
+    // The connection is shared with the room. Once the room has the screen, its coach is the only
+    // voice on it; a line from here would land in the middle of somebody's turn.
+    if (ctxRef.current.busy) return;
     if (!line.trim() || !voice.isConnected()) return;
     setSpeaking(true);
     try {
@@ -302,6 +338,7 @@ export function useVoiceEntry(ctx: EntryContext, actions: EntryActions) {
   const rest = useCallback(
     (lead: string, alt = "", options: { silent?: boolean } = {}) => {
       clearIdle();
+      ownsCaptureRef.current = false;
       voice.abortCapture();
       voice.setMicWindow("closed");
       busyRef.current = false;
@@ -366,11 +403,19 @@ export function useVoiceEntry(ctx: EntryContext, actions: EntryActions) {
       setPhase("blocked");
       return false;
     }
+    // The host took the screen while the connection was being made. The stand-down effect has
+    // already run and found nothing to close; opening a capture now would hand it a live one.
+    if (ctxRef.current.busy) {
+      busyRef.current = false;
+      setPhase("resting");
+      return false;
+    }
     // The entry sentence is the learner talking about their own life, which is English. The pin is
     // a hint rather than a filter, so a Spanish sentence still comes through -- but leaving it to
     // auto-detect is what once turned a short reply into Korean.
     voice.setTranscriptionLanguage("en");
     voice.openCapture();
+    ownsCaptureRef.current = true;
     voice.setMicWindow("capturing", { patient: patientRef.current });
     setPhase("listening");
     // Q1. The single most important conversion in the app: a microphone with no vocabulary in
@@ -627,12 +672,12 @@ export function useVoiceEntry(ctx: EntryContext, actions: EntryActions) {
           const named = Number(result.resumeId.split(":")[2]);
           const beat = liveEvent.beats.find((item) => item.index === named) ?? nextBeat;
           if (beat) {
-            window.setTimeout(() => startBeat(liveEvent, beat.index), readBackMs);
+            handOff(() => startBeat(liveEvent, beat.index));
             return;
           }
         }
         const moment = moments.find((item) => item.id === result.resumeId);
-        window.setTimeout(() => resumeMoment(moment ?? null), readBackMs);
+        handOff(() => resumeMoment(moment ?? null));
         return;
       }
 
@@ -653,7 +698,7 @@ export function useVoiceEntry(ctx: EntryContext, actions: EntryActions) {
       if (result.intent === "ask_phrase" && result.askEn) {
         void say(line);
         const askEn = result.askEn;
-        window.setTimeout(() => startAskPhrase(said, askEn), readBackMs);
+        handOff(() => startAskPhrase(said, askEn));
         return;
       }
 
@@ -662,7 +707,7 @@ export function useVoiceEntry(ctx: EntryContext, actions: EntryActions) {
       if (result.intent === "stung" && result.scenario) {
         void say(line);
         const situationEn = result.scenario.situationEn;
-        window.setTimeout(() => startStung(said, situationEn), readBackMs);
+        handOff(() => startStung(said, situationEn));
         return;
       }
 
@@ -679,7 +724,7 @@ export function useVoiceEntry(ctx: EntryContext, actions: EntryActions) {
        * nothing.
        */
       const declined = result.intent === "talk";
-      window.setTimeout(() => {
+      handOff(() => {
         setPhase(declined ? "declined" : "kept");
         busyRef.current = false;
         // Understood, and nothing behind it. The corpus of what to build next -- and for `talk`,
@@ -695,7 +740,7 @@ export function useVoiceEntry(ctx: EntryContext, actions: EntryActions) {
             ? `${line} open chat isn't a thing I do. give me a real situation, or something you couldn't say.`
             : `${line} I can't build that one yet. I've kept it — it's the first thing when I can.`,
         );
-      }, readBackMs);
+      });
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps -- keepIt is a hoisted declaration and closes over nothing
     [openMic, say, planEvent],
@@ -704,10 +749,14 @@ export function useVoiceEntry(ctx: EntryContext, actions: EntryActions) {
   /** Closes the window, judges what came back, and only then spends a request on it. */
   const finishListening = useCallback(
     async (manual: boolean) => {
+      // Not the engine's capture. In the room the same stream carries the learner's turns, and
+      // closing one of those here would hand a Spanish attempt to the intent router.
+      if (ctxRef.current.busy) return;
       if (!voice.capturing) return;
       clearIdle();
       // Closed, then the mic, then the commit -- the buffer commit has to be the last thing that
       // happens while the track is still live.
+      ownsCaptureRef.current = false;
       const { speechSeen } = voice.closeCapture();
       voice.setMicWindow("closed");
       // Q1's other half. `spoke: false` is somebody who opened the mic and then said nothing,
@@ -789,6 +838,15 @@ export function useVoiceEntry(ctx: EntryContext, actions: EntryActions) {
   useEffect(() => {
     onVoiceEventRef.current = (event: RealtimeServerEvent) => {
       const type = event.type ?? "";
+      /*
+       * Deaf while the host has the screen. The room subscribes to this same stream, and this
+       * listener is registered first -- the hook is called above the room's own subscription --
+       * so without the guard it closed every server-VAD-ended turn in the room before the room
+       * saw it: `closeCapture` ran here, the room's handler then found nothing to finish, and the
+       * learner's Spanish went to `/api/intent`. Found by voice on 2026-09-12. The typed path
+       * never touches the stream, which is why no check had seen it.
+       */
+      if (ctxRef.current.busy) return;
       if (!voice.capturing) return;
       if (type === "input_audio_buffer.speech_started") {
         // They are talking, so the "said nothing" timeout no longer applies.
@@ -803,6 +861,37 @@ export function useVoiceEntry(ctx: EntryContext, actions: EntryActions) {
   useEffect(() => voice.onEvent((event) => onVoiceEventRef.current(event)), []);
 
   useEffect(() => clearIdle, []);
+
+  /*
+   * The host has taken the screen, so the engine lets go of everything it holds.
+   *
+   * The guards on the listener and on `finishListening` keep the engine out of the room's turns;
+   * this is the rest of it. A capture the engine opened on the landing must not run on into the
+   * room, a "when is it?" or "how did it go?" must not claim the room's first answer, and a
+   * read-back timer must not start a second session on top of the one the host just started.
+   *
+   * Only a capture the engine itself opened is aborted. By the time this runs the room may already
+   * have a live one of its own, and closing that would be the very fault this exists to end.
+   *
+   * The engine's own phase is reset during render, above; this half touches only refs, timers and
+   * the shared session.
+   */
+  useEffect(() => {
+    if (!ctx.busy) return;
+    clearIdle();
+    if (handOffTimerRef.current !== null) {
+      window.clearTimeout(handOffTimerRef.current);
+      handOffTimerRef.current = null;
+    }
+    if (ownsCaptureRef.current) {
+      ownsCaptureRef.current = false;
+      voice.abortCapture();
+      voice.setMicWindow("closed");
+    }
+    pendingEventRef.current = null;
+    askingOutcomeRef.current = null;
+    busyRef.current = false;
+  }, [ctx.busy]);
 
 
   /**
@@ -953,7 +1042,9 @@ export function useVoiceEntry(ctx: EntryContext, actions: EntryActions) {
     }
   })();
 
-  const orbState = speaking
+  // Typed as the literals, because a return object widens them to `string` and the canvas wants
+  // its own union. The same four names `OrbCanvas` uses; it does not export the type.
+  const orbState: "speaking" | "listening" | "thinking" | "idle" = speaking
     ? "speaking"
     : phase === "listening"
       ? "listening"
@@ -999,6 +1090,7 @@ export function useVoiceEntry(ctx: EntryContext, actions: EntryActions) {
   function standDown() {
     if (!voice.capturing && phase !== "listening" && phase !== "connecting") return;
     clearIdle();
+    ownsCaptureRef.current = false;
     voice.abortCapture();
     voice.setMicWindow("closed");
     busyRef.current = false;

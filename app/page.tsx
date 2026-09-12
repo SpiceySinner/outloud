@@ -1065,6 +1065,19 @@ export default function Home() {
    */
   const entryData = useEntryData({ previewByDefault: false });
   const [stepsFor, setStepsFor] = useState<string | null>(null);
+  /*
+   * Who is looking, in one line.
+   *
+   * Signed out with nothing on this device is a first-time visitor, and they get the funnel that
+   * has always been here -- "90 seconds. no signup." is true for them and only for them. Anybody
+   * else gets their own practice: a dated evening, an overdue phrase, or the honest empty version
+   * with a way in. Events are keyed to the browser rather than an account, so somebody who
+   * planned one before signing up still sees it.
+   *
+   * Decided above the engine rather than below it, because the engine has to know: the funnel is
+   * the room's own intake, and the engine is switched off for it (see `busy`).
+   */
+  const showFunnel = !authedEmail && !entryData.liveEvent && !entryData.pickUp;
   const entry = useVoiceEntry(
     {
       libraryState: entryData.libraryState,
@@ -1081,9 +1094,20 @@ export default function Home() {
       events: entryData.events,
       todayIso: entryData.todayIso,
       preview: entryData.preview,
-      // The engine goes inert the moment the room is doing anything else. It only ever drives the
-      // landing screen; a capture opening behind a live session would fight the room for the mic.
-      busy: !isLanding,
+      /*
+       * The engine drives exactly one face of the landing screen, and nothing else.
+       *
+       * `!isLanding`: a capture opening behind a live session would fight the room for the mic --
+       * and the engine listens to the same voice stream as the room, so inert has to mean deaf as
+       * well. The hook stands itself down on this flag.
+       *
+       * `showFunnel`: the funnel is the room's own intake, not the engine's. A first-time visitor
+       * who says what is hard for them is answering the placement question, and the intent router
+       * -- built for "what do you want to do?" -- must never hear it. Found by voice on
+       * 2026-09-12: the funnel's orb was this engine's orb, so the biggest thing on the screen sent
+       * a stranger's first sentence to the wrong classifier.
+       */
+      busy: !isLanding || showFunnel,
     },
     {
       /*
@@ -1101,16 +1125,6 @@ export default function Home() {
     },
   );
 
-  /*
-   * Who is looking, in one line.
-   *
-   * Signed out with nothing on this device is a first-time visitor, and they get the funnel that
-   * has always been here -- "90 seconds. no signup." is true for them and only for them. Anybody
-   * else gets their own practice: a dated evening, an overdue phrase, or the honest empty version
-   * with a way in. Events are keyed to the browser rather than an account, so somebody who
-   * planned one before signing up still sees it.
-   */
-  const showFunnel = !authedEmail && !entryData.liveEvent && !entryData.pickUp;
   /**
    * Picks a saved moment back up, here rather than via `/dash` and a page load.
    *
@@ -1777,6 +1791,10 @@ export default function Home() {
    */
   function handleRealtimeEvent(event: RealtimeServerEvent) {
     const type = event.type ?? "";
+
+    // On the landing screen the stream belongs to the entry engine, which shares the connection.
+    // The mirror of the engine's own `busy` guard: one listener per face of the screen.
+    if (isLanding) return;
 
     if (type === "input_audio_buffer.speech_started") {
       if (voice.capturing) {
@@ -5974,20 +5992,37 @@ export default function Home() {
               )}
 
               {/*
-                The orb listens here now, exactly as it does on `/dash` -- same hook, same phase
-                machine, same router. The room's own orb is still mounted behind this panel and
-                still disabled on the landing; it has a different job (a turn in a scene) and the
-                two must not become one control that guesses which it is.
-              */}
-              <button className="landing-orb-wrap" type="button" {...entry.orbProps}>
-                <OrbCanvas state={entry.orbState} className="landing-orb" size={440} />
-              </button>
+                Two orbs, one per face of the screen, and neither guesses which it is.
 
-              {entryData.focus && entry.phase === "resting" && !entry.retry ? (
+                On the funnel the orb is the way into the placement conversation -- the same
+                thing "start talking." below does, because a first-time visitor reaches for the
+                biggest thing on the screen and says what is hard for them. That sentence belongs
+                to the room's own intake. For anybody with practice behind them the orb listens
+                here, exactly as it does on `/dash`: same hook, same phase machine, same router.
+
+                The room's own orb is still mounted behind this panel and still disabled on the
+                landing; it has a third job (a turn in a scene).
+              */}
+              {showFunnel ? (
+                <button
+                  className="landing-orb-wrap"
+                  type="button"
+                  aria-label="start talking"
+                  onClick={() => enterRoom("speaks-first")}
+                >
+                  <OrbCanvas state="idle" className="landing-orb" size={440} />
+                </button>
+              ) : (
+                <button className="landing-orb-wrap" type="button" {...entry.orbProps}>
+                  <OrbCanvas state={entry.orbState} className="landing-orb" size={440} />
+                </button>
+              )}
+
+              {!showFunnel && entryData.focus && entry.phase === "resting" && !entry.retry ? (
                 <FocusLine label={entryData.focus.label} />
               ) : null}
 
-              {entry.micBlocked && !entry.orbBusy ? (
+              {!showFunnel && entry.micBlocked && !entry.orbBusy ? (
                 <form
                   className="dash-typed"
                   onSubmit={(event) => {

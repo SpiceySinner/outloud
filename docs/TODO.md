@@ -369,6 +369,13 @@ Neither of the first two touches `/dash`, so neither blocks or is blocked by the
    the document — so a reload mid-session costs nothing either, which it always used to. See the
    CHANGELOG.
 
+   **Funnel and entry engine, separated — 2026-09-12.** Found by voice on a fresh browser, not by
+   any check: the funnel's orb was the entry engine's, and the engine listened to the room's turns
+   through the shared voice session. Both in the CHANGELOG. The lesson for this section is that the
+   merge put two engines on one screen with one voice connection, and `busy` is now the single
+   thing that says whose it is. **Still to be proved by voice on the phone:** a fresh-browser run
+   through the funnel, then the same sentence on `/dash`.
+
 **~~Blocking detail for step 3.~~ Cleared 2026-09-11.** Sign-out, the email and the auth provider
 all landed on `/account` before `/profile` was deleted, and every link was repointed. One
 correction to what this said: sign-out was in **two** places, not one — the verdict card has had
