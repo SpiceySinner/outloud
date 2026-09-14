@@ -10,7 +10,10 @@
     "build": "vinext build",
     "start": "vinext start",
     "render:lines": "node --experimental-strip-types scripts/render-static-lines.ts",
-    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern work --ignore-pattern outputs --ignore-pattern .vinext --ignore-pattern .wrangler"
+    "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning checks/run.mjs unit structure",
+    "test:live": "node --experimental-strip-types --disable-warning=ExperimentalWarning checks/run.mjs live",
+    "test:all": "node --experimental-strip-types --disable-warning=ExperimentalWarning checks/run.mjs unit structure live",
+    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern work --ignore-pattern outputs --ignore-pattern .vinext --ignore-pattern .wrangler --ignore-pattern .vercel --ignore-pattern .output --ignore-pattern types/routes.d.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "2.110.7",

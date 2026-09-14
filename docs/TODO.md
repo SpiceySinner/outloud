@@ -169,9 +169,11 @@ in one.* So the 7-of-108 measurement below is not a number to admire — the mis
       **New and undecided:** answering a Spanish coach turn in English during the INTAKE now steps
       out immediately, where it used to count toward the two-strike nudge. It follows from the
       rule; it also bypasses a deliberate design, and it belongs with the question below.
-- [ ] **Give the harness a home in the repo.** The scratchpad was wiped between sessions and the
-      whole persona harness had to be reinstalled to answer one question. Second time this has
-      cost something today.
+- [x] **Give the harness a home in the repo — done 2026-09-14.** `checks/`, run by `npm test` and
+      `npm run test:live`, no new dependency. Seven checks moved in, each importing the real module
+      instead of restating it. `baselineComparison()` turns "prove the check against unchanged
+      code" from a note into a function that fails when a check cannot tell your change from HEAD.
+      See `checks/README.md` and the CHANGELOG.
 - [x] **The coach answers the question (2026-09-14).** `/api/aside` is two jobs in one engine and
       only the diagnostic one had a voice: the prompt banned Spanish outright, and `stuck` was a
       single-turn exception on top of an interview script. So the first follow-up question in a
@@ -195,9 +197,9 @@ The largest and least defined item, and the only one that could change what the 
 - [x] **Synthesise a set of runs** — done, and it earned its keep on the first sweep. Four personas
       along two axes (what they can produce; what they do when they cannot), driven through the real
       UI on the typed path. Twelve runs, all reaching the verdict, no console errors. See
-      [docs/features/synthetic-runs.md](features/synthetic-runs.md). The harness files still live in
-      the scratchpad — **the repo has no test infrastructure to put them in, and that is now the
-      blocker for making any of this repeatable by anyone but the session that wrote it.**
+      [docs/features/synthetic-runs.md](features/synthetic-runs.md). **~~The harness files still
+      live in the scratchpad.~~ Unblocked 2026-09-14:** `checks/` exists, and the persona sweep is
+      the obvious next resident — it is 1.3 in executable form.
 - [ ] **Store what the AI said** and analyse it as a corpus rather than judging it one screen at a
       time. Partly already there: `moments.conversation_turns_json` holds every character line and
       every reply of a saved run.
@@ -427,7 +429,7 @@ conversation and the card at the end.
 
       So the sentence we hand back as his win is the one the scene talked him into. That is the
       opposite of the 2026-09-14 scenario fix, which settled that **his words outrank the options we
-      put in front of him** — `pickScenario` in [coach/route.ts](app/api/coach/route.ts) now honours
+      put in front of him** — `pickScenario` in [coach/route.ts](../app/api/coach/route.ts) now honours
       that at the door, and the scene does not honour it once inside. Same rule, second altitude.
 
       This is a prompt question for `/api/converse`, not a detector: a character who wants the
@@ -463,9 +465,9 @@ conversation and the card at the end.
       being told anything about the conversation it is transcribing.
 
       The German one is its own problem. The transcriber is pinned to `en` or `es` and **never**
-      `de` — [realtime-token/route.ts:90](app/api/realtime-token/route.ts#L90),
-      [voice-session.ts:431](lib/voice-session.ts#L431),
-      [page.tsx:1707](app/page.tsx#L1707) — so for that turn the hint either never reached the
+      `de` — [realtime-token/route.ts:90](../app/api/realtime-token/route.ts#L90),
+      [voice-session.ts:431](../lib/voice-session.ts#L431),
+      [page.tsx:1707](../app/page.tsx#L1707) — so for that turn the hint either never reached the
       session or was ignored. This run is *after* the 2026-09-14 language fix, which was shipped
       explicitly unverified because only real audio exercises it. It is now not-yet-proven rather
       than proven wrong, for the reason in the next paragraph.
@@ -529,7 +531,7 @@ conversation and the card at the end.
       hesitations, English leakage — are the evidence behind half the teaching model, and on the
       voice path they are empty. Only the file-upload transcription path fills them.
 - [ ] **`MAX_REALTIME_SESSIONS_PER_DAY` defaults to 5 in production**
-      ([realtime-token/route.ts:36](app/api/realtime-token/route.ts#L36)). Five voice sessions per
+      ([realtime-token/route.ts:36](../app/api/realtime-token/route.ts#L36)). Five voice sessions per
       day per client, for everyone. Fine for a closed test, wrong the moment strangers arrive.
 
 ---
@@ -611,10 +613,13 @@ hypothetical.*
 ## 6. Housekeeping
 
 - [ ] **Three pre-existing TypeScript errors**, untouched for weeks and easy to fix:
-      `sessionId` in [retrieval/route.ts:135](app/api/retrieval/route.ts#L135), and `Fetcher` /
-      `D1Database` in [worker/index.ts:6](worker/index.ts#L6). They make `npx tsc --noEmit` useless
+      `sessionId` in [retrieval/route.ts:135](../app/api/retrieval/route.ts#L135), and `Fetcher` /
+      `D1Database` in [worker/index.ts:6](../worker/index.ts#L6). They make `npx tsc --noEmit` useless
       as a pass/fail gate, which is the actual cost.
-- [ ] **`npm run lint` picks up `.vercel/output`.** Slow and noisy; needs an ignore.
+- [x] **~~`npm run lint` picks up `.vercel/output`.~~ Done 2026-09-14.** 6748 errors, none of them
+      ours, on a command the new README tells a newcomer to run. `.vercel`, `.output` and the
+      vinext-generated `types/routes.d.ts` are ignored now; `npm run lint` exits 0 and means
+      something again.
 - [x] ~~**One test row sits in production `analytics_events`**~~ — moot: the whole table was
       dropped in 1.2, and the two rows that were actually ours moved to `kept_requests`.
 - [ ] **There is no local database.** The dev server talks to **production Supabase**, so every test

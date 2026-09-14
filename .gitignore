@@ -30,6 +30,9 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+# ...except the template, which holds names and comments and no values. Without the exception the
+# `.env*` line above swallows it and a fresh clone has no way to know what needs setting.
+!.env.example
 
 # vercel
 .vercel

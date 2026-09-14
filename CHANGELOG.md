@@ -1,5 +1,119 @@
 # Changelog
 
+## 2026-09-14 — a fresh clone can now be started by somebody who was not here
+
+The repo had no README, no `.env.example` and no setup of any kind. `.env` is gitignored, so a new
+person could clone this and had **no way to learn that 29 environment variables exist**, let alone
+which four have to be real before anything runs. The rules and the task split were written and the
+thing still could not be started.
+
+- **`.env.example`**, generated from the real `.env`: every name, every comment that explains why a
+  value is what it is, and **no values**. `.gitignore`'s `.env*` line would have swallowed it, so
+  `!.env.example` sits underneath with the reason written next to it.
+- **`README.md`** — install, the four variables that are not optional, the commands, and where to
+  read next. Plus the two things nobody should discover by accident: the dev server writes to the
+  production database, and `.env` is the only place a credential lives.
+- **`docs/Tests/TEST_RUN.md` is linked from somewhere people look**, which it never was. It belongs
+  next to rule 6: voice has no automated cover and cannot get any, so the manual run is not extra
+  credit, it is the only coverage half this app has.
+
+### The command in the README was broken when I wrote it down
+
+`npm run lint` reported **6748 errors, none of them ours** — all from `.vercel/output`, a known
+TODO item that had been sitting there as noise nobody looked at. It stops being noise the moment a
+README tells a newcomer to run it: a fresh clone would have opened with seven thousand errors and
+no way to tell they were pre-existing.
+
+`.vercel`, `.output` and the vinext-generated `types/routes.d.ts` are ignored now. `npm run lint`
+exits 0 and means something again.
+
+### One Supabase, shared
+
+Timo's call: the second seat uses the same production database, not a second project. So
+`docs/TASKS.md` gained four non-negotiable rules for working in there, and the two tasks that touch
+rows were rewritten around it. The retention job in particular now ships in two halves — a dry run
+that only reports what it *would* remove, and, after Timo has read that list, the half that
+actually removes. It is the one task on the list that can destroy data, and there is no local
+database to make a mistake in.
+
+## 2026-09-14 — the checks get a home, and a way to prove themselves
+
+Every check that has ever found something here lived in a scratchpad that is wiped between
+sessions. Twice this week the whole thing had to be rebuilt to answer one question. And a second
+person is about to start work on this repo with their own agent, which turns "the checks are
+somewhere else" from an annoyance into the thing that decides whether their changes are safe.
+
+`checks/` now holds them. **No new dependency:** node 22 strips TypeScript itself, so the runner is
+70 lines and the only thing missing was the `@/` alias, which is a 20-line resolve hook.
+
+```
+npm test          unit + structure - no server, no model, no credits, about a second
+npm run test:live prompt behaviour against the real model
+```
+
+### What moved in
+
+| | cases | |
+|---|---|---|
+| `unit/scene-turn` | 39 | English mid-scene reaches the coach; Spanish, however broken, stays an attempt |
+| `unit/stuck-signal` | 65 | reaching for words vs describing your problem, and what `strippedAsk` leaves behind |
+| `unit/voice-guards` | 47 | filler is not an answer; `saidInEnglish` without a word list |
+| `unit/phrase-recall` | 11 | every saved phrase is scheduled, `asked` still sorts first |
+| `unit/voice-dump` | 5 | the session's own trace reaches `__outloudVoiceDump()` |
+| `structure/dead-exports` | ratchet | 91 exports nothing imports. It may go down; it may not go up. |
+| `live/aside-answers` | 8 | four turns against the real model: does the coach answer, or interview you |
+
+Each imports the real module rather than restating it. That is the whole point: two checks in this
+repo have reported green while broken because they carried a copy of the pattern they were
+checking, and the copy was wrong in exactly the same way.
+
+### The part that is new rather than moved
+
+`baselineComparison()` runs the same probe against your working tree **and** against git, and says
+whether it can tell them apart.
+
+A green run proves your change works, or proves your check cannot fail. Those are indistinguishable
+in a log, and this repo has shipped the second one twice. So the rule is now a function rather than
+a note in a document:
+
+| | what it says |
+|---|---|
+| file unchanged from the ref | "nothing for this check to prove today" |
+| file changed, probe differs | the green run above means something |
+| file changed, probe identical | **fails** — your check is not measuring your change |
+
+Proven on the voice-session change: against `HEAD` (which now contains it) 4 lines both ways and
+nothing to prove; against `9a784eb` 4 lines against 0, so the check can tell them apart.
+
+It found a real fault in its own first probe within a minute. `setTranscriptionLanguage` returns
+early when nothing changed, so the probe silently recorded zero lines whenever anything earlier in
+the process had already left the singleton in Spanish — a probe that passes by not running. Pinned
+to `en` first.
+
+### Refusing to be reassuring
+
+- **`realModelRequired(t)`** reads `OUTLOUD_MOCK_AI` from `.env` and stops a live check rather than
+  letting it go green against fixtures. `OUTLOUD_MOCK_AI=true` short-circuits the model completely,
+  so a prompt check against it is reading a canned string.
+- **A missing dev server is a SKIP**, never a pass.
+- **There is no voice group and there cannot be.** Headless has no microphone. `checks/README.md`
+  says so in as many words, because the failure mode is an agent reporting "voice tested".
+
+### The harness itself was proved the same way
+
+A deliberately failing check was added, run, and removed: `FAIL unit/zz-proof 0/1`, exit code 1;
+exit code 0 once removed. A runner nobody has watched fail is not a runner.
+
+### AGENTS.md
+
+The repo had no guidance file of any kind — no `AGENTS.md`, no `CLAUDE.md`, no README. A fresh
+agent started from nothing and rediscovered the same six lessons by causing them again. It now
+carries: fix the scenario not the sentence; deterministic code owns facts and the model owns
+meaning; a check carrying its own copy proves nothing; prove it against unchanged code; a mock run
+of a prompt fault proves nothing; nothing automated ever covers voice. Plus the four that are
+dangerous rather than merely expensive — production Supabase behind the dev server, the realtime
+model as a voice bridge only, no free text to PostHog, no credential in a migration.
+
 ## 2026-09-14 — the trace can finally say which language it was listening in
 
 Timo's first full voice run came back with one Spanish turn transcribed as **German** — *"äh C und
