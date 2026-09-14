@@ -41,6 +41,7 @@ import {
   looksLikeDecodeLoop,
   mediaRecorderTypes,
   micConstraints,
+  saidInEnglish,
 } from "@/lib/voice-guards";
 import {
   voice,
@@ -1686,6 +1687,30 @@ export default function Home() {
     );
   }
 
+  /**
+   * Which language to pin the TRANSCRIBER to, which is not the same question as the one above.
+   *
+   * The scenario turn is the case that separates them, and it was wrong. The coach speaks it in
+   * English -- it names the person, sets the scene -- and ends on "show me what you would say, in
+   * Spanish, however it comes out". Its own instruction says so: *the learner speaks Spanish next,
+   * you do not.* So the answer to it is the learner's FIRST Spanish of the whole session, and the
+   * transcriber was pinned to English for exactly that turn. Spanish audio decoded as English
+   * words, which is what Timo hit on 2026-09-14: he spoke Spanish and got an English sentence back.
+   *
+   * `expectsEnglishAnswerNow` keeps the scenario turn, deliberately, because it answers a
+   * different question: is English a KNOWN and HANDLED reply here? On the scenario turn it is --
+   * `/api/coach` has a branch for somebody who says in English that they do not know how to say
+   * it, and stepping out to the aside instead would replace working help with a detour.
+   *
+   * One function answering two questions is how the wrong one won. Two questions, two functions.
+   */
+  function transcriptionLanguageNow(): "en" | "es" {
+    if (asideActiveRef.current) return "en";
+    if (flowPhaseRef.current === "opening") return "en";
+    if (flowPhaseRef.current === "coach" && coachPhaseRef.current === "framing") return "en";
+    return "es";
+  }
+
   function deriveMicWindow(): "closed" | "armed" | "capturing" {
     if (voice.capturing) return "capturing";
     if (micModeRef.current === "push" || micSleepingRef.current) return "closed";
@@ -1720,7 +1745,7 @@ export default function Home() {
      * get right.
      */
     if (!voice.capturing && !voice.awaitingTranscript) {
-      applyTranscriptionLanguage(expectsEnglishAnswerNow() ? "en" : "es");
+      applyTranscriptionLanguage(transcriptionLanguageNow());
     }
 
     voice.setMicWindow(deriveMicWindow(), {
@@ -2161,7 +2186,7 @@ export default function Home() {
       return true;
     }
     vlog("listen", "OPENING capture, resumingSpeech:", options.resumingSpeech === true);
-    applyTranscriptionLanguage(expectsEnglishAnswerNow() ? "en" : "es");
+    applyTranscriptionLanguage(transcriptionLanguageNow());
 
     clearTimers();
     setRoomNote(null);
@@ -2920,8 +2945,20 @@ export default function Home() {
 
     const sent: Array<{ who: "coach" | "you"; text: string }> = [...asideExchange, { who: "you", text }];
     setAsideExchange(sent);
-    // They kept talking instead of taking the offer, so the offer is no longer the live question.
-    setAsideOffer(null);
+    /*
+     * The offer stays on screen until we know what they said about it.
+     *
+     * This used to clear it here, on the reasoning that talking instead of tapping meant declining.
+     * It does not. Saying "yeah, I'd like that" is how somebody takes an offer out loud, and
+     * clearing it first meant the yes was sent as a fresh remark -- the coach then offered the
+     * same thing again with a new button, and the learner had said yes into a void. Timo found it
+     * on 2026-09-14 and it is the one thing users asked for by name: confirm by voice.
+     *
+     * `pendingOffer` carries only what the model needs to judge the answer. Whether the offer is
+     * taken is a judgment about meaning, in whatever language they said it in; what a taken offer
+     * DOES stays here, in `acceptAsideOffer`, so there is exactly one path and two ways into it.
+     */
+    const onScreen = asideOffer;
     setTurn("thinking");
     syncRealtimeMic();
 
@@ -2930,9 +2967,22 @@ export default function Home() {
         await fetch("/api/aside", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ exchange: sent, ...snapshot }),
+          body: JSON.stringify({
+            exchange: sent,
+            pendingOffer: onScreen ? { kind: onScreen.kind, labelEn: onScreen.labelEn } : null,
+            ...snapshot,
+          }),
         }),
       );
+      if (onScreen && next.acceptsPendingOffer) {
+        // The coach's confirming line is spoken by the leave-in below, so the thread keeps the
+        // yes and the room does what the button does. Nothing here re-asks.
+        setAsideExchange([...sent, { who: "coach", text: next.sayEn }]);
+        await acceptAsideOffer(onScreen);
+        return;
+      }
+      // They said something else, so the offer is no longer the live question.
+      setAsideOffer(null);
       showAsideTurn(next, sent);
     } catch (error) {
       const message = error instanceof Error ? error.message : "OutLoud could not answer that yet.";
@@ -2943,8 +2993,14 @@ export default function Home() {
     }
   }
 
-  async function acceptAsideOffer() {
-    const offer = asideOffer;
+  /**
+   * What a taken offer does. One path, and two ways into it: the button, and saying yes.
+   *
+   * `taken` is passed rather than read from state so the spoken route can hand over the offer it
+   * actually asked about -- by the time the model has answered, state may have moved on.
+   */
+  async function acceptAsideOffer(taken?: AsideResponse["offer"]) {
+    const offer = taken ?? asideOffer;
     if (!offer) return;
 
     if (offer.kind === "change_focus" && offer.newFocus) {
@@ -5117,28 +5173,42 @@ export default function Home() {
   }
 
   /**
-   * Somebody in the middle of a scene who says, in English, that they do not know how to say it
-   * has not produced a bad transcript and has not produced a Spanish attempt. They have asked for
-   * the coach.
+   * The coach/roleplay boundary, decided by the language rather than by the wording.
    *
-   * Without this the sentence goes to `looksBrokenAttempt` -- which keys on English filler words
-   * as evidence that English leaked into Spanish, so a clear English sentence trips it every time
-   * -- and the learner is shown "here's what I heard. fix anything that's wrong, then send." The
-   * transcription was perfect. Telling somebody who just asked for help that the problem is their
-   * pronunciation is worse than saying nothing, and it repeats for as long as they keep asking.
+   * Somebody mid-scene who says something in English has not produced a bad transcript and has not
+   * produced a Spanish attempt. They are talking TO us. Without this the sentence goes to
+   * `looksBrokenAttempt`, which reads English function words as evidence that English leaked into
+   * Spanish -- true of a half-Spanish sentence, exactly backwards for a whole English one -- and
+   * the learner is shown "here's what I heard. fix anything that's wrong, then send." The
+   * transcription was perfect. Telling somebody who just asked a question that the problem is
+   * their pronunciation is worse than saying nothing, and it repeats for as long as they keep
+   * asking.
    *
-   * The way out already exists and is already built: the aside is a room mode, the mic stays
-   * open, `/api/aside` carries the scene snapshot, and leaving it puts them back where they were.
-   * It was only ever reachable by pressing a chip. Now the asking reaches it, which is the point:
-   * a partner who becomes a coach the moment you ask is the thing this app is supposed to be.
+   * **This used to be `needsWordsEn` alone, and that was the wrong altitude.** A regex over asking
+   * phrases has no end: it was widened on 2026-09-11, again on 2026-09-12, and a live session on
+   * 2026-09-14 still produced the confirm box -- "How do I order a water?", where the only thing
+   * wrong was that the verb was not one of the four the pattern happened to list. Each widening
+   * fixed the sentences in front of it and left the next ones to be found by a person. So the
+   * decision moved to the question the scenario actually asks, which has two answers and no tail:
+   * is there any Spanish in this at all?
+   *
+   * `needsWordsEn` stays, first, and still earns its place -- the coach route reads the same
+   * signal to know that words were asked for rather than merely that English was spoken, and it
+   * catches an ask wrapped around Spanish ("I want to say quiero un agua") that the language gate
+   * correctly refuses to call English.
+   *
+   * The way out already exists and is already built: the aside is a room mode, the mic stays open,
+   * `/api/aside` carries the scene snapshot, and leaving it puts them back where they were. A
+   * partner that becomes a coach the moment you speak to it in English is the thing this app is
+   * supposed to be.
    */
-  function stuckAskShouldStepOut(text: string) {
+  function englishTurnShouldStepOut(text: string) {
     if (asideActiveRef.current || !canStepOut) return false;
     // Not during the intake. English is the expected answer there, and /api/coach already answers
     // a stuck admission by handing over the words -- stepping out would replace working help with
     // a detour.
     if (expectsEnglishAnswerNow()) return false;
-    return needsWordsEn(text);
+    return needsWordsEn(text) || saidInEnglish(text);
   }
 
   /**
@@ -5158,9 +5228,10 @@ export default function Home() {
       ? lowConfidence || transcript.includes("...") || wordCount <= 1
       : lowConfidence || looksBrokenAttempt(transcript) || transcript.trim().length < 3;
 
-    // Asked for, not mis-heard. Checked before `suspicious` is acted on, because this sentence
-    // trips every one of those checks and the confirm box is the wrong answer to all of them.
-    if (stuckAskShouldStepOut(transcript)) {
+    // Addressed to us, not mis-heard. Checked before `suspicious` is acted on, because an English
+    // sentence trips every one of those checks and the confirm box is the wrong answer to all of
+    // them -- it claims we misheard something we heard perfectly.
+    if (englishTurnShouldStepOut(transcript)) {
       void enterAside("stuck", transcript);
       return;
     }
@@ -5232,7 +5303,7 @@ export default function Home() {
 
     // Typing it, or confirming it after the transcript box, has to mean the same thing as saying
     // it. Otherwise the help you get depends on which input you happened to use.
-    if (stuckAskShouldStepOut(trimmed)) {
+    if (englishTurnShouldStepOut(trimmed)) {
       await enterAside("stuck", trimmed);
       return;
     }

@@ -266,6 +266,20 @@ export function initTracking() {
      * trade this app has to make rather than picking one side of it.
      */
     disable_session_recording: false,
+    /*
+     * The console is not recorded, and this line has to be here rather than left to a default.
+     *
+     * Found 2026-09-14, in a log Timo pasted: every line carried `posthog-recorder.js` as its
+     * source, because the replay recorder patches `console`. The voice trace prints the learner's
+     * transcript verbatim -- `transcript: "I would say it's the vocabulary."` -- so with console
+     * capture on, free text walks straight out to PostHog through the one door the masking does
+     * not cover. `maskTextFn` sees rendered DOM text; it never sees a console call.
+     *
+     * It is off by default in posthog-js, but it is also a PROJECT setting that can be switched on
+     * from the PostHog UI by anybody, at which point this app starts leaking without a deploy.
+     * Stated here, it cannot.
+     */
+    enable_recording_console_log: false,
     session_recording: {
       maskAllInputs: true,
       maskTextSelector: "*",

@@ -1,5 +1,450 @@
 # Changelog
 
+## 2026-09-14 — the trace can finally say which language it was listening in
+
+Timo's first full voice run came back with one Spanish turn transcribed as **German** — *"äh C und
+äh bei Stack auch so, bitte."* for *Sí, un bistec también, por favor*. The transcriber is pinned to
+`en` or `es` and never `de`, so for that turn the hint either never landed or was ignored. Which of
+the two, the log he sent could not say — and it is the question the 2026-09-14 language fix was
+shipped without an answer to.
+
+**Two loggers, one buffer, and only one of them was in it.** The room's `vlog` writes to the console
+*and* to `window.__outloudVoiceLog`, which is what `__outloudVoiceDump()` prints. `VoiceSession`'s
+own `log()` wrote to the console only. So a trace pasted back after a session went wrong showed the
+microphone opening and closing and nothing about the connection underneath it: not the language
+switches, not a dropped `session.update`, not a data channel that failed to open. Every one of those
+looks identical from the outside — "the mic does nothing" — which is the reason this file logs at
+all.
+
+`log()` now pushes the same line into the same array, with the same timestamp format, so both
+sources interleave in the order they happened. It sits behind the existing `if (!this.debug) return`
+and formats values the way `vlog` does, since a joined string cannot render an object the way
+`console.log` can. **With tracing off, nothing in this runs.**
+
+### Verified
+
+`dump-buffer-check.mjs` bundles `lib/voice-session.ts` with esbuild and drives the real singleton
+through a real public method. Run against **both** versions, because a check that only passes is not
+a check:
+
+| | buffer lines | console lines | language switch recorded |
+|---|---|---|---|
+| `HEAD` | **0** | 4 | no |
+| now | **4** | 4 | yes |
+
+Same console output on both sides — nothing moved out of the console, the buffer gained a copy.
+Every buffered line carries the room's `HH:MM:SS.mmm` prefix.
+
+**Known limit:** `__outloudVoiceDump()` is defined by the room. Opening `/dash` directly in a fresh
+tab gives you the buffer but no way to print it; coming from `/` in the same tab has both.
+
+## 2026-09-14 — the scenario you name is the scenario you get
+
+Timo's rule, and it is the whole fix: *wenn ich sage, welches Szenario ich möchte, dann nehmen wir
+das, egal ob es vorgeschlagen war.* He was offered a cafe and a friend, said he wanted a restaurant,
+and the session put him in the cafe.
+
+**Why it ignored him.** `pickScenario` tried to MAP his answer onto one of the two offered
+directions by counting the words longer than three characters it shared with each. An option's own
+text carries words like *want*, *order*, *about*, *talk* — so a sentence containing any one of them
+scored above zero. Below that sat an escape hatch for answers matching neither option, and it only
+opened at six words or more. "in a restaurant" is three words and a completely different place, so
+it never opened, and the fallback was option A.
+
+The same shape as the two before it this week: a word list standing in for a judgment. So the
+matching is gone. What is left is the part that is genuinely closed and cannot grow:
+
+| they said | it resolves to |
+|---|---|
+| an ordinal — "the first one", "die zweite" | that option |
+| bare agreement — "yes", "egal", "you choose" | option A, their own context |
+| anything else | **their words, exactly as they said them** |
+
+The model still gets the raw answer and both options, so a pointer this cannot read — "the cafe
+one" — is resolved where that judgment belongs. The scenario prompt now says the rest out loud:
+what they said outranks anything you put in front of them, and never steer them back to an option
+they turned down.
+
+### Verified against the real model, end to end
+
+`my-scenario-wins.mjs` walks the room on the dev server, answers the opening question, waits for
+the framing turn to offer two directions, and then names a third.
+
+| | |
+|---|---|
+| offered | "Explaining your day to a friend" · "Returning something to a shop" |
+| he said | "I want to do it in a restaurant" |
+| the scene it built | *"This is Luis, the restaurant manager — he's busy and a bit impatient. Show me what you would say to return a dish and explain what's wrong, in Spanish."* |
+
+His place won. Worth noticing, and left alone: it kept the TASK from the option it had offered —
+returning something — and moved it into his restaurant. He named a place and no task, so something
+had to fill that in, and reusing the one already on the table is a defensible way to do it. If it
+should instead ask what he wants to do there, that is a separate call.
+
+`scenario-pick-check.mjs` covers the resolver over fourteen realistic answers, including four in
+German. It reads the real function out of the route and refuses to run if it no longer looks like
+what it mirrors — a check that quietly drifts from its subject has reported green here twice.
+
+## 2026-09-14 — the first Spanish of the session was transcribed as English
+
+Timo, from a real voice session: *"warum macht das direkt englisch, ich hab spanisch gesprochen"*.
+
+`expectsEnglishAnswerNow()` was answering two different questions with one boolean, and the
+scenario turn is where they come apart.
+
+The coach speaks that turn in English — it names the person, sets the scene. Its own instruction
+ends: *"Then invite them: show me what you would say -- in Spanish, however it comes out"*, and
+spells it out, *the learner speaks Spanish next, you do not.* So the answer to it is the learner's
+**first Spanish of the whole session**, and the transcriber was pinned to English for exactly that
+turn. Spanish audio, decoded into English words.
+
+| | what language will they answer in? | is English a known, handled reply? |
+|---|---|---|
+| opening | English | yes |
+| coach framing | English | yes |
+| **coach scenario** | **Spanish** | **yes** |
+| scene turn | Spanish | no |
+
+One function, two questions, and the wrong answer won. `transcriptionLanguageNow()` now answers
+the first; `expectsEnglishAnswerNow` keeps the second and keeps the scenario turn, because
+`/api/coach` has a branch for somebody who says in English that they cannot say it, and stepping
+out to the aside there would replace working help with a detour.
+
+**Not verified end to end, and it cannot be here.** This only bites on real audio, and the harness
+aborts the realtime token — the automated path has never connected a microphone and never will. The
+reasoning is on the page above; the proof is a voice session on `/dash`.
+
+His log stops one turn short of the moment, which fits: the last transcript in it is "Ordering
+something", an answer to the framing turn's *"ordering at a cafe, or telling a friend about your
+weekend?"* The scenario turn is the next one.
+
+### Also in that log, and it matters more
+
+Every line he pasted carried **`posthog-recorder.js`** as its source. The replay recorder patches
+`console`, and the voice trace prints the learner's transcript verbatim:
+
+```
+transcript: "I would say it's the vocabulary."
+```
+
+The replay masking covers rendered DOM text and typed input. `maskTextFn` never sees a console
+call. So with console capture on, free text walks out to PostHog through the one door the masking
+does not cover — against the rule this app has had since the tracking went in.
+
+It is off by default in posthog-js. It is also a **project setting**, switchable from the PostHog
+UI by anybody, at which point the app would start leaking with no deploy. `enable_recording_console_log: false`
+is now stated in `initTracking`, so it cannot be. Confirmed in the built bundle. The existing mask
+check still reports nothing readable.
+
+## 2026-09-14 — the offer stopped being a lens
+
+Timo sent four turns of a real conversation. The coach had taught him *quisiera un bistec, por
+favor*:
+
+| | |
+|---|---|
+| **you** | Ah, quisiera un bistec, por favor. Is that correct? |
+| **coach** | You want to focus on vocabulary, especially words for food and ordering. What part of ordering food feels hardest to you? |
+| **you** | Wait, wait, wait, before we talk about that, what does Casiera actually mean? |
+| **coach** | Casiera means cashier... You want to know vocabulary meanings like that. Let's focus on vocabulary retrieval. |
+| **you** | No, I mean quisiera. |
+| **coach** | You want to focus on the word "quisiera." Is that right? |
+
+Three restatements of a focus he never asked about, a confident meaning invented for a word the
+microphone mis-heard, and the word he actually asked about never explained. *"desto länger ich mit
+dem Coach rede, desto komischer wird es"* — and the longer it ran, the truer that got.
+
+### Three causes, and the first one was mine, from this morning
+
+**The pending offer was written as an early return.** It replaced the turn guidance entirely, so
+once an offer was on screen every message was read as an answer to it. A question became a thing to
+restate as a focus. That is where "you want to focus on the word quisiera, is that right?" comes
+from: the instruction said that when you cannot tell whether they accepted, ask one yes-or-no
+question about the offer. It is a prefix now, and it defers — **their question outranks our offer**,
+answered without the offer being mentioned at all. The acceptance half stays.
+
+**The mission statement was the diagnostic one for both asides.** *"Find out what is actually in
+their way"* is right for somebody who walked out without saying why. Pointed at somebody asking what
+a word means, it is a standing order to find a difficulty in the question.
+
+**The offer menu was the diagnostic ladder for both asides.** Name a different situation, name a
+different difficulty, otherwise resume — handed to a coach whose learner asked about one word. A
+word-asking aside now has exactly one offer: go back and use it. No focus change, no scene change,
+no starting over.
+
+Plus the mis-hearing: if they ask about a word that appears in nothing either of you said, the
+microphone mis-heard a word you did say. Answer about the real one; never invent a meaning for a
+word that was never in the conversation.
+
+### The same four turns, replayed against the real route
+
+| | |
+|---|---|
+| Ah, quisiera un bistec, por favor. Is that correct? | Yes, your sentence works perfectly. "Quisiera" is a polite way to say "I would like." |
+| ...what does Casiera actually mean? | Casiera is not a Spanish word here. The microphone heard "casiera" but the right word is "quisiera," which means "I would like." |
+| No, I mean quisiera. | "Quisiera" means "I would like." It is polite and common for ordering food. |
+| Yes, what does that word mean? | "Quisiera" means "I would like." |
+
+Four turns, no diagnosis, and it names the mis-hearing itself. `aside-timo-transcript.mjs` keeps his
+lines verbatim and fails on the shape rather than the wording. Voice acceptance, the four-turn
+drive and the diagnostic aside all still pass — that last one matters most here, because three of
+these four changes narrow what the coach may do and the aside for somebody who walked out without
+saying why has to keep every bit of it.
+
+## 2026-09-14 — saying yes is how you take an offer
+
+Timo, and he named why it matters: *viele User haben Wert darauf gelegt, das via Stimme zu
+bestätigen.* The coach offered to change the focus. He said **"Yeah, I would like that."** It
+offered the same thing again, with a fresh button.
+
+Taking an offer had exactly one way in, and it was a tap. The room's own comment said so:
+
+> *They kept talking instead of taking the offer, so the offer is no longer the live question.*
+
+Talking instead of tapping is not declining. It is how a person says yes to a voice interface. The
+offer was cleared before the sentence was sent, so the yes arrived as a fresh remark with nothing
+to attach to, and the coach did the only thing left: offer again.
+
+### What changed
+
+- The offer stays on screen until we know what they said about it, and goes to `/api/aside` as
+  `pendingOffer` — its kind and its label, nothing more. Sending the whole offer back would give
+  the model a second chance to change its mind about something already in front of somebody.
+- `acceptsPendingOffer` on the response. **The model judges it**, deliberately: whether a sentence
+  accepts an offer is a judgment about meaning, in whatever language it was said in. Timo answers
+  in German as often as English, and a list of yes-words is the shape of fix that has already
+  failed twice in this repo this week.
+- An offer on screen outranks the turn index, in the real guidance and in the mock both. Accepted:
+  confirm in one line, `done=true`, and never re-offer. Declined or changed the subject: carry on
+  with what they actually said. Genuinely unclear: one yes-or-no question about that offer alone.
+- `acceptAsideOffer(taken?)` takes the offer as an argument, so the spoken route hands over the one
+  it asked about. **One path, two ways into it** — a spoken yes does exactly what the button does.
+
+### Two more the full drive caught
+
+Neither was visible in a single turn, which is the argument for driving the whole thing.
+
+**The closing line came out in Spanish** — *"vamos a volver y usar quiero un agua para pedir."* The
+teaching voice says Spanish is the point, and the model applied it to a sentence about going back.
+Now: the only Spanish is the line they need and the word being explained; everything said *about*
+it is English, because a Spanish closing line is one more exercise on the way out.
+
+**It taught one more thing after "got it, thanks."** The closing turn is now one short English
+sentence about going back and nothing else.
+
+### Verified
+
+Against the real model, because the mock cannot test a prompt:
+
+| said to a pending offer | accepted |
+|---|---|
+| "Yeah, I would like that." | yes |
+| "ja, gerne" | yes |
+| "yes please" | yes |
+| "no, that's not it" | no |
+| "hmm, what does pedir mean?" | no — and it answered the question |
+
+And in a browser against the mock build, which is the half the model cannot prove:
+`say-yes-to-the-offer.mjs` walks the funnel into a scene, steps out by asking in English, talks
+until the coach lands an offer, then **types "yes please" instead of pressing it** — the aside
+closes and the scene is back. Three further full drives end in one English line and the button.
+
+## 2026-09-14 — the coach answers the question
+
+Timo, on the aside this time. The coach gave him *agua, por favor*. He asked whether *sí, un agua,
+por favor* also worked. It replied:
+
+> *You seem unsure about adding words like "sí" or "un" in your sentence. Is it the grammar or the
+> vocabulary that feels tricky to you?*
+
+A question about a sentence, answered with a question about the person who asked it.
+
+### It was not the model wandering off
+
+`/api/aside` is two jobs in one engine, and only one of them had a voice.
+
+| trigger | why they are here | what the coach should do |
+|---|---|---|
+| `learner`, `offered` | walked out, reason unknown | find out what is in the way, offer a change |
+| `stuck` | asked for words | give the words, then answer what they ask about them |
+
+The prompt was written for the first. **"ENGLISH ONLY. Not one Spanish word, not even a quoted
+phrase"**, and under what-you-must-not-do, *"do not translate anything, do not give them a Spanish
+word or pattern"*. `stuck` was added later as a single-turn exception: turn 0 teaches. Turn 1 fell
+straight back into the interview script — *"ask ONE question that narrows it"* — an instrument
+built to narrow a complaint, pointed at somebody who had just asked about a sentence.
+
+So every follow-up question in a word-asking aside was going to land that way. The reply Timo got
+was the prompt working exactly as written.
+
+### The trigger now rewrites the whole aside, not its opening line
+
+- `asideVoice(trigger)` replaces the "how you talk" block. Under `stuck`: teaching, Spanish is the
+  point, **answering comes first**, and never answer a question about the language with a question
+  about them — not how they feel, not whether it is the grammar or the vocabulary. Being told what
+  your question reveals about you is what they stepped out of the scene to escape.
+- `asideMustNot(trigger)` replaces the line that flatly contradicted a `stuck` aside. The `stuck`
+  version guards the other failure: do not turn a quick answer into a lesson.
+- A turn-guidance branch for every `stuck` turn after the first. If they asked whether their own
+  version works, say yes or no first, then why — and if it works, let them keep theirs, because
+  theirs is the one they will remember. Keep answering while they are still asking; offer to go
+  back once nothing is left hanging.
+- Both non-`stuck` triggers keep the diagnostic prompt word for word, plus one new line: answer a
+  direct question before asking one of your own.
+
+### Two more, found by driving the whole aside instead of one turn
+
+Timo asked for a second scenario the same evening: *ask how to order a water, then ask what agua
+means.* His exact exchange already answered correctly by then — *"Puedo means I can or may"* — so
+the screenshot he sent was almost certainly produced by the prompt as it stood before this change.
+Driving four turns end to end found two faults that a single turn could not.
+
+**The English said twice.** *"agua means water. agua means water."* The teaching voice says put the
+English under the Spanish line, and the model obeyed it for an answer that was already English.
+It now says that rule applies to a Spanish line, and that a word's meaning is said once.
+
+**An aside that would not end.** After *"got it, thanks"* the coach repeated its opening line and
+`done` stayed false, so the detour ran on toward its turn budget. The rule was there —  offer to go
+back once nothing is left hanging — and it was too quiet to beat four turns of answering. Now: the
+moment they signal they have it, or say anything that is not a question, offer resume THAT turn. An
+aside that will not end is the scene they walked out of, wearing a different hat.
+
+Driven again afterwards, all four turns: the line with its English, *agua means water* once, *por
+favor means please* once, *"yes, quiero un agua works"* with the reason, and then a close with the
+**go back to the cafe** button.
+
+### Verified against the real model, because a mock would prove nothing
+
+This is a prompt fault, and `OUTLOUD_MOCK_AI` short-circuits the model entirely — a green mock run
+here would have been worthless. Two live calls against the dev server; the route is stateless and
+writes nothing.
+
+Timo's exact exchange, replayed: **"Yes, you can say 'Sí, un agua, por favor.' It means 'Yes, a
+water, please.' It works well and sounds polite."** Twice, consistently.
+
+And the half that could have been broken by this: a `learner` aside still opens *"You stepped out.
+What's on your mind right now?"* — a question, no Spanish, no teaching.
+
+## 2026-09-14 — coach or roleplay, decided by the language
+
+Timo, on the third go at this: *"wir optimieren hier nicht fuer einzelne Saetze, wir optimieren
+fuer das Szenario."* He is right, and the two fixes before this one were the wrong shape.
+
+Both widened a regex over English asking phrases. Both passed their checks. And a live session
+still produced *"here's what I heard. fix anything that's wrong, then send."* — this time for
+**"How do I order a water?"**, where the only thing wrong was that the verb was `order` and the
+pattern listed four: say, ask, tell, put. Every other thing a learner does in a scene — order, pay,
+book, greet, apologise, complain, explain, invite — fell straight through.
+
+A list of phrasings has no end. Each widening fixed the sentences in front of it and left the next
+ones to be found by a person, in a real session, being told their pronunciation was the problem.
+
+### The decision moved
+
+A turn in a Spanish scene has two cases and no tail:
+
+| | |
+|---|---|
+| Spanish, however broken | an attempt at the scene. Judge it. |
+| English, whatever it says | not an attempt. The learner is talking **to** us. |
+
+`looksBrokenAttempt` reads the words "the", "you", "do", "is" and "know" as evidence that English
+leaked into a Spanish attempt. That is right for a half-Spanish sentence and exactly backwards for
+a whole English one, where those words are simply what English is made of — so it claimed to have
+misheard every sentence it had heard perfectly.
+
+`saidInEnglish` answers the question the scenario actually asks: is there any Spanish in this at
+all? Deterministic, function words only, because content words are endless and a beginner's
+vocabulary is tiny — what nobody produces by accident is the grammar around them. An accent or an ñ
+counts double. Two English markers are needed, so a stray "okay" is not a sentence addressed to us.
+Words that are both — "me", "no", "a", "son" — are evidence of neither and belong to no list.
+
+`needsWordsEn` stays, and still runs first. It tells the coach route that words were *asked for*
+rather than merely that English was spoken, and it catches an ask wrapped around Spanish — *"I want
+to say quiero un agua"* — which the language gate correctly refuses to call English.
+
+### A change in the intake, found by accident and worth a decision
+
+The harness walked itself into the aside before it ever reached a scene. It was answering the
+coach's Spanish turns with an English problem description, and that now steps out immediately —
+where it used to count toward `noteIntakeAsideSignal`'s two-strike nudge.
+
+That follows from the rule and is arguably what the rule is for. It also bypasses a deliberate
+design, and 1.3a already carries the open question of whether stepping out stalls the conversation.
+Flagged rather than tuned.
+
+### Verification
+
+**End to end, in a browser, for the first time on this fault.** `asks-reach-the-coach.mjs` walks
+the funnel through the intake and the verdict into a real Spanish scene turn, types Timo's exact
+sentence, and asserts the aside opened rather than the confirm box. It passes.
+
+Typed rather than spoken, and here that is not a compromise: `submitAttempt` runs the same
+`englishTurnShouldStepOut` the captured-transcript path runs, deliberately, so the help you get
+does not depend on which input you used. What typing cannot reach is the confirm box itself.
+
+`scene-turn-check.mjs` mirrors the room's decision at the unit level over 25 English utterances —
+asking, choosing, complaining, apologising, stalling — and 14 Spanish ones including broken and
+mixed. 39 of 39. The false-positive set in `stuck-unit.mjs` still passes: 27 caught, 20 ignored.
+
+## 2026-09-12 — asking for words, in the shapes people actually use
+
+Timo, mid-funnel, by voice: ask something in English and the confirm box comes back. *"Here's what
+I heard. fix anything that's wrong, then send."* The transcription was perfect. He had asked a
+question.
+
+This detector was widened once before, on 2026-09-11, after a real session produced exactly this.
+That fix was right and too narrow: it taught the app the ASKING shape but only the phrasings that
+happened to be in front of it.
+
+**Why a miss is expensive, and it is not this detector's doing alone.** The confirm box appears
+when `needsWordsEn` says no and `looksBrokenAttempt` says yes. The second one reads "the", "you",
+"do", "is", "know" and "want" as evidence that English leaked into a Spanish attempt — so it says
+yes to very nearly every English sentence. The two together mean a phrasing the detector misses is
+not merely un-helped. It is told its pronunciation was the problem.
+
+**Measured rather than guessed.** Twenty-three ways a half-fluent learner asks for a word, written
+down before running anything, then put through both functions:
+
+| | before | after |
+|---|---|---|
+| reached the coach | 9 | 23 |
+| got the confirm box | 11 | 0 |
+| scored as a Spanish attempt | 3 | 0 |
+
+The three that were scored are the quieter half of the same fault. *"I want to say I'll be there at
+eight"* contains none of the words `looksBrokenAttempt` hunts for, so it was never suspicious — it
+went to the evaluator as if it had been an attempt at Spanish. `strippedAsk`, ten lines further
+down the same file, already knew that shape.
+
+Eleven alternatives added, each a request for words that cannot be read as anything else: bare
+"how to say", "X in Spanish", "the word for X", "which one do I use", "is it X or Y", "I want to
+say X", "help me say X", "what does X mean", "what was that word". The false-positive set this file
+has paid for twice — people DESCRIBING their problem, which is what the opening question asks them
+to do — is pinned in `stuck-unit.mjs` and still passes: 27 caught, 20 correctly ignored.
+
+### What is NOT fixed, and it is a decision rather than a patch
+
+`looksBrokenAttempt` cannot tell a broken Spanish attempt from a clean English sentence. It never
+could; enumerating ask phrasings works around it. So during a Spanish turn, English that is not a
+request for words still gets the confirm box — *"I don't like the way I sound"*, *"I understand a
+lot but the words disappear"*. Said in the opening, where English is the expected answer, none of
+this applies and the suspicion router never consults it.
+
+The honest claim for that screen is narrow: it means "I heard words and they might be wrong, check
+them". A sentence with no Spanish in it at all is not that, whatever else it is. What should happen
+instead — step out to the coach, answer in English inside the scene, or nudge back to Spanish — is
+a design call with a real cost attached, and 1.3a already carries the open question of whether
+stepping out stalls the conversation.
+
+### Verification, and its limit
+
+Unit level, against the real file, both directions. **The path itself cannot be reached without a
+microphone**: both callers of `routeCapturedTranscript` are voice paths, so nothing typed ever
+reaches the confirm box, and no automated run here connects the realtime session. The sentence-level
+behaviour is verified. That it lands correctly in a live scene is not, and `/dash` is what that is
+for.
+
 ## 2026-09-12 — the funnel gets its screen back
 
 Found by Timo, by voice, on a fresh browser: run the 90-second flow and it comes out mixed with the

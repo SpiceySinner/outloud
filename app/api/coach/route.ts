@@ -231,51 +231,59 @@ function realAttemptCount(state: CoachState) {
   ).length;
 }
 
-// Map the learner's answer to the framing question onto one of the offered directions. The
-// model sees the raw answer too; this only gives it a stable `chosenScenario` to anchor on.
+/**
+ * Which situation the session is built in, once they have answered the framing question.
+ *
+ * **Their word wins.** Timo's rule, 2026-09-14, and it replaces what was here: *wenn ich sage,
+ * welches Szenario ich möchte, dann nehmen wir das, egal ob es vorgeschlagen war.*
+ *
+ * What was here tried to MAP their answer onto one of the two offered directions, by counting how
+ * many words longer than three characters the answer shared with each option. That is a decent
+ * idea and it fails on ordinary English. He was offered "ordering at a cafe" and said he wanted a
+ * restaurant; the option's own text carries words like "want" and "order", his sentence carried
+ * one of them, the option scored above zero, and the escape hatch below it only opened for answers
+ * of six words or more. So "in a restaurant" -- three words, a completely different place --
+ * resolved to the cafe, and the app practised the scene he had just turned down.
+ *
+ * The shape of that bug is the same one this repo has now paid for three times in a week: a list
+ * of words standing in for a judgment. So the matching is gone. What is left is the part that is
+ * genuinely closed and cannot grow:
+ *
+ *   an ordinal        -- "the first one", "die zweite" -- points at an option, so take it
+ *   bare agreement    -- "yes", "sure", "egal", "you choose" -- they deferred, so option A stands
+ *   anything else     -- their words, exactly as they said them
+ *
+ * The model still gets the raw answer and both options, so a pointer it can read and this cannot
+ * ("the cafe one") is resolved where that judgment belongs. The one thing it may never do is
+ * overrule a place they named.
+ */
+const deferredToUs = new Set([
+  "yes", "yeah", "yep", "ok", "okay", "sure", "fine", "either", "whatever", "any", "anything",
+  "you", "your", "choose", "pick", "decide", "one", "both", "that", "this", "sounds", "good",
+  "works", "great", "lets", "let", "us", "go", "do", "it", "please", "thanks", "thank",
+  // He talks to it in German as often as English.
+  "ja", "gerne", "egal", "klar", "passt", "such", "aus", "du", "beides", "eins", "danke",
+]);
+
 function pickScenario(state: CoachState, answer: string) {
   const framing = [...state.turns].reverse().find((turn) => turn.phase === "framing" && turn.options?.length);
   const options = framing?.options ?? [];
-  if (!options.length) return answer;
+  const trimmed = answer.trim();
+  if (!options.length) return trimmed;
   const optionA = options[0];
   const optionB = options[1] ?? options[0];
-  const lower = answer.toLowerCase();
-  if (/\b(first|1|former|erste|ersten)\b/.test(lower)) return optionA.scenarioEn;
-  if (/\b(second|2|latter|other|zweite|zweiten)\b/.test(lower)) return optionB.scenarioEn;
+  const lower = trimmed.toLowerCase();
 
-  const hits = (text: string) =>
-    text
-      .toLowerCase()
-      .split(/\W+/)
-      .filter((word) => word.length > 3 && lower.includes(word)).length;
-  const scoreA = hits(optionA.labelEn) + hits(optionA.scenarioEn);
-  const scoreB = hits(optionB.labelEn) + hits(optionB.scenarioEn) + hits(state.rotationTopic);
-  if (scoreB > scoreA) return optionB.scenarioEn;
+  // Pointing at one of the two, which is the only case where the option beats their sentence.
+  if (/\b(first|1|former|erste|ersten|erstes)\b/.test(lower)) return optionA.scenarioEn;
+  if (/\b(second|2|latter|other|zweite|zweiten|zweites|andere)\b/.test(lower)) return optionB.scenarioEn;
 
-  /*
-   * They did not pick either option and described something instead.
-   *
-   * Falling through to option A here is what produced the worst thing this route does: somebody
-   * answered "I froze at my girlfriend's parents last friday" and was put in a cafe, because
-   * option A had been built from the word "vocabulary" one turn earlier. They named a person, a
-   * place and a moment, and the app practised ordering coffee.
-   *
-   * Option A IS their own context when the answer restates the opening problem -- "the words go
-   * missing" -- and that is the case the old comment here was written for. It stops being true the
-   * moment they say something new and concrete, and a sentence that overlaps NEITHER option is the
-   * signal for exactly that.
-   *
-   * Six words, because that is about the shortest a real situation gets ("dinner at her parents on
-   * friday"). Below it lives "yes", "vocabulary", "the second one, I guess" -- answers that point
-   * back at what was already on offer rather than naming anything new.
-   */
-  const wordsInAnswer = answer.trim().split(/\s+/).filter(Boolean).length;
-  if (scoreA === 0 && scoreB === 0 && wordsInAnswer >= 6) return answer.trim();
+  const words = lower.replace(/[^\p{L}\s]/gu, " ").split(/\s+/).filter(Boolean);
+  // Nothing of their own in it: they handed the choice back, and option A is their own context.
+  if (!words.length || words.every((word) => deferredToUs.has(word))) return optionA.scenarioEn;
 
-  // Anything else -- including the learner restating their own problem -- means their own
-  // context, which is what option A was built from. Never leave this unresolved: an unclear
-  // pick used to make the model re-ask the framing question in a loop.
-  return optionA.scenarioEn;
+  // They named something. That is the scene, whether or not it was on the menu.
+  return trimmed;
 }
 
 async function generateTurn(
@@ -514,7 +522,7 @@ Then, instead of inviting them to speak: hand them the words. Pick ONE tool (key
 sayEs under 40 words and entirely in English; the Spanish belongs in the tool.`;
   }
   if (step === 1) {
-    return `Scenario turn, IN ENGLISH. phase=scenario, intent=probe, tool=none (or preparation_time if their opening answer suggests they freeze). chosenScenario is "${state.chosenScenario ?? "their own context from the opening answer"}" (already resolved from what they said; if their answer named something else entirely, adopt that instead). NEVER offer the two directions again and never use path_choice from now on.${
+    return `Scenario turn, IN ENGLISH. phase=scenario, intent=probe, tool=none (or preparation_time if their opening answer suggests they freeze). chosenScenario is "${state.chosenScenario ?? "their own context from the opening answer"}" -- and it is WHAT THEY SAID, not one of the two directions you offered. If it points at one of them ("the cafe one"), use that direction. Otherwise it is their own, and it OUTRANKS anything you put in front of them: somebody who was offered a cafe and answered "a restaurant" gets a restaurant. Never steer them back to an option they turned down. NEVER offer the two directions again and never use path_choice from now on.${
       skipsFramingFor(state)
         ? state.mode === "upcoming"
           ? " This is the FIRST turn of the session and they have not spoken to you yet, so open with one short sentence acknowledging the thing they are preparing for -- in the future, as something that has not happened -- before you set the scene. Do NOT ask them where they want to practise or offer them anything to choose between: they already told you, and chosenScenario is it."

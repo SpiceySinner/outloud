@@ -64,6 +64,17 @@ const declaredStuckEn = new RegExp(
 );
 
 /**
+ * The questions that are about LEARNING rather than about saying something.
+ *
+ * "How do I get better", "how do I stop translating in my head" are not requests for words, and
+ * the opening question invites exactly that kind of sentence. Excluded by name, and the list is
+ * deliberately short: the cost is lopsided. A false positive hands somebody words they did not ask
+ * for; a false negative tells somebody who asked a question that their pronunciation was wrong.
+ */
+const notAboutWords =
+  "(?!(?:get\\s+better|get\\s+past|get\\s+over|improve|practi[cs]e|learn|study|stop|avoid|overcome|train)\\b)";
+
+/**
  * The other shape of the same request, and the one that was missed.
  *
  * Reported from a real session, mid-scene: *"What is the word, like, I know, thanks to the hint,
@@ -81,12 +92,68 @@ const declaredStuckEn = new RegExp(
  */
 const asksForWordsEn = new RegExp(
   [
-    "\\bhow\\s+(?:do|would|can|should|d)\\s+(?:i|you|we)\\s+(?:say|ask|tell|put)\\b",
-    "\\bhow\\s+(?:do|would)\\s+(?:i|you)\\s+\\w+\\s+(?:say|ask)\\b",
+    /*
+     * "how do I ORDER a water" — the shape, with any verb in it.
+     *
+     * Timo, 2026-09-14, from a live session, and the confirm box came back for exactly the reason
+     * it always does. This alternative used to name four verbs: say, ask, tell, put. Every other
+     * thing a learner actually does in a scene — order, pay, book, greet, apologise, complain,
+     * explain, invite — fell straight through.
+     *
+     * The 2026-09-12 widening added PHRASINGS and never touched the verb list. Worse, the 23
+     * sentences that verified it were written around the verbs already in it, so the check was
+     * built with the same blind spot as the thing it was checking. That is the second time this
+     * file has been verified by something that shared its fault.
+     *
+     * Mid-scene, in English, "how do I X" is a request for the words for X, whatever X is.
+     */
+    `\\bhow\\s+(?:do|would|can|should|d)\\s+(?:i|you|we)\\s+${notAboutWords}\\w+`,
+    `\\bhow\\s+to\\s+${notAboutWords}\\w+`,
     "\\bwhat(?:'?s| is)\\s+(?:the\\s+)?(?:spanish|word|phrase|term)\\s+(?:for|is)\\b",
     "\\bwhat(?:'?s| is)\\s+the\\s+word\\b",
     "\\bwhat\\s+do\\s+i\\s+say\\b",
     "\\bdo\\s+i\\s+say\\b",
+    /*
+     * The rest of the shapes, added 2026-09-12 after Timo hit the confirm box again mid-funnel.
+     *
+     * Measured rather than guessed: 23 ways a half-fluent learner actually asks, run through this
+     * function and `looksBrokenAttempt` together. **Fourteen of the 23 were missed** -- eleven of
+     * them produced the confirm box and three were scored as if they had been Spanish attempts.
+     * The pairing is what makes a miss expensive. `looksBrokenAttempt` reads the words "the",
+     * "you", "do", "is", "know" and "want" as evidence that English leaked into a Spanish attempt,
+     * so it says yes to very nearly every English sentence. Whatever this function does not catch
+     * is therefore not merely un-helped: it is told "here's what I heard. fix anything that's
+     * wrong" about a transcript that was perfect.
+     *
+     * Every one of these is a request for words and cannot be read as anything else. The
+     * false-positive set this file has already paid for twice -- people DESCRIBING their problem,
+     * which is exactly what the opening question asks them to do -- is pinned in `stuck-unit.mjs`
+     * and stays quiet.
+     */
+    // "what's dinner in Spanish", "say that again in Spanish".
+    "\\b(?:what(?:'?s| is)|how\\s+(?:do|would|can|d)\\s+(?:i|you|we))\\b[^.?!]{0,40}\\bin\\s+spanish\\b",
+    "\\b(?:say|said|saying)\\b[^.?!]{0,20}\\bin\\s+spanish\\b",
+    /*
+     * "the word for bill", "give me the word for tomorrow".
+     *
+     * Bounded by an article on purpose. A bare "word for" would reach into "I understand a lot but
+     * the words disappear" -- near enough the single most common sentence in the opening answer --
+     * and that is the over-firing this file already paid for once.
+     */
+    "\\b(?:the|that|a|another)\\s+word\\s+for\\b",
+    "\\bwhat\\s+was\\s+(?:that|the)\\s+word\\b",
+    // "which one do I use", "what should I say here".
+    "\\b(?:which|what)\\s+(?:one\\s+)?(?:do|should|would)\\s+i\\s+(?:use|say)\\b",
+    // "is it la cuenta or el cuenta" -- choosing between two forms is asking which words to use.
+    // The gap allows for the article plus the noun; one word either side missed the real phrasing.
+    "\\bis\\s+it\\s+(?:\\S+\\s+){1,3}or\\s+\\S+",
+    // "I want to say I'll be there at eight". `strippedAsk` below already knew this shape; the
+    // detector did not, so the sentence was scored as a Spanish attempt instead of answered.
+    "\\bi\\s+(?:want|need|'?d\\s+like)\\s+to\\s+(?:be\\s+able\\s+to\\s+)?say\\b",
+    "\\bhelp\\s+me\\s+(?:say|ask)\\b",
+    // "what does cuenta mean" -- a comprehension question is the coach's job too, not a bad
+    // attempt at the scene.
+    "\\bwhat\\s+does\\s+\\S+\\s+mean\\b",
   ].join("|"),
   "i",
 );

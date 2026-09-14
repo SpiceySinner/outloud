@@ -1,6 +1,6 @@
 # OutLoud — what is actually open
 
-Last swept: **2026-09-11**, after the surface audit.
+Last swept: **2026-09-11**, after the surface audit. Section **1.6** added 2026-09-14 from a live voice run.
 
 Written by reading the code, not from memory. Where an item makes a claim, the file that proves it
 is named — an item nobody can check is an item nobody will act on.
@@ -151,9 +151,38 @@ in one.* So the 7-of-108 measurement below is not a number to admire — the mis
       off the front for people who answer a question with a question. Verified end to end in the
       real UI: `/api/lifeline`, three options with when to use each, the say-it-back, `/api/rescue`,
       and then *use it for real* / *that's all I needed*.
+- [x] **Both shapes, in the phrasings people actually use (2026-09-12).** The 2026-09-11 widening
+      taught the app the ASKING shape and only the phrasings in front of it. Timo hit the confirm
+      box again mid-funnel. Measured this time: of 23 ways a learner asks for a word, **14 never
+      reached the coach** — 11 produced the confirm box and 3 were scored as Spanish attempts.
+      Now 23 of 23. See the CHANGELOG.
+
+      **~~Left open: `looksBrokenAttempt` cannot tell a broken Spanish attempt from a clean
+      English sentence.~~ Closed 2026-09-14, and it was the whole fault.** Timo, after the third
+      confirm box: *we are not optimising for single sentences, we are optimising for the
+      scenario.* Two widenings of the asking regex had passed their own checks and a live session
+      still produced the box, for "How do I order a water?" — the verb was not one of the four the
+      pattern listed. The decision now asks whether there is any Spanish in the utterance at all,
+      which has two answers and no tail. Verified end to end in a browser, which this fault had
+      never had. See the CHANGELOG.
+
+      **New and undecided:** answering a Spanish coach turn in English during the INTAKE now steps
+      out immediately, where it used to count toward the two-strike nudge. It follows from the
+      rule; it also bypasses a deliberate design, and it belongs with the question below.
 - [ ] **Give the harness a home in the repo.** The scratchpad was wiped between sessions and the
       whole persona harness had to be reinstalled to answer one question. Second time this has
       cost something today.
+- [x] **The coach answers the question (2026-09-14).** `/api/aside` is two jobs in one engine and
+      only the diagnostic one had a voice: the prompt banned Spanish outright, and `stuck` was a
+      single-turn exception on top of an interview script. So the first follow-up question in a
+      word-asking aside got "is it the grammar or the vocabulary that feels tricky to you?" The
+      trigger now rewrites the whole aside. Verified against the real model, twice, because a mock
+      run of a prompt fault proves nothing. See the CHANGELOG.
+- [x] **Taking an offer by voice (2026-09-14).** The coach offered a focus change, Timo said "yeah,
+      I would like that", and the room cleared the offer before sending the sentence -- so the yes
+      arrived with nothing to attach to and the coach offered again. Users asked for voice
+      confirmation by name. The offer now survives until the model has judged the answer, and a
+      spoken yes runs the same `acceptAsideOffer` the button does. See the CHANGELOG.
 - [ ] **Coming back from the aside with the phrase.** Going back into the scene able to say it is
       the whole point; the return path has not been measured yet.
 - [ ] **Re-measure with the sweep.** Does the switch move help-during-the-scene off 7 of 108, and
@@ -382,6 +411,85 @@ correction to what this said: sign-out was in **two** places, not one — the ve
 its own since 1.1, and it stays there, which is the point of it. What `/profile` held alone was the
 sign-out you can reach when you are NOT mid-session.
 
+### 1.6 The first full voice run-through — two findings (2026-09-14)
+
+Timo's first end-to-end session by voice after the scenario and aside work, on a fresh browser. The
+flow itself held: opening, coach, scenario, scene, aside, closing card. Both findings below are read
+off the same trace (`__outloudVoiceDump()`, 10:16:32–10:20:27), which records **the learner's side
+only** — what the character said between his turns is not in it, so the evidence is his half of the
+conversation and the card at the end.
+
+- [ ] **The scene does not take no for an answer.** Timo's words: *my wishes were ignored and the
+      roleplay was not flexible enough.* He declines the bill four turns running — "No, gracias."
+      (10:18:25), "No." (10:18:48), "No, me don't want the bill." (10:19:04), "No quiero la cuenta."
+      (10:19:16) — the scene is still on the bill at 10:20:08, and the run ends with him paying:
+      "Efectivo, por favor." (10:20:27), which is also the sentence the closing card leads with.
+
+      So the sentence we hand back as his win is the one the scene talked him into. That is the
+      opposite of the 2026-09-14 scenario fix, which settled that **his words outrank the options we
+      put in front of him** — `pickScenario` in [coach/route.ts](app/api/coach/route.ts) now honours
+      that at the door, and the scene does not honour it once inside. Same rule, second altitude.
+
+      This is a prompt question for `/api/converse`, not a detector: a character who wants the
+      conversation to reach a destination will steer toward it, and steering past a plain "no" is
+      what a learner reads as being ignored. Whatever it turns into, it has to be verified against
+      the real model — a mock run of a prompt fault proves nothing.
+
+      **Worth checking at the same time, unproven:** two turns re-opened the mic with
+      `resumingSpeech: true` at `turn:ready` (10:17:18, 10:18:46), and in both cases the next thing
+      he said was a near-repeat of what he had just said. If a turn was dropped rather than
+      re-prompted, that reads as being ignored too.
+
+- [ ] **Transcription hit rate — the one real degrade in the run.** Two confirmed misses in
+      thirteen turns, one more unresolved. **Corrected by Timo 2026-09-14** — my first reading of
+      this trace guessed at four, and two of the guesses were wrong. What he confirms:
+
+      | heard | actually said | what went wrong |
+      |---|---|---|
+      | "äh C und äh bei Stack auch so, bitte." (10:18:07) | *Sí, un bistec también, por favor* | decoded as **German** |
+      | "Hola galos, un agua, por favor." (10:17:48) | *Hola **Carlos**, un agua, por favor* | the character's own name |
+      | "No, quieres la cuenta." (10:20:08) | unresolved — *quiero* or *quieres* | possible person error |
+
+      **"No, me don't want the bill." (10:19:04) was not a miss.** He said it exactly that way. It
+      belongs to the finding above this one: by that point he had declined in Spanish twice and
+      reached for English to get the scene to move.
+
+      Unchecked: the opening answer came back as "Say the vocabulary." (10:16:35), which is not an
+      answer to *what do you want to be able to say?* — nobody has confirmed it either way.
+
+      **"Carlos" is the argument for the whole item.** It is not an obscure word. It is the name
+      **we chose and the coach said out loud** on the scenario turn — it sits in the room's own
+      state, on screen, before he opens his mouth. If the transcriber can miss that, it is not
+      being told anything about the conversation it is transcribing.
+
+      The German one is its own problem. The transcriber is pinned to `en` or `es` and **never**
+      `de` — [realtime-token/route.ts:90](app/api/realtime-token/route.ts#L90),
+      [voice-session.ts:431](lib/voice-session.ts#L431),
+      [page.tsx:1707](app/page.tsx#L1707) — so for that turn the hint either never reached the
+      session or was ignored. This run is *after* the 2026-09-14 language fix, which was shipped
+      explicitly unverified because only real audio exercises it. It is now not-yet-proven rather
+      than proven wrong, for the reason in the next paragraph.
+
+      **~~The dump cannot answer it.~~ Closed 2026-09-14, before the next run.**
+      `setTranscriptionLanguage` logged through `voice-session.ts`'s own `log()`, which wrote to the
+      console only, while `vlog` in the room is what fills `__outloudVoiceLog`. So the trace we
+      actually receive could not show which language a turn was transcribed in — exactly the
+      question. Both loggers now share the buffer, verified against `HEAD` as well as against the
+      change (0 lines before, 4 after, same console output). See the CHANGELOG. **The next voice
+      dump answers this one on its own.**
+
+      **Timo's idea, and it lands on a knob that already exists.** When a learner says a word, it is
+      very often a word **the character or the coach just said** — so bias the transcriber toward
+      the vocabulary already in play instead of letting it guess against all of Spanish. The
+      realtime `transcription` object takes a **`prompt`** alongside `model` and `language`, and we
+      send only the latter two. Seed it per turn with the character's recent lines, the coach's
+      recent lines, and the phrase being practised. No new model call, no new latency, and it aims
+      the guess at the twenty words that could plausibly come next. Start with the cheapest and
+      most certain ingredient: the character's name, which we already hold in state.
+
+      This is the concrete half of **#16** in section 3 (real audio-condition testing), which until
+      now had no numbers attached to it.
+
 ---
 
 ## 2. Things that look finished and are not
@@ -454,6 +562,10 @@ sign-out you can reach when you are NOT mid-session.
 - [ ] **#16** Real audio-condition testing — car mics, AirPods, background noise, accents,
       code-switching. Listed as P0 in the review analysis and still the fastest way to lose a voice
       user.
+
+      **First real evidence, 2026-09-14:** two confirmed transcription misses in a thirteen-turn
+      voice run — one decoded as German, one missing the character's own name. Timo's proposed fix — bias the transcriber with the words the
+      character and the coach have already said — is written up in **1.6**.
 
 ### Phase 6 — money and launch
 - [ ] **#17** Boring, obvious billing: trial end date, exact amount, cancellation path

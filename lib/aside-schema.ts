@@ -111,6 +111,19 @@ export const asideResponseSchema = z.object({
       newOpeningEn: z.string().nullable(),
     })
     .nullable(),
+  /**
+   * The learner's last message TOOK the offer that was already on screen.
+   *
+   * Taking an offer had exactly one way in: pressing the button. Saying "yeah, I'd like that" made
+   * the room discard the offer and send the sentence back as another aside turn, so the coach
+   * re-offered the same thing with a new button and the learner said yes into a void. Voice is how
+   * people asked to use this app.
+   *
+   * The model decides it, deliberately. "Did this accept?" is a judgment about meaning, in
+   * whatever language they happen to speak -- and a list of yes-words is the shape of fix that has
+   * already failed twice in this repo.
+   */
+  acceptsPendingOffer: z.boolean(),
   done: z.boolean(),
 });
 
@@ -119,7 +132,7 @@ export type AsideResponse = z.infer<typeof asideResponseSchema>;
 export const asideResponseJsonSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["turnIndex", "sayEn", "intent", "offer", "done"],
+  required: ["turnIndex", "sayEn", "intent", "offer", "acceptsPendingOffer", "done"],
   properties: {
     turnIndex: { type: "number" },
     sayEn: { type: "string" },
@@ -167,6 +180,7 @@ export const asideResponseJsonSchema = {
         { type: "null" },
       ],
     },
+    acceptsPendingOffer: { type: "boolean" },
     done: { type: "boolean" },
   },
 } as const;

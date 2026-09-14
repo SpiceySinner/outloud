@@ -2,8 +2,14 @@ import OpenAI from "openai";
 import { NextResponse } from "next/server";
 import { z } from "zod";
 
-import { asideResponseJsonSchema, asideResponseSchema, asideStages, offerKindsForStage } from "@/lib/aside-schema";
-import type { AsideResponse, AsideStage } from "@/lib/aside-schema";
+import {
+  asideOfferKinds,
+  asideResponseJsonSchema,
+  asideResponseSchema,
+  asideStages,
+  offerKindsForStage,
+} from "@/lib/aside-schema";
+import type { AsideOfferKind, AsideResponse, AsideStage } from "@/lib/aside-schema";
 import { isMockAiEnabled } from "@/lib/mock-ai";
 import { checkRateLimit, openAiRequestsPerDay } from "@/lib/rate-limit";
 
@@ -73,6 +79,21 @@ const requestSchema = z.object({
    * so an older client cannot accidentally unlock the intake-only offer.
    */
   stage: z.enum(asideStages).optional().default("session"),
+  /**
+   * The offer already on screen when they spoke, if there was one.
+   *
+   * Only what is needed to judge whether they took it. The client holds the offer itself and
+   * applies it -- sending the whole thing back so the model could hand it over again would give
+   * it a second chance to change its mind about what it had already put in front of somebody.
+   */
+  pendingOffer: z
+    .object({
+      kind: z.enum(asideOfferKinds),
+      labelEn: z.string().max(120),
+    })
+    .nullable()
+    .optional()
+    .default(null),
   /** The aside so far, oldest first. Empty on the opening call. */
   exchange: z
     .array(
@@ -102,7 +123,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Stepping out needs the scene you left." }, { status: 400 });
   }
 
-  const { scene, focus, recentTurns, trigger, exchange, stage, stuckSaid } = parsed.data;
+  const { scene, focus, recentTurns, trigger, exchange, stage, stuckSaid, pendingOffer } = parsed.data;
   // The coach's turn number is how many times it has already spoken, so the client cannot claim a
   // later turn -- and its more decisive guidance -- than the conversation has actually reached.
   const turnIndex = Math.min(exchange.filter((entry) => entry.who === "coach").length, MAX_TURN_INDEX);
@@ -123,6 +144,7 @@ export async function POST(request: Request) {
       exchange,
       turnIndex,
       lastLearnerMessage,
+      pendingOffer,
     });
     return NextResponse.json(next);
   } catch (error) {
@@ -135,12 +157,13 @@ type AsideInput = {
   scene: z.infer<typeof requestSchema>["scene"];
   focus: { current: string | null; stated: string | null; observed: string | null };
   recentTurns: Array<{ characterLineEs: string; userAttempt: string; meaning: string }>;
-  trigger: "learner" | "offered" | "stuck";
+  trigger: AsideTrigger;
   stuckSaid: string | null;
   stage: AsideStage;
   exchange: Array<{ who: "coach" | "you"; text: string }>;
   turnIndex: number;
   lastLearnerMessage: string | null;
+  pendingOffer: { kind: AsideOfferKind; labelEn: string } | null;
 };
 
 /**
@@ -153,9 +176,41 @@ type AsideInput = {
  */
 function asideTurnGuidance(
   turnIndex: number,
-  trigger: "learner" | "offered" | "stuck",
+  trigger: AsideTrigger,
   stuckSaid: string | null,
+  pendingOffer: { kind: AsideOfferKind; labelEn: string } | null,
 ) {
+  const base = asideTurnBase(turnIndex, trigger, stuckSaid);
+  if (!pendingOffer) return base;
+  /*
+   * An offer on screen is a thing they MAY answer, not a lens to read everything through.
+   *
+   * This was written as an early return, and it replaced the guidance below entirely. Timo's
+   * transcript, 2026-09-14: he asked "is that correct?", then "what does quisiera mean?", then
+   * corrected a mis-hearing -- and got "you want to focus on vocabulary", "let's focus on
+   * vocabulary retrieval", "you want to focus on the word quisiera, is that right?". Four turns,
+   * three restatements of a focus he never asked about, and the word still unexplained. Every
+   * message was being read as an answer to a pending offer, because that is what this said to do.
+   *
+   * So it is a prefix now, and it defers: their question outranks our offer. The acceptance half
+   * stays, because saying yes out loud is the thing users asked for by name.
+   */
+  return (
+    `An offer is already on screen: "${pendingOffer.labelEn}" (${pendingOffer.kind}). ` +
+    "IF THEIR MESSAGE TOOK IT -- yes, yeah, sure, please do, ja, in any language -- set " +
+    "acceptsPendingOffer=true, offer=null, done=true, and make sayEn one short line confirming it. " +
+    "Do not offer it again: it is already theirs. " +
+    "IF THEY ASKED YOU SOMETHING, THEIR QUESTION IS THE LIVE ONE, not your offer. Answer it, set " +
+    "acceptsPendingOffer=false, and do not mention the offer at all -- it can wait, and they can " +
+    "still take it later. " +
+    "IF THEY TURNED IT DOWN, acceptsPendingOffer=false and carry on with what they actually said. " +
+    "Never restate what you think they want as a focus or a topic. Telling somebody what their " +
+    "question reveals about them is the app talking ABOUT them instead of to them. " +
+    base
+  );
+}
+
+function asideTurnBase(turnIndex: number, trigger: AsideTrigger, stuckSaid: string | null) {
   if (turnIndex === 0 && trigger === "stuck") {
     /*
      * They did not wander out of the scene. They said, in English, that they did not have the
@@ -181,6 +236,37 @@ function asideTurnGuidance(
       "they wanted to say -- never a broad one about how they are feeling. " +
       "Then offer to go back and use it. intent=reframe, done=false."
     );
+  }
+  /*
+   * Every turn after the first one, when they came here asking for words.
+   *
+   * This branch did not exist. Turn 0 taught and turn 1 fell through to "ask ONE question that
+   * narrows it" -- an instrument built to narrow a COMPLAINT, pointed at somebody who had just
+   * asked about a sentence. It produced "is it the grammar or the vocabulary that feels tricky to
+   * you?" in answer to "can I also say un agua, por favor?", which is the app analysing a learner
+   * who asked it a plain question.
+   */
+  if (trigger === "stuck") {
+    if (turnIndex < MAX_TURN_INDEX) {
+      return (
+        "They are asking about the words you just gave them. ANSWER THE QUESTION. " +
+        "If they asked whether their own version works, say yes or no first, then why, in one " +
+        "line -- and if it works, say so plainly and let them keep theirs. Give the Spanish they " +
+        "need with the English under it. " +
+        "Do NOT ask what they find difficult, do NOT ask whether it is the grammar or the " +
+        "vocabulary, and do NOT tell them what their question shows about them. They asked about " +
+        "a sentence, not about themselves. " +
+        "While they are still asking, keep answering: intent=reframe, offer=null, done=false. " +
+        "THE MOMENT THEY SIGNAL THEY HAVE IT -- \"got it\", \"thanks\", \"okay\", \"that makes " +
+        "sense\", or anything that is not a question -- they are finished. Offer to go back and " +
+        "use it THAT TURN: intent=offer, kind=resume, done=true. " +
+        "That closing sayEn is ONE short English sentence about going back, and NOTHING ELSE. No " +
+        "new Spanish, no second way to say it, no line they have already been given. They told you " +
+        "they have what they came for; teaching them one more thing on the way out is how an " +
+        "aside becomes the scene they walked out of, wearing a different hat."
+      );
+    }
+    return "This is the last turn. Answer what they asked in one short line, then offer to go back and use it. intent=close, offer set, done=true.";
   }
   if (turnIndex === 0) {
     return trigger === "offered"
@@ -259,40 +345,134 @@ function offerRulesFor(stage: AsideStage) {
   ];
 }
 
+type AsideTrigger = "learner" | "offered" | "stuck";
+
+/**
+ * Two jobs in one engine, and they need different mouths.
+ *
+ * `learner` and `offered`: somebody walked out of the scene and we do not know why. The job is to
+ * find out what is in their way and offer a change. Diagnostic, and deliberately no Spanish --
+ * teaching here would hand them back the lesson they just walked out of.
+ *
+ * `stuck`: they are here BECAUSE they asked for words. The job is to give the words, and then to
+ * answer what they ask about them. Teaching, and Spanish is the whole point.
+ *
+ * Timo, 2026-09-14. The coach gave him *agua, por favor*. He asked whether *un agua, por favor*
+ * worked too. It replied: *"You seem unsure about adding words like sí or un in your sentence. Is
+ * it the grammar or the vocabulary that feels tricky to you?"* A question about a sentence,
+ * answered with a question about the person who asked it.
+ *
+ * That was not the model wandering off. `stuck` was a single-turn exception bolted onto an
+ * interview script: turn 0 taught, and everything after it reverted to narrowing a complaint --
+ * while this prompt forbade Spanish outright, which is the one thing they came for. Every
+ * follow-up question was going to land that way. The trigger has to change the whole aside, not
+ * its opening line.
+ */
+function asideVoice(trigger: AsideTrigger) {
+  if (trigger === "stuck") {
+    return [
+      "They stepped out to ask about words, so you are TEACHING, not interviewing.",
+      "If they ask about a word that appears in NOTHING either of you has said, the microphone mis-heard a word you DID say -- \"casiera\" for \"quisiera\". Answer about the real word. Never invent a meaning for a word that was never in the conversation.",
+      "The only Spanish you write is the line they need, and any word you are explaining. EVERYTHING you say ABOUT it -- what it means, whether theirs works, going back to the scene -- is English. A closing line in Spanish is you setting them another exercise on the way out.",
+      "When you give them a SPANISH line, put the English under it, one line each.",
+      "When the answer is simply what a word means, say it once and stop. An English sentence has no English translation to put underneath it, and \"agua means water. agua means water.\" is what happens when you try.",
+      "Never repeat a line you have already given them in this conversation.",
+      "",
+      "# Answering comes first",
+      "If their last message asked you anything, ANSWER IT. Before anything else on this page.",
+      "When they ask whether their own version also works, say yes or no plainly, then why, in one line. If it works, say so and let them keep it -- theirs is the one they will remember.",
+      "NEVER answer a question about the language with a question about them. Not how they feel, not whether it is the grammar or the vocabulary, not what they find tricky. Being told what your question reveals about you is the thing they stepped out of the scene to escape.",
+    ];
+  }
+  return [
+    "ENGLISH ONLY. Not one Spanish word, not even a quoted phrase. The moment you teach Spanish here you have turned their aside back into the lesson they walked out of.",
+    "",
+    "# Answering comes first",
+    "If their last message asked you a direct question, answer it before you ask one of your own.",
+  ];
+}
+
 const asideSystemPromptBase = [
   "You are the OutLoud coach. The learner has just stepped out to talk to you about something that is bothering them. You are on their side and you are not in character as anyone -- if there is a person in the scene they left, that person is not here.",
   "",
   "# How you talk",
-  "ENGLISH ONLY. Not one Spanish word, not even a quoted phrase. The moment you teach Spanish here you have turned their aside back into the lesson they walked out of.",
+  "VOICE_PLACEHOLDER",
   "Every line is spoken out loud on a phone: ONE idea, under 30 words, plain sentences. No lists, no headings, no numbered steps.",
   "Lowercase, warm, direct. You sound like a good teacher who stopped the exercise to actually listen -- not like a support agent and not like a therapist.",
   "Never open with praise for the question, never say \"great point\", never say \"I hear you\". Say the thing.",
   "Ask at most ONE question per turn. Two questions in one breath is an interrogation and they will answer neither.",
   "",
   "# What you are doing",
-  "Find out what is actually in their way. Not what the evaluator measured -- what THEY think is wrong. Those are often different, and when they are, theirs is the one that decides whether they come back tomorrow.",
+  "DOING_PLACEHOLDER",
   "Take what they say at face value. If they say the situation is useless to them, that is data, not resistance. If they say they cannot do this at all, believe them and do not talk them round.",
   "Do not defend the session, do not explain why the exercise was designed that way, do not tell them that struggling is normal. They know.",
   "",
   "OFFER_RULES_PLACEHOLDER",
   "",
+  "# The offer they already have",
+  "acceptsPendingOffer is true ONLY when there was an offer on screen and their message took it. When it is true, say in one short line that it is happening and set done=true. Otherwise it is false -- never true on a turn where you are making a new offer, because they have not seen that one yet.",
+  "An offer on screen does NOT make every message an answer to it. If they asked you something, theirs is the live question, not yours: answer it, acceptsPendingOffer=false, and let the offer wait.",
+  "",
   "# What you must not do",
-  "Do not translate anything, do not give them a Spanish word or pattern, do not rehearse the line they were stuck on. There is a separate place for that and they did not go to it.",
+  "MUST_NOT_PLACEHOLDER",
   "Do not summarize their progress and do not praise their Spanish. They stepped out to talk about a problem.",
   "Do not promise anything the app cannot do: you can change the scene or change the focus, and that is all.",
 ].join("\n");
 
-function asideSystemPrompt(stage: AsideStage) {
-  const offerBlock = [
-    "# The offer",
-    "When you can name what they want different, attach exactly one offer. Never more than one, and never an offer on the first turn.",
-    ...offerRulesFor(stage),
-    "",
-    "labelEn is button text: 2-5 words, lowercase, saying what happens.",
-    "reasonEn is one short line under the button saying what changes. If nothing changes, say that plainly.",
-    "NEVER invent a problem they did not state, and never upgrade a passing remark into a diagnosis so you have something to offer.",
-  ].join("\n");
-  return asideSystemPromptBase.replace("OFFER_RULES_PLACEHOLDER", offerBlock);
+/**
+ * The mission, and it is not the same mission in both asides.
+ *
+ * "Find out what is actually in their way" is right for somebody who walked out of a scene without
+ * saying why. Pointed at somebody who asked what a word means, it is the instruction that produced
+ * "you want to focus on vocabulary" three turns running while the word went unexplained.
+ */
+function asideDoing(trigger: AsideTrigger) {
+  return trigger === "stuck"
+    ? "Answer what they ask about the language, until they can go back and say it. That is the whole job. You are NOT diagnosing them: never name what they \"want to focus on\", never restate their question as a difficulty they have, and never tell them what kind of learner their question makes them. A question about a word is a question about a word."
+    : "Find out what is actually in their way. Not what the evaluator measured -- what THEY think is wrong. Those are often different, and when they are, theirs is the one that decides whether they come back tomorrow.";
+}
+
+/** The one line that flatly contradicts a `stuck` aside, so it cannot be in one. */
+function asideMustNot(trigger: AsideTrigger) {
+  return trigger === "stuck"
+    ? "Do not turn this into a lesson: one line they can say, the English under it, and back to the scene. Do not drill them, do not stack three alternatives, and do not explain the grammar unless they asked about it."
+    : "Do not translate anything, do not give them a Spanish word or pattern, do not rehearse the line they were stuck on. There is a separate place for that and they did not go to it.";
+}
+
+function asideSystemPrompt(stage: AsideStage, trigger: AsideTrigger) {
+  /*
+   * A word-asking aside has ONE offer, and the rest of the menu is why it kept going wrong.
+   *
+   * `offerRulesFor` is a diagnostic ladder: name a different situation, name a different
+   * difficulty, otherwise resume. Handed to a coach whose learner just asked what "quisiera"
+   * means, it is a standing instruction to find a difficulty in the question -- which is exactly
+   * what came back, three turns in a row, while the word went unexplained. They did not step out
+   * to have their session re-diagnosed; they stepped out to find out what a word means.
+   */
+  const offerBlock =
+    trigger === "stuck"
+      ? [
+          "# The offer",
+          'ONE offer exists in this aside: kind="resume", going back to the scene able to say it. Attach it when their question is answered and nothing is left hanging, never before.',
+          "NEVER offer to change the focus, change the scene, or start over. They came to ask about words. Naming a focus at somebody who asked what a word means is the app talking about them instead of to them.",
+          "",
+          "labelEn is button text: 2-5 words, lowercase, saying what happens.",
+          "reasonEn is one short line under the button.",
+        ].join("\n")
+      : [
+          "# The offer",
+          "When you can name what they want different, attach exactly one offer. Never more than one, and never an offer on the first turn.",
+          ...offerRulesFor(stage),
+          "",
+          "labelEn is button text: 2-5 words, lowercase, saying what happens.",
+          "reasonEn is one short line under the button saying what changes. If nothing changes, say that plainly.",
+          "NEVER invent a problem they did not state, and never upgrade a passing remark into a diagnosis so you have something to offer.",
+        ].join("\n");
+  return asideSystemPromptBase
+    .replace("VOICE_PLACEHOLDER", asideVoice(trigger).join("\n"))
+    .replace("DOING_PLACEHOLDER", asideDoing(trigger))
+    .replace("MUST_NOT_PLACEHOLDER", asideMustNot(trigger))
+    .replace("OFFER_RULES_PLACEHOLDER", offerBlock);
 }
 
 async function generateAsideTurn(input: AsideInput): Promise<AsideResponse> {
@@ -302,7 +482,7 @@ async function generateAsideTurn(input: AsideInput): Promise<AsideResponse> {
   const response = await client.responses.create({
     model: process.env.OPENAI_MODEL ?? "gpt-4.1-mini",
     input: [
-      { role: "system", content: asideSystemPrompt(input.stage) },
+      { role: "system", content: asideSystemPrompt(input.stage, input.trigger) },
       {
         role: "user",
         content: JSON.stringify({
@@ -315,7 +495,13 @@ async function generateAsideTurn(input: AsideInput): Promise<AsideResponse> {
           recentPracticeTurns: input.recentTurns,
           asideSoFar: input.exchange,
           lastLearnerMessage: input.lastLearnerMessage,
-          turnGuidance: asideTurnGuidance(input.turnIndex, input.trigger, input.stuckSaid),
+          offerAlreadyOnScreen: input.pendingOffer,
+          turnGuidance: asideTurnGuidance(
+            input.turnIndex,
+            input.trigger,
+            input.stuckSaid,
+            input.pendingOffer,
+          ),
         }),
       },
     ],
@@ -409,26 +595,48 @@ function normalizeAsideTurn(
 }
 
 function mockAsideTurn(input: AsideInput): AsideResponse {
+  /*
+   * An offer on screen is the live question, whatever turn it is -- the same precedence the real
+   * guidance uses. Checked first for that reason, and because the mock is what every browser check
+   * runs against: without it the one path a test CAN drive is the one path that never says yes.
+   */
+  if (input.pendingOffer) {
+    const answer = (input.lastLearnerMessage ?? "").toLowerCase();
+    if (/\b(yes|yeah|yep|sure|please|ok|okay|do it|sounds good|let.?s)\b/i.test(answer)) {
+      return {
+        turnIndex: input.turnIndex,
+        sayEn: "done -- that's what we're working on from here.",
+        intent: "close",
+        offer: null,
+        acceptsPendingOffer: true,
+        done: true,
+      };
+    }
+  }
+
   if (input.turnIndex === 0) {
     return {
       turnIndex: 0,
       sayEn:
         input.trigger === "stuck"
-          ? 'the phrase you wanted is "me encargo de eso" — I\'ll take care of it. want to go back and use it?'
+          ? 'the phrase you wanted is "me encargo de eso" -- I\'ll take care of it. want to go back and use it?'
           : input.trigger === "offered"
             ? "that wasn't landing, was it. what's actually going on?"
             : "okay, we're out of the scene. what's on your mind?",
       intent: input.trigger === "stuck" ? "reframe" : "probe",
       offer: null,
+      acceptsPendingOffer: false,
       done: false,
     };
   }
+
   if (input.turnIndex === 1) {
     return {
       turnIndex: 1,
       sayEn: "so it's less the words and more the situation. is that right?",
       intent: "reframe",
       offer: null,
+      acceptsPendingOffer: false,
       done: false,
     };
   }
@@ -459,6 +667,7 @@ function mockAsideTurn(input: AsideInput): AsideResponse {
             newOpeningEn: "I have basically no Spanish yet -- I want to start from nothing.",
           }
         : resume,
+      acceptsPendingOffer: false,
       done: true,
     };
   }
@@ -480,6 +689,7 @@ function mockAsideTurn(input: AsideInput): AsideResponse {
           newCharacter: { name: "Rosa", relation: "your landlord", traitEn: "brisk, and she does not repeat herself" },
         }
       : resume,
+    acceptsPendingOffer: false,
     done: true,
   };
 }

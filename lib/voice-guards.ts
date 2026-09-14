@@ -149,3 +149,82 @@ export const micConstraints: MediaStreamConstraints = {
     channelCount: 1,
   },
 };
+
+/*
+ * Spanish or English? The question `looksBrokenAttempt` cannot answer, and the only one that
+ * actually separates the two things a learner does in a scene.
+ *
+ * Timo, 2026-09-14: *"wir optimieren hier nicht für einzelne Sätze, wir optimieren für das
+ * Szenario."* He is right, and the two fixes before this one were the wrong shape. Both widened a
+ * list of English phrasings that count as asking for words, and a list like that has no end -- the
+ * app kept meeting a sentence nobody had written down yet and answering it with "here's what I
+ * heard. fix anything that's wrong", about a transcript that was perfect.
+ *
+ * The scenario has exactly two cases, and neither is about phrasing:
+ *
+ *   Spanish, however broken   -> an attempt at the scene. Judge it.
+ *   English, whatever it says -> not an attempt at all. It is the learner talking TO us.
+ *
+ * `looksBrokenAttempt` reads the words "the", "you", "do", "is", "know" and "want" as evidence
+ * that English leaked into a Spanish attempt. That is right for a half-Spanish sentence and
+ * exactly backwards for a whole English one, where the same words are simply what English is made
+ * of -- so it says "I misheard you" to every sentence that was heard perfectly.
+ *
+ * Deterministic on purpose, and function words only. Content words are endless and a beginner's
+ * vocabulary is tiny; what nobody produces by accident is the grammar around them.
+ */
+const spanishMarkers = new Set([
+  "que", "de", "del", "la", "el", "los", "las", "un", "una", "unos", "unas", "en", "con", "por",
+  "para", "es", "esta", "estoy", "soy", "eres", "somos", "hay", "tengo", "tiene", "tienes",
+  "quiero", "quieres", "quiere", "puedo", "puedes", "puede", "necesito", "necesita", "se", "te",
+  "lo", "le", "les", "mi", "mis", "tu", "su", "muy", "mas", "pero", "tambien", "como", "donde",
+  "cuando", "porque", "gracias", "favor", "hola", "buenos", "buenas", "senor", "senora", "usted",
+  "yo", "el", "ella", "nosotros", "ellos", "voy", "vas", "va", "vamos", "ser", "estar", "hacer",
+  "hago", "quisiera", "podria", "perdon", "disculpe", "si", "al",
+]);
+
+const englishMarkers = new Set([
+  "the", "i", "you", "he", "she", "it", "we", "they", "is", "are", "was", "were", "do", "does",
+  "did", "don't", "dont", "doesn't", "can", "can't", "could", "would", "should", "will", "how",
+  "what", "where", "when", "why", "who", "to", "of", "and", "but", "my", "your", "want", "wanted",
+  "need", "know", "say", "said", "get", "got", "have", "has", "had", "am", "be", "been", "like",
+  "just", "really", "please", "thanks", "sorry", "about", "with", "for", "in", "on", "at", "that",
+  "this", "there", "here", "something", "anything", "word", "words", "mean", "means", "again",
+]);
+
+/*
+ * Words that are both, and therefore evidence of neither: "me", "no", "a", "son", "van", "ten",
+ * "or". Left out of both sets rather than assigned to one, because a wrong assignment here is a
+ * wrong verdict about the whole utterance.
+ */
+
+/**
+ * Did they say this in English, with no Spanish in it at all?
+ *
+ * Two markers, not one: a single English word is a stray token, and "okay" or "sorry" on its own
+ * in the middle of a Spanish turn is more likely a reaction than a sentence addressed to us. Any
+ * Spanish at all makes it an attempt -- a learner who produces *"quiero the bill"* is reaching for
+ * the scene and has earned the confirm box, which is what that screen is honestly for.
+ *
+ * An accent or an ñ counts double. Nobody types or pronounces one by accident, and a short
+ * correct answer is the case most likely to have too few function words to score on its own.
+ */
+export function saidInEnglish(text: string) {
+  const normalized = text
+    .toLowerCase()
+    .replace(/[\u2018\u2019\u02bc\u00b4]/g, "'");
+  const accented = /[ñáéíóúü¿¡]/.test(normalized) ? 2 : 0;
+  const words = normalized
+    .replace(/[^\p{L}\p{N}'\s]/gu, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+  const spanish =
+    accented + words.filter((word) => spanishMarkers.has(stripAccents(word))).length;
+  const english = words.filter((word) => englishMarkers.has(word)).length;
+  return spanish === 0 && english >= 2;
+}
+
+/** So "está" and "esta" are the same marker, and the accent is counted once, above. */
+function stripAccents(word: string) {
+  return word.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+}

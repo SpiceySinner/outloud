@@ -89,6 +89,24 @@ function nowMs() {
   return typeof performance === "undefined" ? Date.now() : performance.now();
 }
 
+/**
+ * Whatever a caller handed `log()`, as one line of text.
+ *
+ * Mirrors `vlog` in the room so the two halves of a trace read alike once they share a buffer.
+ * `console.log` can render an object; a joined string cannot.
+ */
+function printable(value: unknown) {
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  if (value instanceof Error) return `${value.name}: ${value.message}`;
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return "[unserialisable]";
+  }
+}
+
 class VoiceSession {
   // --- transport ---
   private peer: RTCPeerConnection | null = null;
@@ -169,12 +187,26 @@ class VoiceSession {
   private captureResolve: ((value: string) => void) | null = null;
   private captureTimer: number | null = null;
 
+  /**
+   * To the console AND to the room's dump buffer.
+   *
+   * The second half matters more than it looks. `__outloudVoiceDump()` is what somebody can
+   * actually paste back after a session went wrong, and until 2026-09-14 nothing in this file
+   * reached it -- only the room's own `vlog` did. So a trace sent in for diagnosis showed the
+   * microphone opening and closing and never showed which language the transcriber was pinned to,
+   * which was the open question about the transcript it produced. Same debug gate, same array,
+   * same timestamp format, so both sources interleave in the order they happened.
+   */
   private log(scope: string, ...rest: unknown[]) {
     if (!this.debug) return;
-    console.log(
-      `[voice:${scope}]`,
-      ...rest,
-      `| mic:${this.micWindow} mode:${this.mode} capturing:${this.capturing}`,
+    const tag = `[voice:${scope}]`;
+    const suffix = `| mic:${this.micWindow} mode:${this.mode} capturing:${this.capturing}`;
+    console.log(tag, ...rest, suffix);
+    if (typeof window === "undefined") return;
+    const store = window as unknown as { __outloudVoiceLog?: string[] };
+    store.__outloudVoiceLog ??= [];
+    store.__outloudVoiceLog.push(
+      `${new Date().toISOString().slice(11, 23)} ${[tag, ...rest.map(printable), suffix].join(" ")}`,
     );
   }
 
