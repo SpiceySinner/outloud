@@ -1,9 +1,11 @@
 /** Cloudflare Worker entry point for the vinext-starter template. */
+import type { D1Database } from "@cloudflare/workers-types";
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
 
 interface Env {
-  ASSETS: Fetcher;
+  // vinext uses DOM Request/Response types; Workers globals would also alter the browser app.
+  ASSETS: Pick<typeof globalThis, "fetch">;
   DB: D1Database;
   IMAGES: {
     input(stream: ReadableStream): {
