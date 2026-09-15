@@ -109,7 +109,41 @@ where a deploy is needed and is handed back.
 
 ## Second seat — coding
 
-In order. Each one is small enough to finish, and each is verifiable without a deploy.
+**The numbers are labels, not an order.** 1 to 7 were written first and 8 to 11 were moved across
+later, so a low number does not mean "do this sooner". This is the order that actually makes sense,
+and the reason for each:
+
+| | why here |
+|---|---|
+| ~~1 `device-class`~~ | done |
+| **8 TypeScript errors** | first, because it pays into everything after it. While the three known errors are there, nobody can use `npx tsc --noEmit` as a pass/fail gate — every later PR has to remember which three are allowed |
+| **9 two stale documents** | smallest thing on the list, and it stops the build plan telling the next person that shipped work is unbuilt |
+| **3 realtime session limit** | a few lines |
+| **check `build-group`** | unlocks three of the six checks. Do it before you need it |
+| **5 date the nav bug** + **check `build-navigation`** | the same investigation. Build the check, and the bisect nearly writes itself |
+| **2 delete path** → **4 retention** | 4 builds on 2. The two that touch production data, so take them when you are no longer new here |
+| **6 store what the AI said** | unlocks TODO 1.3, the largest open question in the product |
+| **7 `account_created` events** | touches `app/page.tsx` — see the collisions below |
+| **10 `lastVoiceFreeze`** | after 7, same file |
+| **11 transcription bias** | unblocked 2026-09-15. The run that was owed happened and the language fix holds — the task carries what it found |
+
+The remaining checks — `pure-modules`, `room-restore`, `screen-fingerprint`, `persona-sweep` — have
+no dependencies beyond `build-group` and are good work to pick up whenever a PR is waiting on
+review.
+
+### What collides with what
+
+`app/page.tsx` is one 6400-line component and three tasks edit it. Two branches changing it at once
+will conflict, and the merge cost lands on whoever goes second.
+
+| file | tasks that touch it |
+|---|---|
+| `app/page.tsx` | **7**, **10** |
+| `lib/voice-session.ts` | **10**, **11** |
+| `app/api/realtime-token/route.ts` | **3**, **11** |
+| `lib/freeze.ts` | **10** |
+
+Nothing else overlaps. Take one of each pair, get it merged, then take the other.
 
 ### 1. `device_json` stores the raw User-Agent
 
@@ -145,9 +179,18 @@ sessions per day per client, for everybody, the moment it is deployed.
 
 **Timo's call: 100 while this is a test phase.**
 
-**Done when:** production gets 100 **and** the line carries a comment saying it must go back down
-before launch, plus a line in `docs/TODO.md` under the launch items. A raised limit with no note
-is an open cost tap nobody remembers opening.
+**You cannot set this in production and should not try.** `.env` is not the deploy configuration —
+Vercel's environment is, and that is Timo's. What a PR can carry is the *fallback*, so change the
+`: 5` to `: 100` and the environment variable keeps overriding it for anybody who wants something
+else. Timo can still raise or lower it without a deploy.
+
+Which makes the comment the actual deliverable. A raised ceiling with nothing next to it is an open
+cost tap nobody remembers opening, and "it was for the test phase" is not recoverable from a diff
+six weeks later.
+
+**Done when:** the fallback is 100, the line carries a comment saying **why** it is 100 and that it
+must go back down before launch, and `docs/TODO.md` has a matching line under the launch items so
+it is findable from the record and not only from the code.
 
 ### 4. No retention policy
 
@@ -212,6 +255,252 @@ redirect — a signup that the visitor abandons on Google's screen is not a sign
 proves the count is not zero when the device has unclaimed runs.
 
 **Not in scope:** what the learner sees afterwards. That is on Timo's list below, undecided.
+
+### 8. Three pre-existing TypeScript errors
+
+`npx tsc --noEmit` has reported the same three since long before either of us: `sessionId` in
+[retrieval/route.ts:135](../app/api/retrieval/route.ts#L135), and `Fetcher` / `D1Database` in
+[worker/index.ts:6](../worker/index.ts#L6).
+
+The cost is not the errors, it is that **`tsc` cannot be used as a pass/fail gate while they are
+there** — everyone has to remember which three are allowed, and a fourth hides in plain sight.
+
+Both halves are verifiable locally: `npx tsc --noEmit` for the types, `npm run build` for the
+Cloudflare side. The `Fetcher` / `D1Database` pair are Cloudflare worker types and the fix is
+probably a `@cloudflare/workers-types` reference rather than hand-written declarations — check
+what `vite.config.ts` already pulls in before adding anything.
+
+**Stops short of the deploy.** Timo confirms the deployed build after the merge; you cannot.
+
+**Done when:** `npx tsc --noEmit` is silent, `npm run build` still succeeds, and the line in
+AGENTS.md that warns about the three known errors is deleted along with them.
+
+### 9. Two stale documents
+
+Housekeeping, and the smallest thing on this list. Both files moved to `docs/idk/` on 2026-09-14.
+
+- **[docs/idk/outloud-master-build-plan.md](../docs/idk/outloud-master-build-plan.md)** still lists
+  Phase 4 as unbuilt and its self-audit says *"Phases 4–6 are entirely unbuilt"*. Both are wrong:
+  **#30** shipped 2026-09-07 and **#51–54** are visible on the Verdict card. The plan also predates
+  Dash entirely. `CHANGELOG.md` is the source for what actually shipped — do not guess.
+- **[docs/idk/stuffihavetodo.md](../docs/idk/stuffihavetodo.md)** — its three items are already in
+  `docs/TODO.md` section 5. Confirm that, then delete the file.
+
+**Done when:** the plan no longer claims unbuilt things are unbuilt, `stuffihavetodo.md` is gone,
+and `docs/TODO.md` section 0 loses both items.
+
+### 10. `lastVoiceFreeze` is never filled on the voice path
+
+#### What is broken
+
+Freeze signals — time to first word, hesitations, English leaking in — are the evidence behind half
+the teaching model. `setLastVoiceFreeze` has exactly one call site that sets a real value,
+[page.tsx:5153](../app/page.tsx#L5153), and it fires from `submitAudioAttempt` → `/api/transcribe`,
+which is the **recorded-attempt** path. A live voice session never calls it.
+
+So on the path almost everybody actually uses, `lastVoiceFreeze` stays `null`, and
+[page.tsx:5405](../app/page.tsx#L5405) files every spoken attempt as zero hesitations, zero English
+words and no time to first word. Not missing — *wrong*, and wrong in the confident direction.
+
+#### Why this is not just wiring
+
+`/api/transcribe` derives the numbers from whisper-1 word timestamps. The realtime transcriber does
+not return any: the two are deliberately different models, and the reason is written at
+[realtime-token/route.ts:77](../app/api/realtime-token/route.ts#L77). You cannot call the same
+route and you cannot get word timings out of the live session.
+
+#### What already exists, and saves you most of the work
+
+**`buildFreezeSignals` already handles the no-timestamps case.** Read
+[lib/freeze.ts:49](../lib/freeze.ts#L49): when `words` is empty it falls back to
+`clientMetrics.firstSpeechMs`, and `englishWordCount` is computed from the transcript text alone
+and needs no timing at all.
+
+```ts
+export type ClientVoiceMetrics = {
+  firstSpeechMs: number | null;
+  hesitationCount: number;
+  durationMs: number;
+};
+```
+
+So the job is **not** to write a second freeze implementation. It is to produce a
+`ClientVoiceMetrics` on the realtime path and call the function that is already there with
+`words: []`.
+
+**And the session already knows when speech started.** `VoiceSession.speechSeen`
+([voice-session.ts:154](../lib/voice-session.ts#L154)) is set the moment
+`input_audio_buffer.speech_started` arrives ([voice-session.ts:819](../lib/voice-session.ts#L819)),
+and `openCapture` ([voice-session.ts:627](../lib/voice-session.ts#L627)) resets it. Three
+timestamps is all you need, and two of those moments already have code in them.
+
+#### The shape of it
+
+1. **In `lib/voice-session.ts`**, stamp three moments on a capture: when `openCapture` opens the
+   window, when `speech_started` first arrives, and when `closeCapture` runs. Use the module's own
+   `nowMs()` — it prefers `performance.now()`, which does not jump when the system clock does.
+2. **Return them.** `closeCapture(): { speechSeen: boolean }`
+   ([voice-session.ts:648](../lib/voice-session.ts#L648)) becomes
+   `{ speechSeen, metrics: ClientVoiceMetrics }`, so the Room never reaches into the session's
+   fields. Keep the arithmetic in one small **exported pure function** — that is the part a unit
+   check can hold on to.
+3. **In the Room**, where the realtime capture finishes and produces a transcript, call
+   `buildFreezeSignals({ transcript, words: [], clientMetrics: metrics })` and
+   `setLastVoiceFreeze(...)` with the result — the same state the recorded path sets at
+   [page.tsx:5153](../app/page.tsx#L5153).
+
+#### The honest limit — read this before you implement `hesitationCount`
+
+Server VAD ends the turn after `silence_duration_ms`, which is **1200ms**, or 850ms in pressure
+mode ([realtime-token/route.ts:61](../app/api/realtime-token/route.ts#L61)). `buildFreezeSignals`
+counts a hesitation at a gap of **1.2 seconds or more**.
+
+Those two numbers are the same number. A pause long enough to count as a hesitation is a pause long
+enough to have already ended the turn — so within a single realtime capture, hesitations are close
+to structurally unmeasurable.
+
+**Do not invent a number to fill the field.** Two honest options, and you should say which you
+chose and why:
+
+- report `0` and treat it as "not measured on this path", or
+- derive an approximation from the gaps between `input_audio_transcription.delta` events, and label
+  it in a comment as what it is — delta arrival reflects model latency as well as speech.
+
+`timeToFirstWordSeconds` and `englishWordCount` are the two that become genuinely real here. That
+is already most of the value, and it is honest.
+
+#### How to check it
+
+Three automated, one by voice. The automated ones cannot tell you the numbers are *true* — only
+that they exist and are sane. That is the split, and it is why the last one is not optional.
+
+**1. Unit — the arithmetic.** Against the pure function from step 2. Feed it timestamps, not a
+session:
+
+| opened | speech started | closed | expect |
+|---|---|---|---|
+| 0 | 3000 | 6000 | `firstSpeechMs` 3000, `durationMs` 6000 |
+| 0 | null (never spoke) | 2000 | `firstSpeechMs` null — **not** 0 |
+| 0 | 0 | 1000 | `firstSpeechMs` 0 survives as 0 — see below |
+
+The middle row is the one that matters most: a learner who said nothing must not be recorded as
+having answered instantly.
+
+**The third row is a bug you will walk into, in code you did not write.**
+[lib/freeze.ts:58](../lib/freeze.ts#L58) tests the value for *truthiness*:
+
+```ts
+: clientMetrics?.firstSpeechMs
+  ? clientMetrics.firstSpeechMs / 1000
+  : null
+```
+
+So `firstSpeechMs: 0` becomes `null` — "started instantly" is thrown away and reported as "never
+started". And zero is not hypothetical here: `openCapture` sets
+`this.speechSeen = resumingSpeech` ([voice-session.ts:635](../lib/voice-session.ts#L635)), so a
+capture that resumes an utterance already has speech at the moment the window opens. Timo's
+2026-09-14 session had two of those in five minutes.
+
+Fix it to a `typeof ... === "number"` test in the same change, and say so in the PR — it also
+affects the recorded path, which is not yours.
+
+**2. Unit — the fallback really produces a number.** Import `buildFreezeSignals` and call it with
+`words: []` and your metrics. Assert `timeToFirstWordSeconds` is non-null. This pins the behaviour
+the whole task depends on, and it is three lines.
+
+**3. Prove the check can fail.** Use `baselineComparison()` on `lib/voice-session.ts` — see
+`checks/unit/voice-dump.check.mjs` for the pattern. Your probe drives a capture and returns the
+metrics. Against `HEAD` there are none; against your tree there are. If it cannot tell them apart,
+your check is not measuring your change.
+
+**4. By voice — and the dump is the measuring stick.** This half is Timo's, but tell him exactly
+what to do, in the PR:
+
+```js
+__outloudVoiceDebug(true)
+```
+
+Then start a session and **deliberately wait about three seconds before speaking**, so the number
+is unmistakable rather than a plausible-looking 0.8. Then:
+
+```js
+copy(__outloudVoiceDump())
+```
+
+The dump carries both the Room's and the session's lines, timestamped to the millisecond:
+
+```
+10:17:42.430 [voice:listen] OPENING capture, resumingSpeech: false | ...
+10:17:47.659 [voice:finish] closing capture, manual: false | speechSeen: true | ...
+```
+
+**The gap between those lines is the ground truth.** If the app computed 3.1s and the log says the
+learner started speaking 3.1s after the window opened, it works. If they disagree, the log wins and
+the arithmetic is wrong.
+
+Worth doing twice: once answering immediately, once after a long pause. Two numbers that differ in
+the right direction is a much stronger result than one number that looks plausible.
+
+**Afterwards**, `secondsToFirstWord` and `hesitations` at
+[page.tsx:5405](../app/page.tsx#L5405) start reaching PostHog with real values instead of zeroes.
+That is a consequence, not a check — nobody has verified events arrive yet (`docs/TODO.md` 1.2).
+
+#### Done when
+
+`closeCapture` returns metrics, the arithmetic lives in an exported pure function with the three
+unit cases above, the Room sets `lastVoiceFreeze` on the realtime path, `baselineComparison` shows
+the check can tell your change from `HEAD`, the hesitation decision is written down in a comment
+with its reason, and the PR tells Timo the two sentences to speak.
+
+**And the truthiness bug at [lib/freeze.ts:58](../lib/freeze.ts#L58) is fixed in the same PR**, with
+the third unit case above pinning it. It is latent today — the only caller that passes
+`clientMetrics` sends `firstSpeechMs: null` ([page.tsx:5136](../app/page.tsx#L5136)), so nothing
+currently produces a zero. **Your change is what makes it live.** Ship them together or the first
+thing you ship is a regression.
+
+### 11. Transcription bias — the character's own name
+
+> **~~Blocked until Timo has done one voice run.~~ Unblocked 2026-09-15 — the run happened and the
+> language fix works.** `transcription language -> es` fired at 03:25:29, seven seconds before the
+> first Spanish capture opened. And the exact sentence that failed the day before — *Sí, un bistec
+> también, por favor*, which came back as *"äh C und äh bei Stack auch so, bitte"* — came back this
+> time as **"Sí, un bistec, por favor."** No German anywhere in the run.
+>
+> **Which makes this task the right next move, and the run says why.** Every remaining miss
+> happened while the language was correctly pinned. Two of them:
+>
+> | pinned | heard | said |
+> |---|---|---|
+> | `es` | `"아"` | a noise, or a filler |
+> | `es` | `"Si quieres, uh, bien cosida."` | *sí, quisiera, bien cocida* |
+>
+> The second is the argument for this whole task in one line. **`cocido` was in the phrase the
+> coach had taught him 57 seconds earlier** — *"Quisiera el bistec bien cocido, por favor"*, his own
+> turn at 03:26:48. The word was in the conversation, on screen, already said out loud by both
+> sides, and the transcriber still spelled it *cosida*. Nothing was telling it what this
+> conversation was about.
+>
+> One more thing worth knowing before you pick the seeding: **the language pin is not what decides
+> accuracy.** In the same run, a Spanish sentence transcribed while pinned to `en` came back
+> perfect (*"Quisiera el bistec bien cocido, por favor"*, 03:26:48), and a Spanish sentence pinned
+> to `es` came back wrong (03:27:45). Language is a hint, context is the missing input.
+
+Timo's first full voice session, 2026-09-14: he said *"Hola Carlos, un agua, por favor"* and the
+transcriber returned *"Hola galos"*. **Carlos is the name we chose and the Coach said out loud** on
+the scenario turn — it sits in the Room's state, on screen, before he opens his mouth. If the
+transcriber can miss that, it is being told nothing about the conversation it is transcribing.
+
+The knob already exists. The realtime `transcription` object takes a **`prompt`** alongside `model`
+and `language`, and today [realtime-token/route.ts:90](../app/api/realtime-token/route.ts#L90) and
+[voice-session.ts:431](../lib/voice-session.ts#L431) send only the latter two. Seed it per turn with
+the vocabulary actually in play: the character's name first, then their recent lines and the phrase
+being practised.
+
+Note that `setTranscriptionLanguage` restates the model deliberately, because a partial
+`transcription` object drops what it omits. Whatever you add is subject to the same rule.
+
+**Done when:** the character's name reaches the transcriber, the language hint still survives every
+update, `npm test` is green, and the PR names what Timo should say to test it.
 
 ---
 
@@ -320,15 +609,58 @@ way, one at a time.
 
 ## First seat — Timo and Claude
 
+Shortened 2026-09-15: the second seat turned out to be faster than the list assumed, so four items
+moved across — the TypeScript errors, the two stale documents, `lastVoiceFreeze` and the
+transcription bias. What is left is what genuinely cannot move.
+
 | | why it stays here |
 |---|---|
-| **Three pre-existing TypeScript errors** | `Fetcher` / `D1Database` hang off the Cloudflare build config, which is the deploy corner. Small for us, unverifiable from the second seat. (The lint half of this item was done 2026-09-14 — `npm run lint` is clean and exits 0.) |
 | **1.6 The Scene does not take no for an answer** | Prompt work on `/api/converse`, against the real model. The scenario rule has to be internalised, and that is learned by breaking it, not by reading it. |
-| **1.6 Transcription bias** | Voice path. Only checkable by hand on Dash. |
-| **`lastVoiceFreeze` on the realtime path** | Voice path. |
 | **#42 Barge-in, Half B** | Gated on a real iPhone echo test on speakerphone at real volume. The failure mode is the coach interrupting *itself* and then blaming the learner — audible, not measurable. |
 | **Persona sweep, the judgment half** | What counts as teaching is a product question. |
 | **Privacy policy** | Timo's text. `docs/user-data.json` is the inventory. |
+| **What counts as an attempt** | Pulled back 2026-09-15 — see below. `lib/voice-guards.ts` decides, on every single scene turn, whether the learner gets graded, gets the confirm box, or reaches the coach. It has been wrong three times. |
+
+### What counts as an attempt — scoped down on purpose
+
+Two things came out of Timo's 2026-09-15 run and they are **not** the same size.
+
+**The artefact, and that is all we do for now.** One capture came back as `"아"` — a single Hangul
+character, a decoding artefact of a noise. `classifyCapture` called it a real answer and the Room
+scored `intake strike 1` against him for it. The rule is one clean question: **a transcript with no
+Latin letter in it at all is not something the learner said.** It lands beside `"ah..."`, not beside
+`"no sé"`. Careful with the edge: `"ok 👍"` must survive, because the question is whether there is
+*any* Latin letter, not whether a foreign character appears.
+
+**The language routing, deferred — Timo's call, 2026-09-15.** While probing the above I found that
+German mid-scene is **graded as a Spanish attempt**: "Wie sagt man das auf Spanisch?" and "Ich
+weiss nicht wie ich das sagen soll" both go to the evaluator. `saidInEnglish` asks *"is this
+English"* and requires two English markers; German has none, so it falls through to "must be
+Spanish".
+
+It stays open for two honest reasons. It is delicate — this function decides every scene turn and
+has been wrong three times, and the obvious fix makes it worse: *"no Spanish markers means they are
+talking to us"* sends a beginner answering **"Agua."** to the coach instead of counting their
+attempt, because `agua` is a content word and carries no marker. And it has **not been seen in a
+real session** — it came out of probing, not out of a learner hitting it. The artefact rule covers
+what actually happened, and for the target group as it stands today that is enough.
+
+Written down rather than fixed, so the next person finds the finding instead of the symptom.
+
+### The half we keep on the tasks that moved
+
+Two of the four are split rather than handed over, because their verification needs a person with a
+microphone and there is no way around that:
+
+| task | second seat builds | first seat proves |
+|---|---|---|
+| **10 `lastVoiceFreeze`** | the signals get filled on the realtime path, and a check that they are non-null and bounded | whether "2.4 seconds to first word" is *true*, by speaking |
+| **11 transcription bias** | the character's name reaches the transcriber | whether the hit rate actually moves, on Dash |
+| **8 TypeScript errors** | `tsc` silent, `npm run build` still green | the deployed build, after the merge |
+
+**~~Task 11 is blocked on us.~~ Cleared 2026-09-15.** The voice run happened: the language fix
+works, and every remaining transcription miss occurred while the language was correctly pinned —
+which is the evidence the bias task was waiting for.
 
 ---
 

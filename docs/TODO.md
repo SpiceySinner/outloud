@@ -527,9 +527,38 @@ conversation and the card at the end.
         weekday out loud, and `retrieval_deliveries` / `retrieval_variations` exist in full.
       > "Your words come back on Tuesday" is currently a promise nothing keeps. Either build the
       > cron and the `/m/` page, or stop saying the date.
+- [ ] **German mid-scene is graded as a Spanish attempt.** Found 2026-09-15 by probing, not by a
+      learner. `saidInEnglish` in `lib/voice-guards.ts` asks *"is this English"* and needs two
+      English markers; German carries none, so it falls through to "must be Spanish" and reaches the
+      evaluator. "Wie sagt man das auf Spanisch?" and "Ich weiss nicht wie ich das sagen soll" are
+      both scored. This is the same bug that was fixed three times for English, still fully present
+      in the language Timo actually speaks.
+
+      **Deliberately not fixed yet (Timo, 2026-09-15).** The obvious version makes it worse: *"no
+      Spanish markers means they are talking to us"* sends a beginner who answers **"Agua."** to the
+      coach instead of counting their attempt, because a content word carries no marker. And nobody
+      has hit it in a real session. First seat, `docs/TASKS.md`.
+
+- [ ] **A transcription artefact was counted against the learner.** Timo's 2026-09-15 run: one
+      capture came back as `"아"`, `classifyCapture` called it a real answer, and the Room scored
+      `intake strike 1` for it. The two-strike nudge is meant to notice somebody struggling, not
+      somebody who cleared their throat. First seat; the rule is "no Latin letter at all is not an
+      answer", not a list of characters.
+
 - [ ] **`lastVoiceFreeze` is never set on the realtime path.** Freeze signals — time to first word,
       hesitations, English leakage — are the evidence behind half the teaching model, and on the
-      voice path they are empty. Only the file-upload transcription path fills them.
+      voice path they are empty. Only the file-upload transcription path fills them. Worse than
+      "missing": [page.tsx:5405](../app/page.tsx#L5405) files every spoken attempt as zero
+      hesitations and zero English words, which is wrong in the confident direction.
+
+      **A trap found while specifying the fix (2026-09-14).**
+      [lib/freeze.ts:58](../lib/freeze.ts#L58) tests `clientMetrics.firstSpeechMs` for *truthiness*,
+      so a real measurement of `0` — started speaking immediately — comes back as `null`, "never
+      started". It is latent today because the only caller sends `firstSpeechMs: null`
+      ([page.tsx:5136](../app/page.tsx#L5136)). It goes live the moment the realtime path starts
+      producing real numbers, and a resumed capture produces exactly zero:
+      `openCapture` sets `speechSeen = resumingSpeech`. Assigned with the fix, second seat
+      (`task/realtime-freeze`).
 - [ ] **`MAX_REALTIME_SESSIONS_PER_DAY` defaults to 5 in production**
       ([realtime-token/route.ts:36](../app/api/realtime-token/route.ts#L36)). Five voice sessions per
       day per client, for everyone. Fine for a closed test, wrong the moment strangers arrive.

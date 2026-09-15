@@ -226,6 +226,22 @@ off your own unmerged work.
 Never commit to `main`. Never force-push a branch anybody else has pulled. Rebasing your own
 unmerged task branch onto `main` is fine and usually the tidy thing to do.
 
+### The one exception, and how to tell
+
+Scaffolding goes straight to `main`, and only Timo puts it there: this file, `README.md`,
+`.env.example`, `checks/`, `docs/`, lint and script configuration. Not because he is exempt, but
+because **everybody has to branch off it** — a task branch cut before the checks exist is a branch
+that cannot run them.
+
+Everything else branches, **his work included**. `main` is what deploys, and a half-finished prompt
+change sitting on it blocks the other seat as surely as a broken build would.
+
+The test, when you are unsure which one you are holding:
+
+> **Does this change what the app does, or what a learner sees?**
+> Yes → branch, even if you own the repo.
+> No, it only changes how we work on it → `main` is fine, if you are the one who owns it.
+
 ### Names
 
 | task | branch |
@@ -237,6 +253,10 @@ unmerged task branch onto `main` is fine and usually the tidy thing to do.
 | date the navigation bug | `task/date-nav-bug` |
 | store what the AI said | `task/ai-corpus` |
 | `account_created` events | `task/account-created-events` |
+| three TypeScript errors | `task/tsc-errors` |
+| two stale documents | `task/doc-hygiene` |
+| `lastVoiceFreeze` on the voice path | `task/realtime-freeze` |
+| transcription bias | `task/transcription-bias` |
 | unit checks for the pure modules | `check/pure-modules` |
 | Playwright and the `build` group | `check/build-group` |
 | production-build navigation | `check/build-navigation` |
