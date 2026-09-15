@@ -641,10 +641,11 @@ hypothetical.*
 
 ## 6. Housekeeping
 
-- [ ] **Three pre-existing TypeScript errors**, untouched for weeks and easy to fix:
+- [x] **Three pre-existing TypeScript errors — fixed locally 2026-09-15; deploy verification stays with Timo:**
       `sessionId` in [retrieval/route.ts:135](../app/api/retrieval/route.ts#L135), and `Fetcher` /
-      `D1Database` in [worker/index.ts:6](../worker/index.ts#L6). They make `npx tsc --noEmit` useless
-      as a pass/fail gate, which is the actual cost.
+      `D1Database` in [worker/index.ts](../worker/index.ts). The email helper now accepts only the
+      fields it uses, and the worker has explicit types. `npx tsc --noEmit` is silent and the
+      production build passes.
 - [x] **~~`npm run lint` picks up `.vercel/output`.~~ Done 2026-09-14.** 6748 errors, none of them
       ours, on a command the new README tells a newcomer to run. `.vercel`, `.output` and the
       vinext-generated `types/routes.d.ts` are ignored now; `npm run lint` exits 0 and means

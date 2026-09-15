@@ -530,7 +530,8 @@ export async function validateMomentAccess(
 }
 
 export async function sendRetrievalEmail(
-  moment: MomentPayload,
+  // Both saved runs and incoming saves can be emailed; their session metadata differs.
+  moment: Pick<MomentPayload, "email" | "originalText">,
   reviewUrl: string,
   unsubscribeUrl: string | null = null,
 ): Promise<{ status: "sent" | "failed" | "not_configured"; error?: string }> {

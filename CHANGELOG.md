@@ -1,5 +1,32 @@
 # Changelog
 
+## 2026-09-15 — TypeScript is a pass/fail gate again
+
+Task 8. The unchanged checkout reported exactly the three documented errors: the retrieval
+email call rejected `SavedMoment`, and the worker could not resolve `Fetcher` or `D1Database`.
+The initial read mistook the `sessionId` diagnostic for a missing variable; the compiler showed
+it was an optional-versus-nullable property mismatch between two record types.
+
+`sendRetrievalEmail` reads only `email` and `originalText`, so its parameter now requires those
+two fields rather than the entire incoming save payload. Both callers satisfy that contract.
+The worker imports `D1Database` from a pinned `@cloudflare/workers-types` devDependency matching
+Wrangler's supported version. Its asset binding uses the app's Fetch API signature. Importing
+Workers types globally changed browser `Response.json()` typing; keeping the import scoped
+avoids that and keeps vinext's DOM request/response boundary intact.
+
+Verified locally:
+
+- TypeScript exited 1 with the three errors before the change and exits 0 with none afterwards.
+  The compiler is the regression check here: `baselineComparison()` loads stripped JavaScript,
+  which cannot distinguish an erased type annotation.
+- `npm test`: all six unit/structure checks passed; `npm run lint` passed.
+- `npm run build`: the default Cloudflare production build passed.
+- TypeScript-emitted JavaScript for both edited source files matches `HEAD`, with comments
+  removed and Git/Windows line endings normalized. No runtime logic changed.
+
+The compiler warnings in the working instructions now require zero errors. No live model call,
+database query, email, browser or voice test was run. Timo verifies the deployed build after merge.
+
 ## 2026-09-14 — a fresh clone can now be started by somebody who was not here
 
 The repo had no README, no `.env.example` and no setup of any kind. `.env` is gitignored, so a new

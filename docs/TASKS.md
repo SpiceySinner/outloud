@@ -116,7 +116,7 @@ and the reason for each:
 | | why here |
 |---|---|
 | ~~1 `device-class`~~ | done |
-| **8 TypeScript errors** | first, because it pays into everything after it. While the three known errors are there, nobody can use `npx tsc --noEmit` as a pass/fail gate — every later PR has to remember which three are allowed |
+| ~~8 TypeScript errors~~ | fixed locally 2026-09-15; `tsc` is a pass/fail gate. Timo confirms the deployed build after merge |
 | **9 two stale documents** | smallest thing on the list, and it stops the build plan telling the next person that shipped work is unbuilt |
 | **3 realtime session limit** | a few lines |
 | **check `build-group`** | unlocks three of the six checks. Do it before you need it |
@@ -257,6 +257,9 @@ proves the count is not zero when the device has unclaimed runs.
 **Not in scope:** what the learner sees afterwards. That is on Timo's list below, undecided.
 
 ### 8. Three pre-existing TypeScript errors
+
+**Fixed locally 2026-09-15.** TypeScript, unit/structure checks and the production build pass.
+The errors below describe the baseline; Timo still verifies the deployed build after merge.
 
 `npx tsc --noEmit` has reported the same three since long before either of us: `sessionId` in
 [retrieval/route.ts:135](../app/api/retrieval/route.ts#L135), and `Fetcher` / `D1Database` in
@@ -707,8 +710,7 @@ Not blocking anything on either list above.
 
 ## Finishing a task
 
-1. `npm test` and `npm run lint` and `npx tsc --noEmit` — the last one has three known errors and
-   no others.
+1. `npm test` and `npm run lint` and `npx tsc --noEmit` — all must pass, with no TypeScript errors.
 2. A check that would have caught the thing you fixed. If you changed a file, use
    `baselineComparison()` to confirm your check can tell your change from `HEAD`.
 3. A CHANGELOG entry saying what broke, what the first theory was, and what you actually verified

@@ -46,7 +46,7 @@ npm test            # unit + structure checks. ~1s, no server, no model, no cred
 npm run test:live   # prompt checks against the real model. Needs `npm run dev` running
 npm run test:all
 npm run lint
-npx tsc --noEmit    # three known pre-existing errors, and no others
+npx tsc --noEmit    # must pass with no errors
 npm run build && npm run start   # the production build, which behaves differently
 ```
 

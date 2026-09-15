@@ -21,9 +21,7 @@ npm run lint
 npx tsc --noEmit
 ```
 
-`npx tsc --noEmit` reports **three errors that were already there** and are nobody's fault:
-`sessionId` in `app/api/retrieval/route.ts`, and `Fetcher` / `D1Database` in `worker/index.ts`.
-Anything beyond those three is yours.
+`npx tsc --noEmit` must pass with no errors.
 
 Read `checks/README.md` before writing a check. It is short.
 
